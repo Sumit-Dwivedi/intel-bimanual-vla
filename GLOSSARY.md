@@ -20,11 +20,13 @@ introduces a term is in [LEARN.md](LEARN.md).
 | gripper | The two-finger end of the arm; also the name of the joint/actuator that opens and closes the moving jaw. |
 | gripper (naming caveat, 1/2) | `<body name="gripper">` (`so101_new_calib.xml`:100) is the physical gripper body, but the joint that moves *it* is `wrist_roll`; the joint/actuator named `gripper` sits on its child body `moving_jaw_so101_v1`. |
 | gripper (naming caveat, 2/2) | So a policy output addressed to `gripper` drives the jaw open/closed, **not** the wrist body — indexing `ctrl` by the name `gripper` never rotates the wrist. |
+| grounder | The component mapping one natural-language command to an executable plan: `ground(CommandEvent, SceneBelief) -> TaskPlan`. `RuleGrounder` is the demo default; `VlmGrounder` is a stretch behind the same interface (ADR-003). |
 | hinge | A joint that rotates about one fixed axis, like a door — 1 position value and 1 DoF. All six SO-101 joints are hinges. |
 | interpenetration | Geoms overlapping more than the contact model intends — usually from bad initial placement, and the solver answers with a large separation impulse that flings them apart. |
 | IR (OpenVINO Intermediate Representation) | OpenVINO's device-neutral model format: an `.xml` holding the graph topology and a `.bin` holding the weights. Analogous to LLVM IR — one front end per framework, one backend per device. |
 | joint | The connection that allows relative motion between a body and its parent, and the variable describing that motion. |
 | kp / kv | Proportional and damping gains of a `<position>` actuator — how hard it pulls toward the target angle and how much it resists overshoot. |
+| manipulation primitive | A short, self-contained unit of physical action (1–3 s of closed-loop control) that a skill name refers to — the level at which this project can actually learn or script behaviour (ADR-001). |
 | MJCF | MuJoCo XML Configuration Format: the XML source language describing a scene's bodies, joints, geoms, and actuators. |
 | `MjData` | The mutable per-timestep state (positions, velocities, controls, contacts) that evolves as the simulation steps. |
 | `MjModel` | The immutable compiled scene produced from MJCF; holds the flat arrays MuJoCo simulates against. |
@@ -39,9 +41,13 @@ introduces a term is in [LEARN.md](LEARN.md).
 | `qpos` / `qvel` | The position and velocity vectors inside `MjData`, lengths `nq` and `nv`; the env copies both into every observation dict. |
 | quantization | Re-expressing weights/activations in a lower-precision numeric type (FP32 → FP16 → INT8) to cut memory and latency, at some accuracy cost. Not part of M03, which stays FP32; it arrives later via NNCF (`ARCHITECTURE.md` ADR-013). |
 | quaternion | A 4-number encoding of a 3D orientation, constrained to unit length so it carries only 3 independent DoF; the reason `nq` can exceed `nv`. |
+| skill | One named action in the fixed vocabulary the grounder may emit — `open_drawer`, `pick`, `place`, `handoff`, `pour` — each implemented as a manipulation primitive in M06. `handoff` is the one that moves an object between arms. |
+| `SkillCall` | One step of a plan as a dataclass: `skill`, `arm`, `target_object`, `params: dict`. `arm` is mandatory and never `None` (`PLAN.md` M05 done-when 3). |
 | slide joint | A joint that translates along one fixed axis — 1 position value and 1 DoF. The drawer uses one (`drawer_slide`). |
 | SO-101 | The 6-joint open-source robot arm used in this project; asset from TheRobotStudio/SO-ARM100. |
 | STL | Triangle-mesh file format; the 13 files in `scenes/so101/assets/` supply the arm's shapes. |
+| `TaskPlan` | The grounder's output: an ordered sequence of `SkillCall`s for one command. The typed IR between language and control — produced once per command, then consumed by the Coordinator. |
 | throughput vs latency | Latency is time for one inference end to end; throughput is inferences per second in aggregate. Batching and parallelism can raise throughput while making latency worse — a closed-loop robot cares about latency. |
 | tunneling | An object moving far enough in one timestep that collision detection never sees the surface between start and end, so it passes straight through. |
+| `UngroundedCommandError` | The typed error a grounder raises when a command falls outside the documented grammar. Required by `PLAN.md` M05 done-when 2 so an unsupported command refuses loudly instead of yielding a partial plan. |
 | `world` / worldbody | The fixed root of the body tree; everything is positioned relative to it and it never moves. |
