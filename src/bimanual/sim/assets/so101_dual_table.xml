@@ -318,6 +318,13 @@
          ~0.667m rest-pose arm height, with a widened fovy for headroom as
          arms move during a task. -->
     <camera name="front" pos="1.5500 0.0000 0.8500" xyaxes="0.0000 1.0000 -0.0000 -0.2203 0.0000 0.9754" fovy="55"/>
+    <!-- drawer_view: low, angled up, on the -y side past the open drawer's
+         protrusion (see DRAWER_CAM_* comment above for the empirical
+         reasoning). mode="targetbody" target="drawer" re-aims at the
+         drawer body's own origin every frame, so it tracks the drawer as
+         drawer_slide goes from 0 (closed) to 0.15 (open) without a
+         hand-computed look-at. -->
+    <camera name="drawer_view" pos="0.0000 -0.5500 0.1500" mode="targetbody" target="drawer" fovy="50"/>
   </worldbody>
 
   <actuator>

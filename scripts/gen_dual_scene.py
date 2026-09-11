@@ -64,6 +64,34 @@ FRONT_CAM_POS = (1.55, 0.0, 0.85)
 FRONT_CAM_TARGET = (0.0, 0.0, 0.50)
 FRONT_CAM_FOVY = 55
 
+# ---- M02(e) drawer_view camera -----------------------------------------
+# Neither `overhead` (straight down from z=1.3) nor `front` (looking along
+# -x from x=1.55) shows the drawer opening -- verified empirically on
+# bm-ptl, not assumed. `overhead` looks straight down onto the opaque
+# table_top box (table_top geom: box, center z=0.34, half-thickness 0.01,
+# top surface z=0.35), which occludes the drawer (housed at z=0.28,
+# entirely below the tabletop) from directly above. `front` looks along
+# -x, roughly parallel to the drawer's slide axis (0,-1,0) rather than
+# across it, so the 3 cm the open drawer protrudes past the table's
+# y=-0.25 edge (drawer body world y goes from -0.05 at slide=0 to -0.20 at
+# slide=0.15=range max; its front face -- box half-extent 0.08 in y --
+# reaches y=-0.20-0.08=-0.28, i.e. 3 cm past the table edge) is not legible
+# from that angle either.
+#
+# Fix: a camera BELOW tabletop height (table surface z=0.35), on the -y
+# side past where the open drawer protrudes, angled UP and toward +y so it
+# looks across the drawer's slide axis instead of along it. Rather than
+# hand-computing a look-at (as the front camera above must, since it aims
+# at a fixed point), this camera uses mode="targetbody" target="drawer":
+# MuJoCo re-aims it at the `drawer` body's own origin every frame, which
+# is exactly the point that moves as drawer_slide goes from 0 to 0.15 --
+# so the same fixed camera pose tracks the drawer whether it is closed or
+# open, and the two states are expected to look visibly different (the
+# open drawer is both closer to the camera and its front face is in clear
+# view, where the closed drawer sits retracted toward the housing).
+DRAWER_CAM_POS = (0.0, -0.55, 0.15)
+DRAWER_CAM_FOVY = 50
+
 
 def _sub(a, b):
     return tuple(a[i] - b[i] for i in range(3))
@@ -217,6 +245,8 @@ def main():
         front_cam_pos=FRONT_CAM_POS_STR,
         front_cam_xyaxes=FRONT_CAM_XYAXES,
         front_cam_fovy=FRONT_CAM_FOVY,
+        drawer_cam_pos="%.4f %.4f %.4f" % DRAWER_CAM_POS,
+        drawer_cam_fovy=DRAWER_CAM_FOVY,
     )
     DEST.parent.mkdir(parents=True, exist_ok=True)
     DEST.write_text(out, newline="\n")
@@ -399,6 +429,13 @@ TEMPLATE = """<?xml version="1.0"?>
          ~0.667m rest-pose arm height, with a widened fovy for headroom as
          arms move during a task. -->
     <camera name="front" pos="{front_cam_pos}" xyaxes="{front_cam_xyaxes}" fovy="{front_cam_fovy}"/>
+    <!-- drawer_view: low, angled up, on the -y side past the open drawer's
+         protrusion (see DRAWER_CAM_* comment above for the empirical
+         reasoning). mode="targetbody" target="drawer" re-aims at the
+         drawer body's own origin every frame, so it tracks the drawer as
+         drawer_slide goes from 0 (closed) to 0.15 (open) without a
+         hand-computed look-at. -->
+    <camera name="drawer_view" pos="{drawer_cam_pos}" mode="targetbody" target="drawer" fovy="{drawer_cam_fovy}"/>
   </worldbody>
 
   <actuator>
