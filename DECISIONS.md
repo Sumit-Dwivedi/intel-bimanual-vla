@@ -11,6 +11,37 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M03 — OpenVINO conversion smoke test complete (b50e300)
+
+**Recorded:** Sept 12, 2026 · **Closes:** ADR-014's first-48-hours requirement ·
+**Feeds:** ADR-013 (export plan), M10, M13
+
+M03 done Sept 12 (b50e300). Two findings for downstream modules:
+
+**(1) NPU (NPU5010) rejects fully-dynamic batch destructively** — `STATUS_ACCESS_VIOLATION`
+(exit `3221225477` / `0xC0000005`), not a catchable exception. **M13 export MUST use static
+or bounded batch dimensions — a fully-open `-1` is unsupported and crashes the process.**
+Diagnostic: the NPU compiler demands upper bounds on any dynamic dim —
+`Upper bounds are not specified for node 'Multiply_11422' (type 'Convolution'): input '0'
+bounds are '[9223372036854775807, 3, 224, 224]'` (`9223372036854775807` = `INT64_MAX`).
+Static FP32 and FP16 both compiled and inferred correctly on NPU.
+
+**(2) The conversion pipeline uses `openvino.convert_model` directly from live torch
+modules — no ONNX intermediate.** The `torch.onnx.export` path was deliberately avoided:
+it needs `onnx` and `onnxscript`, neither pinned. Fewer moving parts. **Do not assume ONNX
+exists in the pipeline.**
+
+Max absolute deviation vs the PyTorch FP32 reference: CPU `5.674362e-05`, GPU (Arc B390)
+`7.408857e-05`, NPU `1.122952e-04`. Full evidence in `benchmarks/ov-smoke-notes.md`.
+
+A third, procedural finding worth keeping: the first run accumulated results in memory and
+wrote them once at the end, so the NPU crash destroyed the NPU *static* results that had
+already passed. `scripts/ov_smoke.py` now runs each device/precision/shape check in its own
+subprocess and writes immediately. Any future harness that probes a device which can crash
+the process needs the same shape.
+
+---
+
 ## ADR-023 (ratified Sept 12): Cut ACT training from critical path.
 
 **Context.** Sept 12 is Day 2 of a schedule with five days left, and the plan is one

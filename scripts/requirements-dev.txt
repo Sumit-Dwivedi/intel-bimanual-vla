@@ -17,7 +17,12 @@
 # passed, e.g.:
 #   pip install -r scripts/requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
+# openvino is needed on the LAPTOP, not only on bm-ptl: M03 converts a live
+# torch.nn.Module to IR with openvino.convert_model(), which requires torch and
+# openvino in the same process. Pinned to the same version as
+# scripts/requirements-bmptl.txt so laptop and bm-ptl do not drift.
 numpy==2.4.6
+openvino==2026.3.1
 mujoco==3.2.7
 torch==2.14.0+cpu
 PyYAML==6.0.3

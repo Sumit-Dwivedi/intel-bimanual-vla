@@ -25,7 +25,9 @@ that wasn't planned from Day 1.
 Intel-specific (100 pts):
 - [ ] End-to-end task completion & bimanual (30)
 - [ ] VLA / multi-modal reasoning (20)
-- [ ] OpenVINO & Core Ultra optimization (20) — Day 0 device access proven
+- [ ] OpenVINO & Core Ultra optimization (20) — Day 0 device access proven; **M03 complete
+  Sept 12**: PyTorch→IR→compile→infer verified on CPU, GPU and NPU, evidence in
+  `benchmarks/ov-smoke-notes.md` (NPU requires static/bounded batch — see DECISIONS.md M03)
 - [ ] Robustness across 10 seeds (15)
 - [ ] Reproducibility (10)
 - [ ] Innovation (5)
