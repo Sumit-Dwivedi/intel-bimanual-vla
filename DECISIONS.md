@@ -44,6 +44,47 @@ fresh clone.
 
 ---
 
+## M05 — Rule grounder complete (41c7a29)
+
+**Recorded:** Sept 12, 2026 · **Implements:** ADR-001 (two-tier control), ADR-003
+(rule grounder as the deterministic floor) · **Consumes:** M04's `CommandEvent` ·
+**Feeds:** M06
+
+`ground(CommandEvent, scene_belief=None) -> TaskPlan`, matching ARCHITECTURE.md's
+component-contract table. `SceneBelief` is M10's output and does not exist yet, so it is
+an optional parameter the rule grounder ignores today — the signature is correct now and
+needs no change when M10 lands.
+
+**Arm assignment is explicit on every `SkillCall`, never `None`** (M05 done-when 3). The
+default rule, documented in `docs/command-grammar.md` so a judge can predict it: an unnamed
+arm defaults to **arm A**, except `handoff`'s origin arm, which defaults to the other of
+the two arms given the mandatory destination arm. This field is what M06 dispatches on and
+what makes `handoff` meaningful; a grounder without it would undercut the 30-point bimanual
+criterion.
+
+**Two failure modes are deliberately distinct, and conflating them was the defect this
+design guards against:**
+- Empty or whitespace-only input → an **empty `TaskPlan`, no exception**. Nothing was asked.
+  M04 passes text through unvalidated and unstripped by design, so this case arrives here.
+- A non-empty command that cannot be grounded → **`UngroundedCommandError`**, a typed error.
+  Something was asked and could not be honoured.
+Verified: a mixed command ("Pick up the plate with arm A and dance.") raises rather than
+returning a partial plan. A half-executed plan on demo day is worse than a clean refusal.
+
+The brief's verbatim example command parses to:
+`open_drawer(A, drawer)` → `pick(A, plate)` → `place(A, plate, dest=table)` →
+`pick(B, mug)` → `pour(A, mug, source=bottle)`.
+
+43 tests in `tests/test_grounder.py`; 54 across the suite with no regression in M04's.
+11 paraphrases (requirement ≥8) and 4 typed-error cases (requirement ≥3).
+
+**Scope note for readers of `docs/command-grammar.md`:** it documents the grammar the
+grounder **accepts**, not ADR-011's full scene sequence, which is richer — ADR-011 adds
+fork and spoon and places `handoff` on the mug. Do not read the grammar as a claim about
+what the demo performs.
+
+---
+
 ## M03 — OpenVINO conversion smoke test complete (b50e300)
 
 **Recorded:** Sept 12, 2026 · **Closes:** ADR-014's first-48-hours requirement ·
