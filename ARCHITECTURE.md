@@ -516,6 +516,35 @@ OpenVINO precision, both success counts published (brief p3 "preserve system beh
 `PLAN.md` M19 done-when 3). INT8 is on the cut list (`PLAN.md` section 6) since it is the
 most likely to consume a day for a table row.
 
+**Correction, Sept 12, 2026 — M03 has run; the conditional above is now resolved.** This
+ADR's Decision says INT8 "targets the NPU5010, with static input shapes **if** M03 finds the
+NPU requires them." M03 ran on Sept 12 (`b50e300`, evidence in `benchmarks/ov-smoke-notes.md`,
+logged in `DECISIONS.md`) and the answer is yes, with a sharper edge than the hedge
+anticipated:
+
+1. **The NPU requires static or bounded input shapes. A fully-open batch dimension (`-1`) is
+   not merely unsupported — it kills the process.** Compiling a dynamic-batch IR on NPU exits
+   with `STATUS_ACCESS_VIOLATION` (`3221225477` / `0xC0000005`), not a catchable OpenVINO or
+   Python exception. The diagnostic names the unbounded dimension: `Upper bounds are not
+   specified for node 'Multiply_11422' (type 'Convolution'): input '0' bounds are
+   '[9223372036854775807, 3, 224, 224]'` — that value is `INT64_MAX`. M13's export must
+   therefore emit static or upper-bounded batch dimensions for the NPU path. This is a hard
+   constraint on the export, not a tuning preference.
+2. **Operational consequence for M13 and M14: isolate every NPU compile attempt in its own
+   subprocess.** Because the failure is a process kill rather than an exception, a harness
+   that compiles several device/precision pairs in one process will lose the results of pairs
+   that already succeeded. M03 hit exactly this — its first run discarded passing NPU *static*
+   results when the dynamic variant crashed — and `scripts/ov_smoke.py` was restructured to run
+   each check in a subprocess that writes its result immediately. M14's benchmark harness needs
+   the same shape or its `UNSUPPORTED` rows will be indistinguishable from lost rows.
+3. **There is no ONNX intermediate in the conversion pipeline.** M03 converts live
+   `torch.nn.Module` objects with `openvino.convert_model`; the `torch.onnx.export` path was
+   avoided because it needs `onnx` and `onnxscript`, neither pinned. M13 should inherit that
+   recipe rather than reintroduce an ONNX step.
+
+Baseline deviations from the PyTorch FP32 reference, for the behaviour-preservation check
+this ADR's Consequences describe: CPU `5.674362e-05`, GPU `7.408857e-05`, NPU `1.122952e-04`.
+
 ---
 
 ### ADR-014 — Prove the PyTorch-to-IR conversion path inside the first 48 hours

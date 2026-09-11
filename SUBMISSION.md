@@ -8,7 +8,11 @@ that wasn't planned from Day 1.
 - [ ] Project title: [DRAFT: Bimanual VLA on Intel Core Ultra — a voice-driven table-setting demo]
 - [ ] Short description (1-2 sentences): TODO
 - [ ] Long description (~300 words): TODO
-- [ ] Technology tags: OpenVINO, MuJoCo, LeRobot, SmolVLA, Speechmatics, Intel Core Ultra
+- [ ] Technology tags: OpenVINO, MuJoCo, PyTorch, Speechmatics, Intel Core Ultra
+  (**Corrected Sept 12:** `LeRobot` removed — ADR-023 cut ACT training and the LeRobot
+  dataset from the critical path, so nothing in the shipped pipeline uses it. `SmolVLA`
+  removed — it appears nowhere in PLAN.md, ARCHITECTURE.md or the code and was never a
+  grounded choice. Judge-facing copy must not claim tools we do not use, per ADR-015.)
 - [ ] Category tags: Robotics, Physical AI, Edge AI
 
 ## Cover Image & Presentation
