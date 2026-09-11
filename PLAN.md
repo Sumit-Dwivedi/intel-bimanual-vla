@@ -132,8 +132,10 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
   unsigned `mujoco.dll`).
 - **Depends on.** M01.
 - **Done when.**
-  1. `python scripts/view_scene.py --headless --save out/scene.png` writes a PNG showing
-     both arms, the drawer and all five objects (plate, mug, fork, spoon, water bottle).
+  1. `python scripts/view_scene.py --headless --save docs/images/m02-scene.png` writes a
+     PNG showing both arms, the drawer and all five objects (plate, mug, fork, spoon,
+     water bottle). (Path corrected post-hoc: the artifact actually produced and
+     committed is `docs/images/m02-scene.png`, not `out/scene.png`.)
   2. `TableSettingEnv.reset(seed=0)` returns observations whose shapes are printed and
      recorded in the Tester report.
   3. The actuated DoF count per arm is **read off the asset and written into

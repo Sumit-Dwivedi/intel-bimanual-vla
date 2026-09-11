@@ -25,3 +25,9 @@ No free body's z-coordinate dropped below the floor threshold.
 | spoon | 0.35272 |
 | water_bottle | 0.43944 |
 
+**Caveat:** this probe catches interpenetration only *indirectly*, via the floor
+check (a large separation impulse launches a prop, which then falls and trips
+`FLOOR_Z`) — it never asserts on `data.contact.dist` directly; acceptable for
+verifying this static scene, to be revisited if M04's controller tests reveal
+contact anomalies that an indirect check would miss.
+
