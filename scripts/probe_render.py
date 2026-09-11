@@ -13,17 +13,19 @@ It is a DIAGNOSTIC, not a deliverable. Two deliberate choices follow from that:
    tracebacks. A scene problem and a rendering problem must not look alike --
    that distinction is exactly what the probe exists to establish.
 
-M02 extension: this script now takes two OPTIONAL positional argv args --
-a scene path and an output PNG path -- so the same RISK-03 probe can be
-reused to render the M02 dual-arm scene at 1280x720 instead of the single-arm
-upstream scene at its native 640x480. Called with no arguments, behaviour is
-byte-for-byte what it was before this change (scene=scenes/so101/scene.xml,
-out=out_probe.png), so it remains valid RISK-03 evidence for ARCHITECTURE.md
-section 5.
+M02 extension: this script now takes up to THREE OPTIONAL positional argv
+args -- a scene path, an output PNG path, and a camera name -- so the same
+RISK-03 probe can be reused to render the M02 dual-arm scene at 1280x720
+instead of the single-arm upstream scene at its native 640x480, from a named
+camera instead of the default free camera. Called with no arguments,
+behaviour is byte-for-byte what it was before this change (scene=
+scenes/so101/scene.xml, out=out_probe.png, free camera), so it remains valid
+RISK-03 evidence for ARCHITECTURE.md section 5.
 
 Usage:
-    python scripts/probe_render.py                              (unchanged default)
-    python scripts/probe_render.py <scene.xml> <out.png>        (M02 and later)
+    python scripts/probe_render.py                                    (unchanged default)
+    python scripts/probe_render.py <scene.xml> <out.png>               (M02, free camera)
+    python scripts/probe_render.py <scene.xml> <out.png> <camera>      (M02, named camera)
 
 Exit codes:  0 rendered   2 model failed to compile   3 GL/renderer failed
 """
@@ -37,6 +39,7 @@ import zlib
 
 SCENE = sys.argv[1] if len(sys.argv) > 1 else os.path.join("scenes", "so101", "scene.xml")
 OUT = sys.argv[2] if len(sys.argv) > 2 else "out_probe.png"
+CAMERA = sys.argv[3] if len(sys.argv) > 3 else None
 
 
 def write_png(path, rgb):
@@ -128,7 +131,10 @@ except Exception:
 
 try:
     with renderer:
-        renderer.update_scene(data)
+        if CAMERA is not None:
+            renderer.update_scene(data, camera=CAMERA)
+        else:
+            renderer.update_scene(data)
         pixels = renderer.render()
     write_png(OUT, np.ascontiguousarray(pixels, dtype=np.uint8))
 except Exception:
