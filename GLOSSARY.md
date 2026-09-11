@@ -8,12 +8,15 @@ introduces a term is in [LEARN.md](LEARN.md).
 | action space | The shape and meaning of what you may pass to `step()`; here a length-`nu` (12) vector of position-actuator targets written straight into `data.ctrl`. |
 | actuator | Element that turns a control number into force on a joint; SO-101 uses `<position>` actuators, so the control input is a target angle. |
 | body | A rigid link in the kinematic tree; MuJoCo nests them, and each child connects to its parent through a joint. |
+| `CommandEvent` | The only type allowed to cross out of `src/bimanual/command/`: a command as `text` plus `timestamp`, `source_id`, optional `confidence` and `raw_meta`. Never audio (ADR-002). |
+| `CommandSource` | Abstract base for "where a command came from", with a non-blocking `poll() -> CommandEvent \| None` and `close()`; `TextCommandSource` and `VoiceCommandSource` are interchangeable behind it. Callers are handed one and never branch on which. |
 | `compile_model` | OpenVINO call that hands IR to one device's plugin and returns an executable for that device; the backend pass of the toolchain. Compiling for CPU, GPU and NPU from the same IR yields three different executables. |
 | device plugin | The per-device backend inside OpenVINO (CPU, GPU, NPU here) that turns IR into kernels for that silicon and decides what it will and will not accept. |
 | DoF (degree of freedom) | One independent way the system can move; counted by `nv`. A hinge has 1, a free-floating object has 6. |
 | env (environment) | The object owning the simulator state and exposing `reset`/`step`/`render`; `TableSettingEnv` is one, though it is not a `gym.Env` (no `Space` objects, no reward). |
 | free joint | A joint giving a body full 6-DoF motion relative to the world; contributes 7 to `nq` (3 position + 4 quaternion) but 6 to `nv`. The five props use `<freejoint>`. |
 | geom | A geometric shape attached to a body, used for collision, for rendering, or both; counted by `ngeom`. |
+| grep gate | A done-when condition expressed as a search that must return zero matches — e.g. M04's `grep -ri "audio\|pcm\|wav\|microphone" src/bimanual/language src/bimanual/policy`. Makes an architectural boundary mechanically checkable instead of a convention. |
 | gripper | The two-finger end of the arm; also the name of the joint/actuator that opens and closes the moving jaw. |
 | gripper (naming caveat, 1/2) | `<body name="gripper">` (`so101_new_calib.xml`:100) is the physical gripper body, but the joint that moves *it* is `wrist_roll`; the joint/actuator named `gripper` sits on its child body `moving_jaw_so101_v1`. |
 | gripper (naming caveat, 2/2) | So a policy output addressed to `gripper` drives the jaw open/closed, **not** the wrist body — indexing `ctrl` by the name `gripper` never rotates the wrist. |
