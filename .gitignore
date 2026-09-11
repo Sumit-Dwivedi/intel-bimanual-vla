@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+ov_env/
+
+# Model checkpoints
+checkpoints/*.pth
+checkpoints/*.safetensors
+checkpoints/*.bin
+!checkpoints/.gitkeep
+
+# Data
+data/
+*.mp4
+*.avi
+
+# Hugging Face cache
+.cache/
+
+# Secrets
+.env
+*.pem
+.kaggle
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
