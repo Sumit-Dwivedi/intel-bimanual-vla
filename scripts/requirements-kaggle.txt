@@ -1,0 +1,27 @@
+# Kaggle GPU training environment (M09 dataset packaging, M10 PoseNet
+# training, M11 ACT/LeRobot training -- see PLAN.md).
+#
+# HONESTY NOTE (read before trusting these pins): none of these versions have
+# been installed or run on an actual Kaggle kernel yet -- M01 is repo
+# scaffolding, done on the laptop, before Kaggle training starts. Pinning an
+# unverified number and calling it "reproducible" would be worse than saying
+# so. The versions below are the current published PyPI releases as of
+# 2026-09-11, checked with `pip index versions <pkg>` (a real query against
+# the package index, not invented from memory), *not* versions confirmed to
+# work together on Kaggle's GPU image.
+#
+# Action required at M11: launch a Kaggle kernel with this file, record
+# whatever `pip freeze` actually reports there, and replace this file's pins
+# with the verified ones (or Kaggle's preinstalled versions if this file is
+# skipped in favor of the base image). Do not treat these numbers as load
+# tested until that happens.
+
+numpy==2.4.6
+PyYAML==6.0.3
+torch==2.14.0
+# LeRobot provides the ACT policy implementation and dataset format (brief p2
+# objective 4, PLAN.md M09/M11). Version below is PyPI's current release,
+# unverified against this project's dataset code.
+lerobot==0.4.4
+opencv-python==4.14.0.94
+tqdm==4.70.0

@@ -1,0 +1,25 @@
+# Laptop / dev environment (Windows).
+#
+# Purpose: code, git, unit tests, wiring code that does not require MuJoCo to
+# actually load. Per ARCHITECTURE.md ADR-020, Windows Smart App Control
+# blocks the unsigned mujoco.dll on this laptop (OSError: [WinError 4551]).
+# `mujoco` is still listed and pinned below -- the *package* installs fine
+# and its metadata is readable (see scripts/verify_env.py), it just cannot be
+# imported here. All real simulation work happens on bm-ptl.
+#
+# Every version below is pinned to what is actually installed and verified on
+# this laptop as of 2026-09-11 (`pip freeze`), not a guess.
+#
+# torch is CPU-only and was installed from the PyTorch CPU wheel index:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# A plain `pip install -r scripts/requirements-dev.txt` will fail to resolve
+# the local `+cpu` version segment for torch unless that extra index is also
+# passed, e.g.:
+#   pip install -r scripts/requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu
+
+numpy==2.4.6
+mujoco==3.2.7
+torch==2.14.0+cpu
+PyYAML==6.0.3
+python-dotenv==1.2.3
+kaggle==2.2.4

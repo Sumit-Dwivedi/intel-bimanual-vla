@@ -11,6 +11,35 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M01 — RISK-07 resolved: `openvino-telemetry` pin unified to `2025.2`
+
+**Recorded:** Sept 11, 2026 · **Closes:** RISK-07 · **Module:** M01 (repo scaffold and
+pinned environments)
+
+`PLAN.md` RISK-07 flagged a discrepancy: `scripts/requirements-bmptl.txt:3` pinned
+`openvino-telemetry==2025.2` while `benchmarks/bmptl-environment.txt:3` recorded
+`openvino-telemetry==2025.2.` with a trailing period.
+
+Read both files directly during M01: as of commit `e5d74eb` (before this module's own
+work began) both already read `openvino-telemetry==2025.2`, with no trailing period and
+no other differences on that line. The trailing-period form was never a real,
+installable pin — `pip index versions openvino-telemetry` lists PyPI releases as
+`2025.2.0`, `2025.1.0`, `2025.0.1`, etc. (three-component versions only); `2025.2.` is
+not one of them and is not valid PEP 440 syntax as a distinct release. `2025.2` is a
+valid pin and resolves to `2025.2.0` under PEP 440's version-normalization rules (a
+trailing implicit zero), so `2025.2` — not `2025.2.` — is the correct value, and it is
+the one both files share.
+
+No further edit to either file was needed; this entry exists because the done-when
+criterion for M01 requires the resolution to be *recorded* here, not only present in the
+files. `scripts/verify_env.py` (this module's other output) checks
+`scripts/requirements-bmptl.txt` package-by-package against installed versions
+whenever it is pointed at that file, so a future re-introduction of the mismatched
+trailing-period form on either file would surface as a plain string mismatch against
+whichever file is passed to `--requirements`, not as a silent drift.
+
+---
+
 ## ADR-020 — Simulation runs on bm-ptl, not the laptop
 
 **Ratified:** Sept 11, 2026 · **Closes:** RISK-11 · **Promotes:** RISK-03 to blocking

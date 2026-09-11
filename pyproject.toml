@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bimanual"
+version = "0.1.0"
+description = "Bimanual VLA manipulation on Intel Core Ultra (dual SO-101 arms, MuJoCo sim, OpenVINO deployment)."
+requires-python = ">=3.11"
+readme = "README.md"
+# Intentionally no [project.dependencies] here: this project pins environment-
+# specific dependency sets per host (laptop / kaggle / bm-ptl) in
+# scripts/requirements-*.txt (see ARCHITECTURE.md section 3 and ADR-020 for why
+# the laptop and bm-ptl environments differ). This file exists to make
+# `src/bimanual` an importable, editable-installable package, not to declare
+# the dependency graph.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bimanual*"]
+
+[tool.setuptools.package-data]
+"bimanual.sim" = ["assets/**/*"]
