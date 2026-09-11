@@ -27,6 +27,21 @@ reproducible stream, and (2) resets MuJoCo's internal data (qpos, qvel, time,
 contacts, ...) back to the model's compiled defaults via `mj_resetData`. Two
 `reset(seed=0)` calls in fresh processes therefore produce byte-identical
 observations, which is the reproducibility property ADR-012 depends on later.
+
+Camera rendering is opt-in (M02 refactor). `reset()`/`step()` return camera
+pixels in `obs` ONLY for the camera names explicitly requested -- either the
+`cameras=` list passed to `__init__` (the instance default) or a per-call
+`cameras=` override. Passing `cameras=None` everywhere (the default) is the
+"state-only" fast path: no image is rendered and, more importantly, no
+offscreen GL renderer is even constructed, because constructing
+`mujoco.Renderer` itself costs real wall-clock (GL/EGL setup) independent of
+how many frames are later rendered through it. This matters because M09
+(demonstration collection) and M08's evaluation harness both read privileged
+state (ADR-005) and never touch pixels -- forcing a renderer to exist for
+those call sites would waste GL setup and per-camera render time on every
+`reset()`/`step()` for streams nobody reads. See
+`docs/hardware/m02-render-cost.md` for measured numbers and ADR-022 for the
+decision record.
 """
 
 from __future__ import annotations
@@ -44,11 +59,17 @@ _DEFAULT_SCENE_PATH = (
     pathlib.Path(__file__).resolve().parent / "assets" / "so101_dual_table.xml"
 )
 
-# Cameras rendered into every observation by default. Discovered from the
-# model at load time in practice (see `_camera_names`), but declared here for
-# reference: this is the M02 scene's full camera set (ARCHITECTURE.md section
-# 1, "overhead camera, front camera, per-arm wrist cameras", plus the M02(e)
-# drawer_view camera added for demo visibility of the drawer-open action).
+# Reference-only documentation constant: the M02 scene's full camera set
+# (ARCHITECTURE.md section 1, "overhead camera, front camera, per-arm wrist
+# cameras", plus the M02(e) drawer_view camera). This is NOT used for
+# validation anywhere in this class -- validation is always performed against
+# `self._camera_names`, discovered from the compiled model via `mj_id2name`
+# in `__init__`. Keeping validation tied to the hardcoded tuple below would
+# silently re-break the property established in commit 80f7316 ("standardize
+# camera obs keys to match MJCF camera names"): that adding a camera to the
+# MJCF requires no env.py edit. If this tuple and the model's actual cameras
+# ever disagree, the model wins and this comment is stale documentation to
+# fix, not a bug in the class.
 _EXPECTED_CAMERAS = ("overhead", "front", "armA_wrist", "armB_wrist", "drawer_view")
 
 
@@ -64,22 +85,33 @@ class TableSettingEnv:
     def __init__(
         self,
         scene_path: str | pathlib.Path | None = None,
+        cameras: list[str] | None = None,
         render_width: int = 640,
         render_height: int = 480,
     ) -> None:
-        """Load the MJCF scene and construct one offscreen renderer per camera.
+        """Load the MJCF scene. Camera rendering is opt-in (see module docstring).
 
         Args:
             scene_path: Path to an MJCF scene file. Defaults to the packaged
                 `so101_dual_table.xml` (M02's dual-arm table scene), resolved
                 relative to this source file's location.
-            render_width, render_height: Offscreen render resolution. Clamped
-                internally to the scene's declared `<visual><global
-                offwidth/offheight/></visual>` framebuffer size (the scene
-                declares 1280x720; see `scripts/gen_dual_scene.py`'s
-                TODO(M02) comment and `scripts/probe_render.py` for why this
-                clamp exists -- requesting more than the framebuffer size
-                raises inside MuJoCo before any GL call happens).
+            cameras: List of camera names to render into `obs` on every
+                `reset()`/`step()` call that does not itself pass a
+                `cameras=` override. `None` (the default) means NO rendering
+                -- the fast, state-only path: `obs` will contain only 'qpos'
+                and 'qvel'. Every name is validated against the cameras
+                actually discovered in the compiled model (see
+                `_camera_names` below); an unknown name raises `ValueError`
+                naming the offending camera and listing every valid name.
+            render_width, render_height: Offscreen render resolution, used
+                only if/when a renderer is actually constructed (see
+                `_ensure_renderer`). Clamped internally to the scene's
+                declared `<visual><global offwidth/offheight/></visual>`
+                framebuffer size (the scene declares 1280x720; see
+                `scripts/gen_dual_scene.py`'s TODO(M02) comment and
+                `scripts/probe_render.py` for why this clamp exists --
+                requesting more than the framebuffer size raises inside
+                MuJoCo before any GL call happens).
         """
         self.scene_path = pathlib.Path(scene_path) if scene_path is not None else _DEFAULT_SCENE_PATH
         if not self.scene_path.exists():
@@ -91,30 +123,43 @@ class TableSettingEnv:
         self.model = mujoco.MjModel.from_xml_path(str(self.scene_path))
         self.data = mujoco.MjData(self.model)
 
-        # Clamp requested render size to the scene's compiled offscreen
-        # framebuffer, exactly as scripts/probe_render.py does, so a caller
-        # asking for more than the scene declares gets a smaller image
-        # instead of a MuJoCo exception that looks like a GL failure.
-        fb_w = int(self.model.vis.global_.offwidth)
-        fb_h = int(self.model.vis.global_.offheight)
-        self._render_width = min(render_width, fb_w)
-        self._render_height = min(render_height, fb_h)
-
         # Discover every camera defined in the scene by name, rather than
-        # hardcoding _EXPECTED_CAMERAS, so this class keeps working if the
-        # hand-authored camera section of the scene changes.
+        # hardcoding a list, so this class keeps working if the
+        # hand-authored camera section of the scene changes. This is the
+        # ONE source of truth for camera-name validation everywhere in this
+        # class -- see the _EXPECTED_CAMERAS comment above.
         self._camera_names = [
             mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_CAMERA, i)
             for i in range(self.model.ncam)
         ]
 
-        # One Renderer per camera. mujoco.Renderer owns its own GL/offscreen
-        # buffer; each render() call re-points it at a different camera via
-        # update_scene(camera=...), so a single renderer instance is reused
-        # across cameras rather than allocating one per camera name.
-        self._renderer = mujoco.Renderer(
-            self.model, height=self._render_height, width=self._render_width
-        )
+        # Record the requested offscreen size now (used only if a renderer
+        # is later actually constructed -- see _ensure_renderer). Clamping
+        # to the compiled framebuffer happens at that point too, since it
+        # needs model.vis, which is already available here but the clamp
+        # itself has no side effect worth paying before it's needed.
+        fb_w = int(self.model.vis.global_.offwidth)
+        fb_h = int(self.model.vis.global_.offheight)
+        self._render_width = min(render_width, fb_w)
+        self._render_height = min(render_height, fb_h)
+
+        # Opt-in camera rendering (M02 refactor -- see module docstring and
+        # ADR-022). `cameras=None` is the fast, state-only default: no
+        # renderer is constructed at all until something actually asks to
+        # render (an explicit `render()` call, or a `reset()`/`step()` that
+        # requests cameras via the instance default or a per-call override).
+        # Stored as a defensive copy so a caller mutating the list they
+        # passed in cannot retroactively change this instance's default.
+        self._validate_cameras(cameras)
+        self._default_cameras: list[str] | None = list(cameras) if cameras is not None else None
+
+        # mujoco.Renderer owns a GL/offscreen buffer and its construction
+        # itself costs real wall-clock (GL/EGL setup) independent of how
+        # many frames are ever rendered through it -- see
+        # docs/hardware/m02-render-cost.md. Lazily constructed on first
+        # actual render via `_ensure_renderer()`, not here, so the
+        # state-only path (`cameras=None` everywhere) never pays that cost.
+        self._renderer: mujoco.Renderer | None = None
 
         # Owned RNG, seeded in reset(). Nothing in step()/render() consumes
         # it yet -- it exists so M07's Randomizer has a documented, seeded
@@ -128,15 +173,14 @@ class TableSettingEnv:
     # Core contract
     # ------------------------------------------------------------------
 
-    def reset(self, seed: int = 0) -> dict:
+    def reset(self, seed: int = 0, cameras: list[str] | None = None) -> dict:
         """Reset physics to the model's compiled initial state.
 
-        Obs schema (identical to `step()`'s, and derived from the scene's
-        cameras at load time, not hardcoded -- see `_build_obs`): 'qpos'
-        (nq,) float64, 'qvel' (nv,) float64, plus one `<camera_name>` key per
-        camera defined in the MJCF (currently 'overhead', 'front',
-        'armA_wrist', 'armB_wrist', 'drawer_view'), each an (H, W, 3) uint8
-        RGB ndarray.
+        Obs schema: always 'qpos' (nq,) float64 and 'qvel' (nv,) float64.
+        Camera entries appear under their bare MJCF name (e.g. 'front',
+        'overhead', ...) as an (H, W, 3) uint8 RGB ndarray, but ONLY for the
+        cameras actually requested this call -- see the `cameras` arg below
+        and the module docstring's "opt-in" note.
 
         Args:
             seed: Seeds `self.np_random` reproducibly. Two `reset(seed=0)`
@@ -144,6 +188,13 @@ class TableSettingEnv:
                 `qpos`/`qvel`/camera images because MuJoCo's own state reset
                 (`mj_resetData`) is itself deterministic; the seed governs
                 only this env's own RNG stream for future randomized use.
+            cameras: If not `None`, overrides the instance's default camera
+                list (set in `__init__`) FOR THIS CALL ONLY -- the instance
+                default itself is never mutated by this argument. If `None`
+                (the default), the instance default is used as-is. Every
+                name is validated against the model's discovered cameras;
+                an unknown name raises `ValueError` naming the offending
+                camera and listing every valid name.
 
         Returns:
             Observation dict; see the obs schema note above.
@@ -154,18 +205,23 @@ class TableSettingEnv:
         mujoco.mj_resetData(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
 
-        return self._build_obs()
+        effective_cameras = self._resolve_cameras(cameras)
+        return self._build_obs(effective_cameras)
 
-    def step(self, action) -> tuple[dict, bool, dict]:
+    def step(self, action, cameras: list[str] | None = None) -> tuple[dict, bool, dict]:
         """Advance physics by one timestep under `action`.
 
         Obs schema: identical to `reset()`'s -- see that docstring's "Obs
-        schema" note.
+        schema" note, including the opt-in `cameras` override semantics
+        (not `None` overrides the instance default FOR THIS CALL ONLY,
+        without mutating it).
 
         Args:
             action: length-`model.nu` (12: 6 actuators x 2 arms) array-like
                 of position-actuator targets, written directly into
                 `data.ctrl` and held constant for exactly one `mj_step`.
+            cameras: Same per-call override semantics as `reset()`'s
+                `cameras` argument.
 
         Returns:
             (obs, done, info) where `obs` has the same shape as `reset()`'s
@@ -184,16 +240,25 @@ class TableSettingEnv:
         self.data.ctrl[:] = action
         mujoco.mj_step(self.model, self.data)
 
-        return self._build_obs(), False, {}
+        effective_cameras = self._resolve_cameras(cameras)
+        return self._build_obs(effective_cameras), False, {}
 
     def render(self, camera: str = "front") -> np.ndarray:
-        """Render one named camera and return an (H, W, 3) uint8 RGB array."""
+        """Render one named camera and return an (H, W, 3) uint8 RGB array.
+
+        This is the explicit escape hatch: it renders regardless of the
+        `cameras=` opt-in setting configured in `__init__`/`reset()`/
+        `step()`. `scripts/view_scene.py` and other probes call this
+        directly when they want one specific frame without opting the whole
+        env into per-step rendering.
+        """
         if camera not in self._camera_names:
             raise ValueError(
                 f"unknown camera {camera!r}; scene defines {self._camera_names}"
             )
-        self._renderer.update_scene(self.data, camera=camera)
-        return self._renderer.render()
+        renderer = self._ensure_renderer()
+        renderer.update_scene(self.data, camera=camera)
+        return renderer.render()
 
     def get_state(self) -> np.ndarray:
         """Return the full internal MuJoCo state as one flat float64 ndarray.
@@ -210,7 +275,7 @@ class TableSettingEnv:
         return state
 
     def close(self) -> None:
-        """Release the offscreen renderer's GL resources."""
+        """Release the offscreen renderer's GL resources, if one was ever built."""
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
@@ -219,18 +284,65 @@ class TableSettingEnv:
     # Internals
     # ------------------------------------------------------------------
 
-    def _build_obs(self) -> dict:
-        # Obs keys are the MJCF camera names themselves (no "_rgb" suffix),
-        # derived from `self._camera_names` (discovered from the model, see
-        # __init__) rather than hardcoded -- adding a camera to the scene
-        # (e.g. M02(e)'s drawer_view) therefore shows up in obs automatically
-        # with no change needed here.
+    def _validate_cameras(self, cameras: list[str] | None) -> None:
+        """Raise ValueError if `cameras` names anything not in the model.
+
+        Validates against `self._camera_names` (discovered from the
+        compiled model), never against the reference-only `_EXPECTED_CAMERAS`
+        constant -- see that constant's docstring comment for why.
+        """
+        if cameras is None:
+            return
+        for name in cameras:
+            if name not in self._camera_names:
+                raise ValueError(
+                    f"unknown camera {name!r}; valid cameras are {self._camera_names}"
+                )
+
+    def _resolve_cameras(self, cameras: list[str] | None) -> list[str] | None:
+        """Resolve a reset()/step() per-call `cameras` argument.
+
+        `cameras is None` means "no override": fall back to the instance
+        default set in `__init__` (itself possibly `None`, i.e. state-only).
+        A non-`None` value is validated fresh (the instance default was
+        already validated once in `__init__`, but an override is new input
+        and must be checked again) and used for THIS CALL ONLY -- the
+        instance default is never written to here.
+        """
+        if cameras is None:
+            return self._default_cameras
+        self._validate_cameras(cameras)
+        return list(cameras)
+
+    def _ensure_renderer(self) -> mujoco.Renderer:
+        """Lazily construct the offscreen renderer on first actual use.
+
+        `mujoco.Renderer.__init__` performs GL/offscreen-buffer setup that
+        costs real wall-clock (see docs/hardware/m02-render-cost.md) even
+        before any frame is rendered. Deferring this until a render is
+        actually requested is what makes `cameras=None` genuinely fast
+        rather than "fast except for the renderer nobody asked for."
+        """
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(
+                self.model, height=self._render_height, width=self._render_width
+            )
+        return self._renderer
+
+    def _build_obs(self, cameras: list[str] | None) -> dict:
+        # Always include privileged state (ADR-005: qpos/qvel are free --
+        # they come straight out of MuJoCo's data struct with no rendering
+        # involved). Camera keys are the MJCF camera names themselves (no
+        # "_rgb" suffix), added ONLY for the cameras this call actually
+        # requested (see `_resolve_cameras`) -- this is the opt-in contract
+        # this refactor exists to establish.
         obs = {
             "qpos": np.array(self.data.qpos, dtype=np.float64, copy=True),
             "qvel": np.array(self.data.qvel, dtype=np.float64, copy=True),
         }
-        for name in self._camera_names:
-            obs[name] = self.render(name)
+        if cameras:
+            for name in cameras:
+                obs[name] = self.render(name)
         return obs
 
     def __enter__(self) -> "TableSettingEnv":
@@ -241,27 +353,43 @@ class TableSettingEnv:
 
 
 if __name__ == "__main__":
-    # Minimal self-test / smoke run: reset, step once, print observation
-    # shapes, and confirm get_state()/render() work. This is a manual
-    # developer check, not the module's automated test (there is no local
-    # test path per ADR-020 -- run this on bm-ptl).
+    # Minimal self-test / smoke run, updated for the opt-in camera refactor:
+    # (1) the state-only fast path (cameras=None, the default -- no renderer
+    #     ever constructed), (2) a reset() with an explicit per-call camera
+    #     override, and (3) render() as the always-available escape hatch.
+    # This is a manual developer check, not the module's automated test
+    # (there is no local test path per ADR-020 -- run this on bm-ptl).
     env = TableSettingEnv()
-    obs = env.reset(seed=0)
     print(f"scene: {env.scene_path}")
     print(f"nq={env.model.nq} nv={env.model.nv} nu={env.model.nu} "
           f"ncam={env.model.ncam} cameras={env._camera_names}")
+
+    obs = env.reset(seed=0)
+    print("reset(seed=0), cameras=None (state-only, default):")
     for key, val in obs.items():
         print(f"  obs[{key!r}].shape = {val.shape}  dtype={val.dtype}")
+    assert env._renderer is None, "state-only reset() must not construct a renderer"
+    print(f"  renderer constructed? {env._renderer is not None} (expected False)")
 
     zero_action = np.zeros(env.model.nu, dtype=np.float64)
-    obs, done, info = env.step(zero_action)
-    print(f"after 1 step: done={done} info={info}")
+    obs, done, info = env.step(zero_action, cameras=["front"])
+    print("step(zero_action, cameras=['front']) -- per-call override:")
+    for key, val in obs.items():
+        print(f"  obs[{key!r}].shape = {val.shape}  dtype={val.dtype}")
+    assert env._renderer is not None, "requesting a camera must construct the renderer"
 
     state = env.get_state()
     print(f"get_state() -> shape {state.shape}, dtype {state.dtype}")
 
     frame = env.render("front")
-    print(f"render('front') -> shape {frame.shape}, dtype {frame.dtype}")
+    print(f"render('front') -> shape {frame.shape}, dtype {frame.dtype} (escape hatch, always works)")
+
+    try:
+        env.reset(seed=0, cameras=["not_a_camera"])
+    except ValueError as exc:
+        print(f"unknown-camera override correctly raised: {exc}")
+    else:
+        raise AssertionError("expected ValueError for unknown camera override")
 
     env.close()
     print("OK")

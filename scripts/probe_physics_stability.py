@@ -85,11 +85,16 @@ def free_body_z_indices(model) -> dict[str, int]:
 
 
 def main() -> int:
-    env = TableSettingEnv()
+    # cameras=None: this probe reads only qpos/qvel, never pixels (see module
+    # docstring). Camera rendering is opt-in (M02 refactor); passing
+    # cameras=None explicitly takes the fast, state-only path -- no
+    # offscreen renderer is even constructed for these 1000 steps. See
+    # docs/hardware/m02-render-cost.md for measured cost and ADR-022.
+    env = TableSettingEnv(cameras=None)
     z_idx = free_body_z_indices(env.model)
     zero_action = np.zeros(env.model.nu, dtype=np.float64)
 
-    obs = env.reset(seed=SEED)
+    obs = env.reset(seed=SEED, cameras=None)
 
     nan_step = None
     tunnel_step = None
@@ -97,7 +102,7 @@ def main() -> int:
     min_z_seen = {name: float(obs["qpos"][idx]) for name, idx in z_idx.items()}
 
     for step in range(N_STEPS):
-        obs, done, info = env.step(zero_action)
+        obs, done, info = env.step(zero_action, cameras=None)
         qpos = obs["qpos"]
         qvel = obs["qvel"]
 

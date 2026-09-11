@@ -85,8 +85,17 @@ def main() -> int:
         )
         return 1
 
+    # Camera rendering is opt-in (M02 refactor): pass cameras=['front']
+    # explicitly so this script's TableSettingEnv is constructed with an
+    # explicit rendering intent rather than the state-only default
+    # (cameras=None). The actual frame written to disk still comes from the
+    # render() escape hatch below (args.camera may differ from 'front' via
+    # --camera), which works regardless of this opt-in list.
     env = TableSettingEnv(
-        scene_path=args.scene, render_width=args.width, render_height=args.height
+        scene_path=args.scene,
+        cameras=["front"],
+        render_width=args.width,
+        render_height=args.height,
     )
     try:
         env.reset(seed=args.seed)
