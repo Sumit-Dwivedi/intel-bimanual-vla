@@ -309,7 +309,15 @@
          automatically from camera pos and the target body's position, so no
          manual quat/xyaxes math is needed for these two. -->
     <camera name="overhead" pos="0 0 1.3" mode="targetbody" target="table"/>
-    <camera name="front" pos="1.15 0 0.75" mode="targetbody" target="table"/>
+    <!-- front: fixed orientation via xyaxes (M02(d) fix), NOT mode="targetbody",
+         because targetbody can only aim at a body's own origin (the table
+         body sits at z=0) and that aim point was too low, cropping both
+         arms above the gripper. See the FRONT_CAM_* constants and
+         look_at_xyaxes() above for the derivation: aims at (0,0,0.5),
+         roughly the midpoint between the 0.35m tabletop and the measured
+         ~0.667m rest-pose arm height, with a widened fovy for headroom as
+         arms move during a task. -->
+    <camera name="front" pos="1.5500 0.0000 0.8500" xyaxes="0.0000 1.0000 -0.0000 -0.2203 0.0000 0.9754" fovy="55"/>
   </worldbody>
 
   <actuator>

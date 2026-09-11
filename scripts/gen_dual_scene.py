@@ -30,12 +30,77 @@ by two people independently drifting apart.
 """
 
 import copy
+import math
 import pathlib
 import xml.etree.ElementTree as ET
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 UPSTREAM = REPO_ROOT / "scenes" / "so101" / "so101_new_calib.xml"
 DEST = REPO_ROOT / "src" / "bimanual" / "sim" / "assets" / "so101_dual_table.xml"
+
+# ---- M02(d) front-camera fix -------------------------------------------
+# The original front camera (pos="1.15 0 0.75", mode="targetbody" target=
+# "table") aimed at the table body's own origin, which sits at z=0 (the
+# floor level the table body is anchored at -- see the hand-authored <body
+# name="table" pos="0 0 0"> below). That put the camera's aim point far
+# below the arms, so its vertical field of view was centered near the
+# tabletop and cropped both arms above the gripper. Measured on bm-ptl via
+# a probe script (scripts/probe_arm_extent.py-equivalent one-off, see
+# DECISIONS.md M02(d) entry): at the reset pose, the highest arm geometry
+# (armA_moving_jaw_so101_v1) reaches z~0.667, roughly 0.32m above the
+# 0.35m tabletop surface.
+#
+# Fix: aim the camera at a point mid-way between the tabletop and a
+# comfortable margin above the measured arm height (z=0.5, not z=0), move
+# it back and up slightly for a wider working margin, and widen the
+# vertical field of view (fovy) so the full arm height stays in frame
+# even as the arms move during a task, not only at the rest pose. Because
+# MuJoCo's mode="targetbody" only aims at a body's own origin -- it cannot
+# aim at an arbitrary point -- we drop that mode and specify the camera's
+# orientation directly via `xyaxes`, computed below with a standard
+# look-at construction (stdlib `math` only, no numpy, so this generator
+# keeps running on the laptop per ADR-020).
+FRONT_CAM_POS = (1.55, 0.0, 0.85)
+FRONT_CAM_TARGET = (0.0, 0.0, 0.50)
+FRONT_CAM_FOVY = 55
+
+
+def _sub(a, b):
+    return tuple(a[i] - b[i] for i in range(3))
+
+
+def _cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _normalize(a):
+    n = math.sqrt(sum(c * c for c in a))
+    return tuple(c / n for c in a)
+
+
+def look_at_xyaxes(pos, target, world_up=(0.0, 0.0, 1.0)):
+    """Compute a MuJoCo <camera xyaxes="..."/> value for a camera at `pos`
+    looking at `target`.
+
+    MuJoCo's xyaxes gives the camera's local +x ("right") and local +y
+    ("up") axes in world coordinates; the camera looks along its local -z,
+    so local z = -forward = cross(right, up) by construction here. This is
+    the standard graphics look-at basis construction, done with plain
+    tuples so the generator has no numpy dependency.
+    """
+    forward = _normalize(_sub(target, pos))
+    right = _normalize(_cross(forward, world_up))
+    up = _cross(right, forward)  # already unit length: right, forward orthonormal
+    return right, up
+
+
+_FRONT_RIGHT, _FRONT_UP = look_at_xyaxes(FRONT_CAM_POS, FRONT_CAM_TARGET)
+FRONT_CAM_XYAXES = "%.4f %.4f %.4f %.4f %.4f %.4f" % (_FRONT_RIGHT + _FRONT_UP)
+FRONT_CAM_POS_STR = "%.4f %.4f %.4f" % FRONT_CAM_POS
 
 # ---- geometry / layout constants (see ADR-021 for the reach-derived rationale) ----
 TABLE_TOP_Z = 0.35   # table surface height above the floor (m)
@@ -149,6 +214,9 @@ def main():
         actuators=actuators_xml,
         meshes=meshes_xml,
         materials=materials_xml,
+        front_cam_pos=FRONT_CAM_POS_STR,
+        front_cam_xyaxes=FRONT_CAM_XYAXES,
+        front_cam_fovy=FRONT_CAM_FOVY,
     )
     DEST.parent.mkdir(parents=True, exist_ok=True)
     DEST.write_text(out, newline="\n")
@@ -322,7 +390,15 @@ TEMPLATE = """<?xml version="1.0"?>
          automatically from camera pos and the target body's position, so no
          manual quat/xyaxes math is needed for these two. -->
     <camera name="overhead" pos="0 0 1.3" mode="targetbody" target="table"/>
-    <camera name="front" pos="1.15 0 0.75" mode="targetbody" target="table"/>
+    <!-- front: fixed orientation via xyaxes (M02(d) fix), NOT mode="targetbody",
+         because targetbody can only aim at a body's own origin (the table
+         body sits at z=0) and that aim point was too low, cropping both
+         arms above the gripper. See the FRONT_CAM_* constants and
+         look_at_xyaxes() above for the derivation: aims at (0,0,0.5),
+         roughly the midpoint between the 0.35m tabletop and the measured
+         ~0.667m rest-pose arm height, with a widened fovy for headroom as
+         arms move during a task. -->
+    <camera name="front" pos="{front_cam_pos}" xyaxes="{front_cam_xyaxes}" fovy="{front_cam_fovy}"/>
   </worldbody>
 
   <actuator>
