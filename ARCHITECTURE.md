@@ -718,10 +718,6 @@ than living only on the instance.
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
 
-- **MuJoCo rendering on bm-ptl** (RISK-03) — **promoted to blocking by ADR-020.** With the
-  laptop rejected as a sim host, there is no local fallback: if offscreen rendering fails on
-  bm-ptl, WSL2 (ADR-020 option (c)) must be built immediately rather than deferred. The M03
-  probe is now a prerequisite, not a convenience.
 - **Platform video length limit** (RISK-10) — nothing in `SUBMISSION.md` records one.
 
 ### Closed since first issue (Sept 11, 2026)
@@ -729,6 +725,16 @@ These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
 - **SO-101 asset source and licence** (RISK-01) — closed. TheRobotStudio/SO-ARM100 @
   `eecbe3e0`, Apache-2.0, unmodified per ADR-016; provenance in
   `scenes/so101/PROVENANCE.md`. M02 is unblocked.
+- **MuJoCo rendering on bm-ptl** (RISK-03) — **closed Sept 11, 2026.** `scripts/probe_render.py`
+  run on bm-ptl (`WIN-GLILH4PFDLN`) under `mujoco==3.2.7` compiled
+  `scenes/so101/scene.xml` (`nq=6 nv=6 nu=6 nbody=8 ngeom=31`) and rendered offscreen
+  headless over SSH with MuJoCo's default Windows backend — no `MUJOCO_GL` override, no
+  osmesa, no X server. Output `out_probe.png`, 640x480, mean pixel 77.6, visually confirmed
+  to show the arm lit with shadow and floor reflection. ADR-020's premise holds in both
+  directions: mujoco imports on bm-ptl and does not on the laptop. **WSL2 (ADR-020 option
+  (c)) is therefore not needed and stays unbuilt.** One caveat carried into M02: the
+  upstream scene declares a 640x480 offscreen framebuffer, so larger renders need an
+  explicit `<visual><global offwidth/offheight/></visual>` in our own scene.
 - **Actuated DoF per arm** (RISK-02) — closed by ADR-016. No longer a decision: the adopted
   asset's shipped DoF is authoritative and Builder reports it in M01/M02.
 - **Speechmatics credentials** (RISK-04) — handling closed by ADR-019 (`.env`, gitignored,

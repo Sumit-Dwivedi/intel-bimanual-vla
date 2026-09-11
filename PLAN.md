@@ -110,6 +110,10 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
 - **Budget.** 2 hours.
 
 #### M02 — MuJoCo dual-SO-101 table scene v0
+- **TODO(M02):** Dual-arm scene must include
+  `<visual><global offwidth='1280' offheight='720'/></visual>` so demo video renders match
+  target resolution. Do not modify upstream `scenes/so101/` per ADR-016; add the override in
+  the new dual-arm scene file. (Upstream declares 640x480; confirmed by the bm-ptl probe.)
 - **Purpose.** A loadable MJCF scene: table, two SO-101 arms mounted with an overlapping
   workspace, a drawer with a prismatic joint, plate, mug, fork, spoon; two cameras
   (overhead + front) plus per-arm wrist cameras if the asset allows. This is required
