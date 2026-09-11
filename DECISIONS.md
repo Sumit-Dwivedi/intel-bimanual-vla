@@ -11,6 +11,33 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-020 — Simulation runs on bm-ptl, not the laptop
+
+**Ratified:** Sept 11, 2026 · **Closes:** RISK-11 · **Promotes:** RISK-03 to blocking
+
+`mujoco.MjModel.from_xml_path` fails on the laptop with `OSError: [WinError 4551]` —
+Windows Smart App Control blocks the unsigned `mujoco.dll`. Reproduced on `mujoco==3.13.0`
+and `3.2.7`, so it is an OS policy issue, not an asset or package defect
+(`scenes/so101/VERIFICATION.md`).
+
+Options: (a) disable Smart App Control locally — one-way and a standing security
+regression on the daily machine, **rejected**; (b) run simulation on bm-ptl — dev matches
+the deployment target the brief requires, gains Arc B390 and 32 GB, costs an SSH iteration
+tax, **chosen**; (c) add WSL2 — another environment to pin plus EGL quirks, **deferred**
+but retained as the escape hatch.
+
+**Decision.** The laptop is for code, git and the Speechmatics client. bm-ptl runs all
+MuJoCo work.
+
+The outstanding MuJoCo compile-check of the SO-101 asset moves to bm-ptl, as does M02's
+rendered PNG and every sim module's iteration loop. Note the cost: with (a) rejected and
+(c) unbuilt, **RISK-03 (offscreen rendering on bm-ptl) now has no fallback** and the M03
+rendering probe becomes a blocking prerequisite. bm-ptl's Sept 17 00:15 expiry now bounds
+simulation development, not just benchmarking, so work must stay pushed to git rather than
+living on the instance.
+
+---
+
 ## M02 prerequisite: SO-101 asset acquisition — adopted from TheRobotStudio/SO-ARM100 (fulfills ADR-016)
 
 **Recorded:** Sept 11, 2026 · **Closes:** RISK-01 · **Fulfills:** ADR-016

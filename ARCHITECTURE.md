@@ -126,7 +126,7 @@ Two flows exist that are **not** the demo path and must be labelled as such in t
 
 | Component | laptop | kaggle | bm-ptl |
 |---|---|---|---|
-| MuJoCo sim, eval harness | dev + data gen | — | **final demo (brief p3)** |
+| MuJoCo sim, eval harness | **no** — blocked, ADR-020 | — | **all of it**: dev, data gen, eval, final demo (brief p3) |
 | CommandSource: text | yes | — | yes |
 | CommandSource: voice | **only here** (`CONSTRAINTS.md:40`) | — | never |
 | Grounder | yes | — | yes |
@@ -669,18 +669,66 @@ the Day-4 drop rule.
 
 ---
 
+### ADR-020 — Simulation runs on bm-ptl, not the laptop
+
+**Context.** `mujoco.MjModel.from_xml_path` fails on the laptop with
+`OSError: [WinError 4551] An Application Control policy has blocked this file`. Windows
+Smart App Control is enforced (registry `VerifiedAndReputablePolicyState = 1`) and blocks
+`mujoco.dll` as an unsigned binary with insufficient Microsoft cloud reputation, confirmed
+via `Microsoft-Windows-CodeIntegrity/Operational` Events 3077/3118 and
+`Get-AuthenticodeSignature`. Reproduced identically on `mujoco==3.13.0` and `3.2.7`, so it
+is an OS policy issue, not an asset or package defect (`scenes/so101/VERIFICATION.md`).
+This surfaced during M02's asset prerequisite and was filed as RISK-11.
+
+**Options.**
+- (a) Disable Smart App Control locally. It is a **one-way** change — Windows cannot
+  re-enable it without a clean OS reinstall — and it is a standing security regression on
+  the developer's daily machine for the sake of one week's project. Rejected.
+- (b) Run all MuJoCo work on bm-ptl. Development then matches the deployment target the
+  brief actually requires (p3: the simulator and inference pipeline must execute on Core
+  Ultra Series 2/3), and gets the Arc B390 iGPU and 32 GB RAM. The cost is an SSH-mediated
+  iteration loop for every simulation change.
+- (c) Add WSL2 as a local Linux sim environment. Another environment to pin, reason about
+  and reproduce, plus EGL/offscreen-rendering quirks under WSL. Deferred, not rejected —
+  it stays available if the SSH tax proves worse than expected.
+
+**Decision.** (b). The laptop is for code, git and the Speechmatics client. bm-ptl runs all
+MuJoCo work.
+
+**Consequences.** The outstanding MuJoCo compile-check of the SO-101 asset moves to bm-ptl,
+as does M02's done-when rendered PNG and every subsequent simulation module's iteration
+loop. This has an unplanned upside: it collapses the "does the demo actually run on Intel
+hardware" question (brief p3) from a Day-5 integration risk into the everyday development
+path, and it retires the laptop-versus-bm-ptl environment drift that the two separate
+requirements files were tracking.
+
+It also has a real cost that must be managed rather than assumed away. **RISK-03 — whether
+MuJoCo offscreen rendering works on bm-ptl at all — is now load-bearing with no local
+fallback**, because option (a) is rejected and (c) is not built. The rendering probe folded
+into M03 (ADR-014) is therefore promoted from a fifteen-minute convenience check to a
+blocking prerequisite: if offscreen rendering fails on bm-ptl, WSL2 under option (c) must be
+built immediately, and that decision cannot wait for Day 5. Iteration latency rises for all
+sim modules, and bm-ptl's expiry on Sept 17 00:15 (`CONSTRAINTS.md:5`) now bounds simulation
+development, not merely benchmarking — so the working tree must stay pushed to git rather
+than living only on the instance.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
 
-- **SO-101 asset source and licence** (RISK-01) — blocks M02 and every downstream module.
-- **MuJoCo rendering on bm-ptl** (RISK-03) — if offscreen rendering fails, the split
-  between where the video is recorded and where the benchmark runs must be decided and
-  disclosed.
+- **MuJoCo rendering on bm-ptl** (RISK-03) — **promoted to blocking by ADR-020.** With the
+  laptop rejected as a sim host, there is no local fallback: if offscreen rendering fails on
+  bm-ptl, WSL2 (ADR-020 option (c)) must be built immediately rather than deferred. The M03
+  probe is now a prerequisite, not a convenience.
 - **Platform video length limit** (RISK-10) — nothing in `SUBMISSION.md` records one.
 
 ### Closed since first issue (Sept 11, 2026)
 
+- **SO-101 asset source and licence** (RISK-01) — closed. TheRobotStudio/SO-ARM100 @
+  `eecbe3e0`, Apache-2.0, unmodified per ADR-016; provenance in
+  `scenes/so101/PROVENANCE.md`. M02 is unblocked.
 - **Actuated DoF per arm** (RISK-02) — closed by ADR-016. No longer a decision: the adopted
   asset's shipped DoF is authoritative and Builder reports it in M01/M02.
 - **Speechmatics credentials** (RISK-04) — handling closed by ADR-019 (`.env`, gitignored,
@@ -690,3 +738,6 @@ These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
   rate as measured; failure modes narrated in the video.
 - **Acceptability of `pour` without fluid** (RISK-08) — closed by ADR-017, with disclosure
   required in both `README.md` and the video narration.
+- **Laptop cannot run MuJoCo** (RISK-11, raised by builder during the M02 asset
+  prerequisite) — closed by ADR-020. Smart App Control stays enabled; all MuJoCo work moves
+  to bm-ptl.
