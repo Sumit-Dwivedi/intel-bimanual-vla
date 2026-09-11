@@ -1,3 +1,4 @@
 numpy==2.4.6
 openvino==2026.3.1
 openvino-telemetry==2025.2
+mujoco==3.2.7
