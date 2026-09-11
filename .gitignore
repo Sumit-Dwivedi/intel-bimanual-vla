@@ -19,6 +19,11 @@ data/
 *.mp4
 *.avi
 
+# Ad hoc probe/debug render output (scripts/probe_render.py); committed render
+# evidence lives under docs/images/ instead, named per module.
+out_probe.png
+out/
+
 # Hugging Face cache
 .cache/
 
