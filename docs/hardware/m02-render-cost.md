@@ -76,3 +76,11 @@ C:\Users\devcloud\project\ov_env\Scripts\python.exe scripts\probe_gl_renderer.py
 The three-configuration benchmark instantiates `TableSettingEnv(cameras=...)`
 for each of `None`, `['front']`, and all five camera names, and times
 `step(np.zeros(12))` after a 5-step warmup.
+
+## Note on fork/spoon materials
+
+Note: fork and spoon share fork_material by design. They are
+distinguishable by shape and position in the scene, not by color. The
+front camera resolution renders them as small pale slivers; higher-
+resolution or closer camera angles used for the cover image will
+disambiguate them.
