@@ -123,7 +123,9 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
 - **Outputs.** `src/bimanual/sim/assets/so101_dual_table.xml` plus meshes, a
   `TableSettingEnv` wrapper exposing `reset(seed)`, `step(action)`,
   `render(camera)`, `get_state()`, and `scripts/view_scene.py`.
-- **Agent.** builder. **Runs on.** laptop.
+- **Agent.** builder. **Runs on.** laptop for MJCF authoring; bm-ptl for compile and
+  render, per ADR-020 (MuJoCo cannot import on the laptop — Smart App Control blocks the
+  unsigned `mujoco.dll`).
 - **Depends on.** M01.
 - **Done when.**
   1. `python scripts/view_scene.py --headless --save out/scene.png` writes a PNG showing

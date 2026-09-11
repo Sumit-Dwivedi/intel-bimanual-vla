@@ -714,6 +714,64 @@ than living only on the instance.
 
 ---
 
+### ADR-021 — Dual-arm scene composed by scripted renaming, not MJCF `<include>`
+
+**Context.** `PLAN.md` M02 names two candidate ways to duplicate the unmodified SO-101 arm
+for the bimanual scene: an MJCF `<include>`, or hand-copying the body tree. MuJoCo requires
+every body, joint, site and actuator name to be unique across the whole compiled model, and
+`<include>` was suspected, not yet confirmed, to have no prefix mechanism to keep two copies
+of the same arm from colliding on every name.
+
+**Options.**
+- (a) `<include>` `scenes/so101/so101_new_calib.xml` twice. Empirically tested on bm-ptl via
+  `scripts/probe_include_namespace.py` (mujoco 3.2.7): the compiler rejects it before naming
+  is even reached — `ValueError: XML Error: File 'scenes/so101/so101_new_calib.xml' already
+  included / Element 'include', line 4`. MuJoCo treats repeated inclusion of the identical
+  file as an error outright, and even a byte-identical second copy under a different filename
+  would still collide on every body/joint/site/actuator name, since `<include>` has no prefix
+  attribute. Ruled out.
+- (b) Hand-copy the arm's body tree twice directly into the new scene file, retyping renamed
+  copies of the ~120 lines of nested `<body>`/`<joint>`/`<site>` XML (7 bodies, 6 joints, two
+  sites, ~40 mesh geoms per arm). Simple to read, but a future upstream recalibration (or a
+  typo in one of the two copies) has no tooling to catch a missed or mismatched rename —
+  exactly the transcription failure mode ADR-016 already worried about for a single arm.
+- (c) Write `scripts/gen_dual_scene.py`: parse the unmodified upstream
+  `so101_new_calib.xml` with `xml.etree.ElementTree` (stdlib only, no `mujoco` import, so it
+  runs on the laptop despite ADR-020), deep-copy its single top-level body twice, prefix every
+  body/joint/site name (`armA_`/`armB_`), reposition each copy's base, and generate a matching
+  renamed actuator pair. Splice the two generated bodies into a hand-authored template holding
+  the table, drawer, props and cameras. Mesh and material definitions are declared **once** in
+  the shared `<asset>` block, since geometry is not per-instance data — only body transforms,
+  joints and actuators need to be.
+
+**Decision.** (c). `scripts/gen_dual_scene.py` generates
+`src/bimanual/sim/assets/so101_dual_table.xml`. The deciding factor was empirical, not
+inspection: `scripts/probe_include_namespace.py` closed option (a) with a hard compiler
+rejection, not merely a predicted naming collision, so no amount of file-splitting rescues
+`<include>` here. Between the two renaming-required options that remained, the deciding
+factor was that (b) has no mechanism to guarantee the two copies stay in sync with each other
+or with upstream, while (c) makes resynchronization a single command
+(`python scripts/gen_dual_scene.py`) that is provably faithful to the upstream source because
+it is generated *from* it, not retyped *from reading* it.
+
+**Consequences.** The dual-arm scene file is derived, not hand-authored, in its arm sections;
+a header comment marks the generated regions and points back at the generator so a future
+editor does not hand-edit a body that the next regeneration would silently discard. This gives
+ADR-016's "adopt the asset's shipped kinematics unmodified" a mechanical guarantee rather than
+a discipline one: the generator copies the upstream body tree by value, so an accidental
+hand-edit of kinematics does not survive regeneration. The cost is one more script to maintain
+and a full ~30 KB regenerated block in the diff whenever upstream or the layout constants
+change, rather than a small hand-edited delta — accepted, since the alternative is exactly the
+double-maintenance failure mode ADR-016 flagged. The table, drawer, prop and camera sections of
+the generated file are hand-authored and marked safe to edit directly; only the arm bodies and
+actuators are generated. Layout follows from a stated reach assumption (also recorded as
+comments in the generator and the generated file): SO-ARM100 reach is approximately 0.30 m, so
+arm bases are placed 0.50 m apart (0.25 m off the table centreline on each long edge) to leave
+roughly a 0.10 m wide band at the table's centre reachable by both arms, where all five props
+are placed.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

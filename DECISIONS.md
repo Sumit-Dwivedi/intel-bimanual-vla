@@ -11,6 +11,43 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-021 — Dual-arm scene composed by scripted renaming, not MJCF `<include>`
+
+**Recorded:** Sept 11, 2026 · **Module:** M02 (dual-SO-101 table scene)
+
+`PLAN.md` M02 named two candidate ways to duplicate the unmodified SO-101 arm for the
+bimanual scene: MJCF `<include>`, or hand-copying the body tree. MuJoCo requires every
+body, joint, site and actuator name to be unique across the whole compiled model.
+
+Tested empirically on bm-ptl before deciding, via `scripts/probe_include_namespace.py`
+(mujoco 3.2.7): `<include>`-ing `scenes/so101/so101_new_calib.xml` twice does not fail on
+a naming collision — it fails earlier, because MuJoCo's compiler refuses to include the
+same file twice at all: `ValueError: XML Error: File 'scenes/so101/so101_new_calib.xml'
+already included / Element 'include', line 4`. `<include>` has no prefix attribute, so
+even a byte-identical second copy under a different filename would still collide on every
+body/joint/site/actuator name. `<include>` is therefore not viable for arm duplication,
+full stop — this is the deciding factor, established by measurement rather than by reading
+the MJCF spec alone.
+
+Hand-copying the ~120-line body tree twice by hand was rejected in favour of
+`scripts/gen_dual_scene.py`: a stdlib-only (`xml.etree.ElementTree`, no `mujoco` import,
+runs on the laptop despite ADR-020) script that parses the unmodified upstream
+`so101_new_calib.xml`, deep-copies its body tree twice, prefixes every body/joint/site name
+(`armA_`/`armB_`), repositions each copy, generates a matching renamed actuator pair, and
+splices the result into a hand-authored table/drawer/props/cameras template. Mesh and
+material definitions are declared once, shared by both arm copies, since geometry is not
+per-instance data. The deciding factor over hand-copying: a script guarantees the two arm
+copies stay byte-faithful to upstream and to each other, resynchronized by a single command
+rather than by two independent manual edits with nothing to catch a missed rename — the same
+transcription-drift failure mode ADR-016 already flagged for the single-arm case.
+
+Layout: SO-ARM100 reach is approximately 0.30 m (stated assumption), so arm bases are
+placed 0.50 m apart on the table's two long edges (0.25 m off centreline each), leaving a
+roughly 0.10 m wide band at the table centre reachable by both arms, where the five props
+sit. Full context, options and consequences in `ARCHITECTURE.md` ADR-021.
+
+---
+
 ## M01 — RISK-07 resolved: `openvino-telemetry` pin unified to `2025.2`
 
 **Recorded:** Sept 11, 2026 · **Closes:** RISK-07 · **Module:** M01 (repo scaffold and
