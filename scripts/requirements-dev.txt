@@ -28,3 +28,9 @@ torch==2.14.0+cpu
 PyYAML==6.0.3
 python-dotenv==1.2.3
 kaggle==2.2.4
+
+# Test runner (M04). Pinned to what was actually installed and verified on
+# this laptop on 2026-09-12 via `pip install pytest`. Needed so
+# `pytest tests/...` is reproducible from a fresh clone -- a test suite that
+# cannot be run is not reproducible (CONSTRAINTS.md reproducibility line).
+pytest==9.1.1

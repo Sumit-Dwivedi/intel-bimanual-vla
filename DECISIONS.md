@@ -11,6 +11,39 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M04 — CommandSource ABC with Text and Voice implementations (voice stub)
+
+**Recorded:** Sept 12, 2026 · **Follows:** ADR-002 · **Feeds:** M05
+
+Built per `ARCHITECTURE.md` ADR-002 and the section 1 component-contract table, not per
+the simplified `get_command() -> str` signature that was floated when this module was
+handed off: `CommandSource` is abstract with `poll() -> CommandEvent | None` and
+`close()`, non-blocking on both implementations. `CommandEvent` carries `text`,
+`timestamp`, `source_id`, `confidence: float | None`, `raw_meta: dict`
+(`src/bimanual/command/events.py`).
+
+`TextCommandSource` (`src/bimanual/command/text_source.py`) is constructible from a
+literal CLI string, a file (one command per line), or stdin (read eagerly at
+construction so `poll()` itself never blocks). It does not validate or strip
+text — empty and whitespace-only commands pass through unchanged, since deciding what
+counts as a "real" command is M05's Grounder's job, not this transport's.
+
+`VoiceCommandSource` (`src/bimanual/command/voice_source.py`) is a stub with the right
+shape only: constructed from an audio file `Path`, emits one fixed placeholder
+transcription with `source_id="voice_stub"` and a placeholder `confidence`, then `None`.
+Speechmatics is not wired — that is M15, the droppable bonus (`CONSTRAINTS.md:38-41`).
+
+Enforcement of ADR-002's "no audio crosses the boundary" is structural, not a comment:
+`grep -ri "audio|pcm|wav|microphone" src/bimanual/language src/bimanual/policy` returns
+no matches. `tests/test_command_source.py` (11 tests, all passing) covers normal text,
+empty string, whitespace-only, an unknown-word command, and a single test parameterised
+over both `TextCommandSource` and `VoiceCommandSource` proving they satisfy the same
+`CommandSource` contract. `pytest==9.1.1` was not previously installed on the laptop; it
+is now pinned in `scripts/requirements-dev.txt` so the suite is reproducible from a
+fresh clone.
+
+---
+
 ## M03 — OpenVINO conversion smoke test complete (b50e300)
 
 **Recorded:** Sept 12, 2026 · **Closes:** ADR-014's first-48-hours requirement ·
