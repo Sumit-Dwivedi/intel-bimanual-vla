@@ -85,8 +85,26 @@ print()
 
 print("Stage 2 -- create GL context and render offscreen (the actual RISK-03 probe)")
 print("---------------------------------------------------------------------------")
+
+# MuJoCo validates the requested size against the model's offscreen framebuffer and
+# raises BEFORE it ever touches GL. Asking for more than the scene declares therefore
+# produces a failure that looks like a rendering problem but is not one -- it would
+# send us chasing GL backends over a number in the XML. Clamp instead, and say so.
+REQ_W, REQ_H = 1280, 720
+fb_w = int(model.vis.global_.offwidth)
+fb_h = int(model.vis.global_.offheight)
+width, height = min(REQ_W, fb_w), min(REQ_H, fb_h)
+print("  scene offscreen framebuffer : %dx%d" % (fb_w, fb_h))
+if (width, height) != (REQ_W, REQ_H):
+    print("  requested %dx%d exceeds it -- clamped to %dx%d."
+          % (REQ_W, REQ_H, width, height))
+    print("  Not a GL problem. To render larger, the scene XML needs:")
+    print("      <visual><global offwidth=\"1280\" offheight=\"720\"/></visual>")
+    print("  That belongs in our own M02 scene, not in the unmodified upstream asset (ADR-016).")
+print()
+
 try:
-    renderer = mujoco.Renderer(model, height=720, width=1280)
+    renderer = mujoco.Renderer(model, height=height, width=width)
 except Exception:
     traceback.print_exc()
     print()
