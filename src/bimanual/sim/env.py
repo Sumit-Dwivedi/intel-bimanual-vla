@@ -59,18 +59,13 @@ _DEFAULT_SCENE_PATH = (
     pathlib.Path(__file__).resolve().parent / "assets" / "so101_dual_table.xml"
 )
 
-# Reference-only documentation constant: the M02 scene's full camera set
-# (ARCHITECTURE.md section 1, "overhead camera, front camera, per-arm wrist
-# cameras", plus the M02(e) drawer_view camera). This is NOT used for
-# validation anywhere in this class -- validation is always performed against
+# NOTE ON CAMERA VALIDATION. There is deliberately no hardcoded list of
+# expected camera names here. Validation is always performed against
 # `self._camera_names`, discovered from the compiled model via `mj_id2name`
-# in `__init__`. Keeping validation tied to the hardcoded tuple below would
-# silently re-break the property established in commit 80f7316 ("standardize
-# camera obs keys to match MJCF camera names"): that adding a camera to the
-# MJCF requires no env.py edit. If this tuple and the model's actual cameras
-# ever disagree, the model wins and this comment is stale documentation to
-# fix, not a bug in the class.
-_EXPECTED_CAMERAS = ("overhead", "front", "armA_wrist", "armB_wrist", "drawer_view")
+# in `__init__`. A hardcoded tuple would silently re-break the property
+# established in commit 80f7316 ("standardize camera obs keys to match MJCF
+# camera names"): that adding a camera to the MJCF requires no env.py edit.
+# The model is the single source of truth.
 
 
 class TableSettingEnv:
@@ -127,7 +122,7 @@ class TableSettingEnv:
         # hardcoding a list, so this class keeps working if the
         # hand-authored camera section of the scene changes. This is the
         # ONE source of truth for camera-name validation everywhere in this
-        # class -- see the _EXPECTED_CAMERAS comment above.
+        # class -- see the camera-validation note at the top of this module.
         self._camera_names = [
             mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_CAMERA, i)
             for i in range(self.model.ncam)
@@ -288,8 +283,8 @@ class TableSettingEnv:
         """Raise ValueError if `cameras` names anything not in the model.
 
         Validates against `self._camera_names` (discovered from the
-        compiled model), never against the reference-only `_EXPECTED_CAMERAS`
-        constant -- see that constant's docstring comment for why.
+        compiled model), never against a hardcoded list -- see the
+        camera-validation note at the top of this module for why.
         """
         if cameras is None:
             return

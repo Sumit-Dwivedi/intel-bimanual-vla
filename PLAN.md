@@ -132,10 +132,13 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
   unsigned `mujoco.dll`).
 - **Depends on.** M01.
 - **Done when.**
-  1. `python scripts/view_scene.py --headless --save docs/images/m02-scene.png` writes a
-     PNG showing both arms, the drawer and all five objects (plate, mug, fork, spoon,
-     water bottle). (Path corrected post-hoc: the artifact actually produced and
-     committed is `docs/images/m02-scene.png`, not `out/scene.png`.)
+  1. The scene is documented by two artifacts: `docs/images/m02-scene.png` (front
+     camera, showing both arms and all five props on the table) and
+     `docs/images/m02-drawer-view-open.png` (drawer camera, showing the drawer state
+     that the front camera occludes). Together they demonstrate the full task
+     workspace. Two artifacts rather than one because no single camera can show both:
+     the drawer sits under an opaque tabletop, verified empirically by rendering it
+     open from every existing camera (ADR-021, and the drawer_view fix in 9860072).
   2. `TableSettingEnv.reset(seed=0)` returns observations whose shapes are printed and
      recorded in the Tester report.
   3. The actuated DoF count per arm is **read off the asset and written into
@@ -349,6 +352,19 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
   grounder. This is the learned-policy branch (brief p2 objective 4).
 - **Inputs.** M09 dataset, LeRobot, Kaggle GPU (`CONSTRAINTS.md:57`: 30 hrs/week free,
   CLI-driven; token present at `.kaggle/access_token`, ignored by `.gitignore:25`).
+- **Render budget (read before sizing the dataset).** ACT is conditioned on camera
+  observations, so the M09 dataset must be collected **with** cameras — the render cost
+  lands on M09 collection, not on this module. Kaggle training reads pre-rendered frames
+  and never invokes MuJoCo. `TableSettingEnv` with three cameras (`front`, `armA_wrist`,
+  `armB_wrist`) costs **~456 ms/step** per ADR-022's measured numbers (0.20 ms physics +
+  3 x 152.05 ms/camera). At that rate ~70,000 collected steps is about 9 hours of
+  wall-clock collection on bm-ptl. Size the demonstration dataset to fit one collection
+  window, or plan a two-session split — and note bm-ptl expires Sept 17
+  (`CONSTRAINTS.md:5`), so this wall-clock is not recoverable.
+  **This contradicts ADR-022's stated consequence that M09 runs with no cameras.**
+  ADR-005's privileged state governs how the scripted controller *chooses* actions; it
+  does not mean the logged dataset can omit images. ADR-022 needs correcting — flagged,
+  not silently patched here.
 - **Outputs.** `scripts/train_act.py`, `configs/act.yaml`, a Kaggle notebook/kernel
   spec committed to the repo, a checkpoint pulled back to the laptop, and a training log
   with the loss curve saved as an artifact.
