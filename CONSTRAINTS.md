@@ -3,8 +3,6 @@
 ## Hard Deadlines
 - Hackathon submission: September 16, 2026
 - bm-ptl instance expires: September 17, 2026 at 00:15 local (end of Sept 16)
-- Kick-off date: [today's date]
-- Days remaining: [5 days 10 Hour]
 
 ## Hardware
 - bm-ptl: Intel Core Ultra 7 358H, Panther Lake, 8-16 cores, 32-64 GB
