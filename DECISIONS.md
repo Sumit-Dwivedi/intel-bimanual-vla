@@ -11,6 +11,48 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M02 — TableSettingEnv, view_scene.py, physics probe, front-camera fix (fulfills ADR-020, ADR-021)
+
+**Recorded:** Sept 11, 2026 · **Module:** M02 (dual-SO-101 table scene v0) ·
+**Relates to:** ADR-020 (sim runs on bm-ptl), ADR-021 (generator, not hand-edit)
+
+Compliance-reviewer found M02 done-when criteria 1, 2 and 4 unmet (`src/bimanual/sim/env.py`
+and `scripts/view_scene.py` did not exist yet). Closed in four separately committed steps,
+each run and verified on bm-ptl per ADR-020 (mujoco cannot import on the laptop):
+
+1. `src/bimanual/sim/env.py` — `TableSettingEnv` with `reset(seed)`, `step(action)`,
+   `render(camera)`, `get_state()`, `close()`. Default scene path resolves via
+   `Path(__file__).resolve().parent`, not the process cwd; verified importable and running
+   from a cwd other than the repo root (`C:\Users\devcloud\import_check.py`, run from
+   `C:\Users\devcloud`). Measured on bm-ptl (mujoco 3.2.7): `nq=48 nv=43 nu=12`, 4 cameras
+   discovered from the model (`overhead`, `front`, `armA_wrist`, `armB_wrist`).
+2. `scripts/view_scene.py` — `python scripts/view_scene.py --headless --save out/scene.png`
+   writes a 1280x720 PNG (clamped to the scene's declared framebuffer) via `TableSettingEnv`.
+3. `scripts/probe_physics_stability.py` — reset(seed=0), 1000 steps of zero action, checked
+   for NaN and free-body tunneling at every step. **PASS**: no NaN, no free body dropped
+   below `FLOOR_Z=0.30` m (5 cm below the 0.35 m tabletop surface — chosen so ordinary
+   millimetre-scale contact settling cannot trip it; see
+   `docs/hardware/m02-physics-stability.md` for the full derivation and the measured per-body
+   minimum z values). Per the task's stop rule, this gated whether subtask (d) proceeded —
+   it passed, so (d) went ahead.
+4. Front-camera clipping fix. The camera used `mode="targetbody" target="table"`, which
+   aims at the table body's own origin (z=0); measured on bm-ptl, the highest arm geometry
+   at the reset pose reaches z≈0.667 against a 0.35 m tabletop, so the frame cropped both
+   arms above the gripper. The camera is emitted by `scripts/gen_dual_scene.py`'s template
+   string, not hand-typed into the generated XML, so per ADR-021's consequences the fix went
+   into the generator (`FRONT_CAM_POS`/`FRONT_CAM_TARGET`/`look_at_xyaxes`, a stdlib-only
+   look-at basis construction) and the scene was regenerated, not hand-patched. `git diff`
+   on the regenerated XML shows only the one `<camera name="front".../>` line changed.
+   Re-rendered `docs/images/m02-scene.png`; both arms fully visible on inspection. Overhead
+   and wrist cameras were not touched (re-rendered for comparison; identical framing).
+   `git diff --stat -- scenes/so101/` is empty throughout.
+
+The package was installed editable on bm-ptl (`pip install -e .`) so `import bimanual` and
+`from bimanual.sim.env import TableSettingEnv` resolve from any working directory, per the
+task's tester-readiness requirement.
+
+---
+
 ## ADR-021 — Dual-arm scene composed by scripted renaming, not MJCF `<include>`
 
 **Recorded:** Sept 11, 2026 · **Module:** M02 (dual-SO-101 table scene)
