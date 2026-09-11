@@ -11,6 +11,124 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-023 (ratified Sept 12): Cut ACT training from critical path.
+
+**Context.** Sept 12 is Day 2 of a schedule with five days left, and the plan is one
+module behind. M03 — "a hard blocker for the whole OpenVINO story (20 rubric points)",
+forced into the first 48 hours by ADR-014 — did not ship on Day 1 and is verifiably absent
+(`scripts/` has no `ov_smoke.py`; `benchmarks/` has no `ov-smoke-notes.md`). Day 2 as
+previously planned therefore carried M03 (3 h) plus M04–M08 (23 h) = **26 builder-hours in
+one calendar day**, before the per-module tester → compliance-reviewer → tutor →
+docs-writer passes that `PLAN.md` section 2 mandates. Day 1's own shape is the evidence for
+what a day actually holds: M01 (2 h budgeted) + M02 (6 h budgeted) plus a correction pass
+(ADR-016..ADR-022 and the opt-in rendering refactor) consumed the whole day.
+
+Two further facts bind. ADR-020 means every simulation module runs on bm-ptl, and bm-ptl
+expires Sept 17 00:15 (`CONSTRAINTS.md:5`), one day past the Sept 16 submission
+(`CONSTRAINTS.md:4`) — so Day 6 is a working day, not a retry window. And ADR-022's
+correction put M09's demonstration collection at ~456 ms/step, i.e. ~8.9 h of bm-ptl wall
+clock for 70,000 attempted steps, which can only be spent overnight and only after M06,
+M07 and M08 have all closed.
+
+The arithmetic that follows is not close. M09b needs M06 + M07 + M08; at ~8
+builder-hours/day those close Day 4 evening at the earliest; an overnight collection then
+lands Day 5 morning, M11 trains Day 5, and GATE-1 could not be held before Day 5 night.
+`PLAN.md`'s GATE-1 block already forbids sliding the gate even into Day 4.
+
+**Options.**
+- (a) **Keep ACT, slide GATE-1 to Day 5 night.** Leaves the OpenVINO benchmark, the
+  bm-ptl pipeline run, the 10-seed recording, the documentation and the submission all
+  stacked on Day 6, on hardware that expires that night. Directly contradicts
+  `CONSTRAINTS.md:50-52`, which rewards a complete pipeline over half-working ML.
+- (b) **Keep ACT, shrink the dataset to the pre-committed 4 h / ~31,500-attempted-step
+  run.** This was `PLAN.md`'s own recommended degradation, and it is still the right
+  degradation *within* the learned branch — but it saves ~5 h of unattended wall clock,
+  not the ~18 builder-hours the schedule is actually short. It treats a capacity problem
+  as a wall-clock problem.
+- (c) **Cut ACT (M11) and its demonstration dataset (M09b) from the critical path, ship
+  the scripted controller as the policy, and keep a much cheaper frame-collection module
+  (M09a) to feed the PoseNet that ADR-009 put in the loop.**
+- (d) **Cut PoseNet (M10) instead and keep ACT.** Puts the 20-point OpenVINO criterion
+  back onto the riskiest module — exactly the dependency ADR-009 exists to break — and
+  leaves `--perception state` in the demo loop against ADR-005.
+
+**Decision.** (c). M11 and M09b move wholesale into F3 (optional revival after M18, under
+F3's existing hard stop, and realistically unreachable). The scripted controller from M06
+is the policy: F1 and F2 are activated now rather than being contingent on a GATE-1
+verdict. GATE-1 is retained on Day 3 as `CONSTRAINTS.md:50-52` requires, but is decided on
+**schedule evidence** and its outcome is pre-committed to the scripted branch.
+
+Three sub-decisions ride with it and are recorded here because they are structural, not
+scheduling detail:
+
+1. **A planning capacity is fixed at 8 builder-hours/day**, module budgets stay denominated
+   in builder-hours, and the day rather than the module absorbs the ~30% review overhead.
+   This is an assumption derived from Day 1's shape, not a measurement, and it is the
+   number to correct if the user knows their throughput differs.
+2. **Clock gates replace judgement calls.** Every day boundary in `PLAN.md` section 1A.5
+   carries a pre-committed time, and `PLAN.md` section 1A.6 is an ordered cut ladder whose
+   rungs fire on a missed gate without re-litigation. The specific hole this closes: M09b's
+   "if M08 does not close in time" had no definition of "in time", so the most
+   consequential decision in the plan was left to a tired developer at night. It is now
+   22:00 / 23:00 / abort, with a 07:00 hard stop, retained in force for F3.
+3. **M09a's camera set is re-derived from its surviving consumer.** ADR-022 fixed M09's
+   cameras at `['front', 'armA_wrist', 'armB_wrist']` *because that was M11's training
+   set*. With M11 cut, the set follows M10's PoseNet input instead: `front` +
+   `drawer_view`, because the drawer is occluded from every other camera (ADR-021) and
+   `SceneBelief` carries drawer opening. Using the measured marginal camera cost of
+   152.05 ms (`docs/hardware/m02-render-cost.md:43-49`) that is **~304.3 ms/step**, and
+   ~5,000 frames is ~25 min of bm-ptl wall clock rather than ~9 h. **This does not
+   supersede ADR-022** — ADR-022's Decision (opt-in rendering) and its ~456 ms/step figure
+   are unchanged and return with ACT if F3 revives it.
+
+**Consequences.**
+
+*What this costs, stated first and without softening.* **No policy is trained.** Brief p2
+objective 4 asks for a policy trained or fine-tuned with LeRobot or compatible tooling;
+with M11 cut, nothing satisfies it. PoseNet is a trained model but it is a perception
+network, not a policy, and it is not LeRobot. ADR-015 rule 2 already forbids calling the
+shipped control path learned; this ADR adds the positive obligation — `PLAN.md` M18
+done-when 5 — that the README *state* the gap rather than merely avoid misdescribing it,
+and that it record that the branch was chosen on schedule grounds. "We chose scripted
+because we ran out of days" and "we chose scripted because learning underperformed" are
+different claims and only the first is true.
+
+*Second cost.* M16 (full pipeline on bm-ptl) loses its day of slack: it folds into M14's
+Day-6 bm-ptl session, on the last day the instance exists. The Day-5 20:00 gate — at least
+one IR compiling on at least one device before Day 6 begins — is the only insurance left
+against that, and it is thin.
+
+*Third cost.* ADR-006 committed the evaluation harness to Day 2 specifically so that it
+would exist before there was anything good to measure. M08 now spans a Day-3 evening
+skeleton and Day 4. That is a real weakening of ADR-006 and is recorded as such rather
+than presented as equivalent. The mitigating fact is narrow but genuine: with M11 cut there
+is no second executor for the harness to be quietly shaped around, so the specific failure
+ADR-006 insured against — a harness written after the numbers exist, to fit them — is
+smaller.
+
+*What survives, and why the cut is survivable.* ADR-009's whole purpose was to stop the
+20-point OpenVINO criterion riding on ACT, and that argument now carries the submission:
+PoseNet is converted, quantized, benchmarked across CPU/GPU/NPU, and executes on Intel
+silicon on every control step of the demo. ADR-004 made M06 dual-purpose; with M11 gone it
+is simply the policy. Brief p2 objectives 1 and 3 are answered by M06 + M07, objectives 2
+and 5 by M05's grounder plus M10's OpenVINO-served perception. ADR-002's CommandSource
+seam is untouched — M04 still ships the abstraction and a stub voice source even though
+the Speechmatics implementation is unscheduled — and ADR-010's scripted `handoff`,
+ADR-012's seed-derived randomization and ADR-018's true-success-rate reporting are all
+unaffected.
+
+*Honest bottom line.* Even after this cut the plan needs ~9–10 builder-hours/day for five
+consecutive days against a capacity of ~8: roughly one day of negative float, recorded as
+RISK-12. This ADR does not make the plan comfortable. It makes the plan's failure mode
+"some scope was cut and said so" instead of "the pipeline was incomplete on Sept 16".
+
+Ratified by user Sept 12. CONSTRAINTS.md fallback clause invoked
+early on schedule evidence per compliance-reviewer's justification.
+ADR-008's numeric gate becomes a formality; scripted controller is
+the shipped policy.
+
+---
+
 ## ADR-022 — Opt-in camera rendering in `TableSettingEnv`
 
 **Ratified:** Sept 11, 2026 · **Evidence:** `docs/hardware/m02-render-cost.md`
