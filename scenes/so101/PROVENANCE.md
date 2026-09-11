@@ -82,3 +82,18 @@ between these conventions explicitly rather than assume LeRobot's linear gripper
 
 See `scenes/so101/VERIFICATION.md` for the exact `mujoco.MjModel.from_xml_path`
 command run and its result on this laptop.
+
+## Apache-2.0 §4(d) — NOTICE file
+
+Checked 2026-09-11. The upstream repository at commit
+`eecbe3e0a9ebb23e25ad7b2759b03884c6660903` contains **no NOTICE file**, so §4(d) imposes
+no carry-forward obligation.
+
+Evidence: `GET https://api.github.com/repos/TheRobotStudio/SO-ARM100/git/trees/eecbe3e0a9ebb23e25ad7b2759b03884c6660903?recursive=1`
+returned 293 tree entries with `truncated: false`; zero paths match `/notice/i`; the only
+license file in the entire tree is the root `LICENSE`.
+
+Integrity: our `scenes/so101/LICENSE` reproduces that file verbatim — git blob sha
+`261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64`, 11357 bytes, identical to the upstream blob
+sha at the same commit. A provenance note is appended below the license text, separated by
+a horizontal rule; the Apache-2.0 terms themselves are unaltered.
