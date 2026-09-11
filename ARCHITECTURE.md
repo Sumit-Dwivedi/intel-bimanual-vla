@@ -745,14 +745,29 @@ of the same arm from colliding on every name.
   joints and actuators need to be.
 
 **Decision.** (c). `scripts/gen_dual_scene.py` generates
-`src/bimanual/sim/assets/so101_dual_table.xml`. The deciding factor was empirical, not
-inspection: `scripts/probe_include_namespace.py` closed option (a) with a hard compiler
-rejection, not merely a predicted naming collision, so no amount of file-splitting rescues
-`<include>` here. Between the two renaming-required options that remained, the deciding
-factor was that (b) has no mechanism to guarantee the two copies stay in sync with each other
-or with upstream, while (c) makes resynchronization a single command
-(`python scripts/gen_dual_scene.py`) that is provably faithful to the upstream source because
-it is generated *from* it, not retyped *from reading* it.
+`src/bimanual/sim/assets/so101_dual_table.xml`.
+
+This is deliberately recorded as **two** decisions, not one, because they rest on different
+kinds of evidence and a future reader who revisits only the first will draw the wrong
+conclusion about the second.
+
+**Decision 1 — eliminate `<include>` (empirical).** `scripts/probe_include_namespace.py`,
+run on bm-ptl under mujoco 3.2.7, produced a hard compiler rejection rather than the
+predicted naming collision: `ValueError: XML Error: File '...so101_new_calib.xml' already
+included`. MuJoCo refuses repeated inclusion of the same file outright, before name
+resolution is ever reached, so no amount of file-splitting or copying-under-a-new-name
+rescues `<include>` — and even if it did, `<include>` has no prefix attribute, so the two
+copies would still collide on every body, joint, site and actuator name. This eliminates
+(a) on measured behaviour, not on inspection.
+
+**Decision 2 — prefer generation over hand-copying (judgement).** Decision 1 leaves (b) and
+(c), both of which require renaming; it says nothing about which to pick. That choice rests
+on maintainability, not on a compiler result: (b) has no mechanism to guarantee the two
+copies stay in sync with each other or with upstream, while (c) makes resynchronization a
+single command (`python scripts/gen_dual_scene.py`) that is provably faithful to the
+upstream source because it is generated *from* it, not retyped *from reading* it. This half
+is a considered preference and could reasonably be revisited; Decision 1 could not, short of
+a change in MuJoCo itself.
 
 **Consequences.** The dual-arm scene file is derived, not hand-authored, in its arm sections;
 a header comment marks the generated regions and points back at the generator so a future

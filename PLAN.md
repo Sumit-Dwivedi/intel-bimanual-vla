@@ -115,9 +115,13 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
   target resolution. Do not modify upstream `scenes/so101/` per ADR-016; add the override in
   the new dual-arm scene file. (Upstream declares 640x480; confirmed by the bm-ptl probe.)
 - **Purpose.** A loadable MJCF scene: table, two SO-101 arms mounted with an overlapping
-  workspace, a drawer with a prismatic joint, plate, mug, fork, spoon; two cameras
-  (overhead + front) plus per-arm wrist cameras if the asset allows. This is required
-  deliverable 2 (brief p4) and the substrate for everything else.
+  workspace, a drawer with a prismatic joint, and **five** manipulable props — plate, mug,
+  fork, spoon, and a water bottle. The bottle is not optional decoration: ADR-011 and
+  ADR-017 scope `pour` as a bimanual tilt-and-position motion in which arm B holds the mug
+  while arm A tilts the bottle over it, so the brief's own example command (p1) cannot run
+  end to end without it. Two cameras (overhead + front) plus per-arm wrist cameras if the
+  asset allows. This is required deliverable 2 (brief p4) and the substrate for everything
+  else.
 - **Inputs.** An SO-101 MJCF asset — **source not yet decided, see RISK-01**. Brief p1
   ("Simulated Dual SO-101 Arms"), brief p3 (MuJoCo or compatible LeRobot Gym env).
 - **Outputs.** `src/bimanual/sim/assets/so101_dual_table.xml` plus meshes, a
@@ -129,7 +133,7 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
 - **Depends on.** M01.
 - **Done when.**
   1. `python scripts/view_scene.py --headless --save out/scene.png` writes a PNG showing
-     both arms, the drawer and all four objects.
+     both arms, the drawer and all five objects (plate, mug, fork, spoon, water bottle).
   2. `TableSettingEnv.reset(seed=0)` returns observations whose shapes are printed and
      recorded in the Tester report.
   3. The actuated DoF count per arm is **read off the asset and written into
