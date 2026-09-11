@@ -1,5 +1,12 @@
 # M02 render cost — opt-in camera rendering, measured on bm-ptl
 
+> **SUPERSEDED FINDING (see ADR-022 correction):** The
+> deferred-investigation paragraph below asserts "M09 requires no
+> cameras per ADR-005." This is incorrect and was corrected in
+> ARCHITECTURE.md ADR-022's Consequences section. The original text
+> is preserved below as historical record. ADR-022 is authoritative
+> for M09's camera requirements.
+
 Measured Sept 11, 2026 on bm-ptl (`WIN-GLILH4PFDLN`), commit `731f0aa`,
 mujoco 3.2.7, `ov_env` venv. Scene: `src/bimanual/sim/assets/so101_dual_table.xml`
 (nq=48, nv=43, nu=12, nbody=23, ngeom=80). Cameras render at the env default
