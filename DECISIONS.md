@@ -53,6 +53,31 @@ task's tester-readiness requirement.
 
 ---
 
+## ADR-022 — Opt-in camera rendering in `TableSettingEnv`
+
+**Ratified:** Sept 11, 2026 · **Evidence:** `docs/hardware/m02-render-cost.md`
+
+Rendering all five cameras on every step cost ~810 ms; physics alone is 0.20 ms.
+Measured on bm-ptl: state-only 0.20 ms/step, one camera 152.25, all five 809.86 —
+a **4049x** spread. Confirmed real GPU time (`Intel(R) Arc(TM) B390 GPU`, OpenGL
+4.6), and cameras scale linearly, so there is no fixed cost to amortise.
+
+Rejected: keeping unconditional rendering (dominates step cost for callers that
+never read an image); frame caching keyed on unchanged action (policy rollouts
+change action every step, so it would never hit).
+
+**Decision.** `cameras=None` by default — render nothing. `reset()` and `step()`
+take a per-call `cameras=` override that does not mutate the instance default.
+`render()` stays ungated as an explicit escape hatch. Names validate against the
+model's discovered cameras, not a hardcoded list.
+
+M09 collects demonstrations with no cameras (ADR-005 uses privileged state, so
+every frame it rendered was discarded); M11 trains on
+`['front','armA_wrist','armB_wrist']`; M08 scores GATE-1 state-only and enables
+cameras only for the final recorded run.
+
+---
+
 ## ADR-021 — Dual-arm scene composed by scripted renaming, not MJCF `<include>`
 
 **Recorded:** Sept 11, 2026 · **Module:** M02 (dual-SO-101 table scene)

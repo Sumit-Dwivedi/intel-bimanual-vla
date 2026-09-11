@@ -787,6 +787,68 @@ are placed.
 
 ---
 
+### ADR-022 — Opt-in camera rendering in `TableSettingEnv`
+
+**Context.** The M02 env rendered all five cameras unconditionally on every
+`reset()` and `step()`, at roughly 750 ms per step (tester measured `step()` at
+0.666–0.813 s). Measured properly in `docs/hardware/m02-render-cost.md`: physics
+alone is **0.20 ms/step**, one camera is **152.25 ms/step**, all five are
+**809.86 ms/step**. Rendering is therefore not a component of step cost — it *is*
+step cost, by a factor of four thousand.
+
+The cost is real GPU time, not a misconfiguration: `scripts/probe_gl_renderer.py`
+confirms the offscreen context is `Intel(R) Arc(TM) B390 GPU` on OpenGL 4.6, not
+a software rasterizer. And cameras scale linearly — 161.93 ms each across five
+versus 152.05 ms for one, only 6.5% above linear — so there is no fixed setup
+being amortised and no camera count at which rendering everything becomes cheap.
+
+What that costs downstream, against a 50 ms/step budget in this document's own
+component table and a bm-ptl reservation that ends Sept 17 (`CONSTRAINTS.md:5`):
+- **M09 (demonstration collection)** — 100% waste. ADR-005 generates
+  demonstrations from privileged simulator state; the policy is not in the loop
+  and no image is ever read. Every rendered frame was discarded.
+- **M08 (10-seed evaluation harness)** — ADR-006 builds this once and reuses it
+  for GATE-1, the nightly checkpoint from Day 3, and M19. The cost is paid on
+  every step of every seed of every run.
+- **M19 (behaviour preservation)** — re-runs those seeds across backends and
+  precisions, multiplying the harness cost again, on the last day before the
+  instance expires.
+
+**Options.**
+- (a) Keep unconditional rendering. Rejected: it dominates step cost for every
+  caller that never looks at an image, which on this plan is most of them.
+- (b) Cache rendered frames and re-use them while the action is unchanged.
+  Rejected: policy rollouts issue a non-zero, different action every step, so the
+  cache would never hit on the workload that matters. It would only speed up the
+  zero-action stability probe, which needs no pixels at all.
+- (c) Opt in to cameras, via a constructor default plus a per-call override.
+
+**Decision.** (c). `TableSettingEnv(cameras=None)` is the default and renders
+nothing; `reset(seed, cameras=...)` and `step(action, cameras=...)` override it
+for a single call without mutating the instance default. Callers name the cameras
+they actually consume. `render(camera)` remains available as an explicit escape
+hatch regardless of the setting, so `view_scene.py` and the probes are unaffected.
+Camera names are validated against the model's discovered cameras — not a
+hardcoded list — so adding a camera to the MJCF still requires no `env.py` change.
+
+**Consequences.** Render cost becomes proportional to what a caller needs instead
+of fixed overhead. Per-module intent:
+- **M09** uses `TableSettingEnv()` with no cameras — 0.20 ms/step, so a 1000-step
+  episode costs 0.2 s of wall clock instead of 13.5 minutes.
+- **M11 (ACT training)** uses `['front', 'armA_wrist', 'armB_wrist']`, the views
+  the policy actually consumes.
+- **M08** defaults to state-only for GATE-1 scoring, and enables cameras only for
+  video capture on the final recorded run.
+
+The cost of this decision is that a caller who forgets to request a camera gets an
+obs dict without images rather than a slow one — a `KeyError` at the point of use
+instead of silent overhead. That is the right failure direction, and the
+docstrings on `reset()`/`step()` state the schema. The ~133 ms per-frame cost
+itself remains unexplained and is deliberately not pursued inside the hackathon
+window; `docs/hardware/m02-render-cost.md` records the suspects for later.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
