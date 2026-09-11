@@ -29,10 +29,32 @@ take a per-call `cameras=` override that does not mutate the instance default.
 `render()` stays ungated as an explicit escape hatch. Names validate against the
 model's discovered cameras, not a hardcoded list.
 
-M09 collects demonstrations with no cameras (ADR-005 uses privileged state, so
-every frame it rendered was discarded); M11 trains on
-`['front','armA_wrist','armB_wrist']`; M08 scores GATE-1 state-only and enables
-cameras only for the final recorded run.
+Per-module intent:
+- **M09** collects **with cameras enabled** (`front`, `armA_wrist`, `armB_wrist`
+  — ADR-005's vision path, and M11's exact training set). The scripted
+  controller reads `get_state()` to *choose actions*; the camera frames are
+  *logged into the dataset* for ACT. Cost **~456 ms/step** (0.20 ms physics +
+  3 x 152.05 ms/camera).
+- **M11** trains on those same three views; Kaggle reads pre-rendered frames and
+  never invokes MuJoCo, so the render cost lands on M09.
+- **M08** splits by executor: `--executor scripted` scores state-only
+  (0.20 ms/step, physics only); `--executor learned` **requires** cameras at
+  ~456 ms/step, because an ACT policy cannot produce an action from an obs dict
+  with no images. Video capture uses all five cameras (~809.86 ms/step) **once**,
+  on the final winning seed only.
+
+**Correction, Sept 11, 2026 — Consequences only; the Decision above is
+unchanged.** This entry previously said M09 collects with no cameras and that
+M08 scores GATE-1 state-only. Both were wrong, from one root cause: ADR-005 was
+read as governing *dataset contents* when it governs only *how the scripted
+controller selects actions*. M11's policy is camera-conditioned, so a state-only
+M09 yields a dataset ACT cannot train on; and state-only scoring of a learned
+executor is not a cheaper measurement but an impossible one. The cost is carried
+in `PLAN.md`: M09 collection moves to ~456 ms/step, and the learned half of
+GATE-1 moves from seconds to ~76 min (10 seeds x 1000 steps). Full version
+history in `ARCHITECTURE.md` ADR-022 Consequences. Note that
+`docs/hardware/m02-render-cost.md:65-66` still repeats the superseded reading and
+is not authoritative on this point.
 
 ---
 

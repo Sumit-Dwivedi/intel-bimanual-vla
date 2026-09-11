@@ -833,12 +833,26 @@ hardcoded list — so adding a camera to the MJCF still requires no `env.py` cha
 
 **Consequences.** Render cost becomes proportional to what a caller needs instead
 of fixed overhead. Per-module intent:
-- **M09** uses `TableSettingEnv()` with no cameras — 0.20 ms/step, so a 1000-step
-  episode costs 0.2 s of wall clock instead of 13.5 minutes.
+- **M09 (demonstration collection)** collects **with cameras enabled** —
+  `['front', 'armA_wrist', 'armB_wrist']`, the vision path ADR-005 specifies and
+  the exact set M11 consumes. The scripted controller reads `get_state()` for
+  *action selection*; the camera frames are recorded into the *dataset* for
+  downstream ACT training. Cost: **~456 ms/step** (0.20 ms physics +
+  3 x 152.05 ms/camera) per the M11 render-budget note in `PLAN.md`.
 - **M11 (ACT training)** uses `['front', 'armA_wrist', 'armB_wrist']`, the views
-  the policy actually consumes.
-- **M08** defaults to state-only for GATE-1 scoring, and enables cameras only for
-  video capture on the final recorded run.
+  the policy actually consumes. Kaggle reads pre-rendered frames and never
+  invokes MuJoCo, so the render cost lands on M09, not here.
+- **M08 (evaluation harness)** depends on which executor is being scored, and the
+  two cases are not interchangeable:
+  - `--executor scripted` — state-only is correct: 0.20 ms/step, physics only.
+    The scripted controller reads `get_state()` and never touches an image.
+  - `--executor learned` — cameras are **required**. The ACT policy cannot
+    produce an action from an obs dict with no images, so the harness must render
+    the same camera set M11 trained on (`front`, `armA_wrist`, `armB_wrist`) at
+    **~456 ms/step**. This is not an optimization the harness may skip.
+  - Video capture on the final winning seed — all five cameras at
+    **~809.86 ms/step**, run **once** on that one seed, not once per seed of
+    every run.
 
 The cost of this decision is that a caller who forgets to request a camera gets an
 obs dict without images rather than a slow one — a `KeyError` at the point of use
@@ -846,6 +860,25 @@ instead of silent overhead. That is the right failure direction, and the
 docstrings on `reset()`/`step()` state the schema. The ~133 ms per-frame cost
 itself remains unexplained and is deliberately not pursued inside the hackathon
 window; `docs/hardware/m02-render-cost.md` records the suspects for later.
+
+**Correction, Sept 11, 2026 (this ADR's Consequences only; the Decision is
+unchanged).** As first written, this section said M09 runs with no cameras and
+that M08 defaults to state-only for GATE-1 scoring. Both were category errors,
+and they shared one root cause: reading ADR-005 as a statement about *dataset
+contents* when it is a statement about *how the scripted controller selects
+actions*. ADR-005 permits privileged `get_state()` in the data-generation loop;
+it says nothing about what must be logged. M11 trains a camera-conditioned ACT
+policy, so M09's dataset must contain camera frames — a state-only M09 would
+produce a dataset ACT cannot train on. The M08 error follows from the same
+confusion in the opposite direction: state-only scoring is sound for
+`--executor scripted`, but a learned executor fed an image-free obs dict cannot
+emit an action at all, so state-only GATE-1 scoring of the learned branch is not
+a cheaper measurement, it is an impossible one. The cost of the correction is
+real and is carried in `PLAN.md`: M09's collection moves from 0.20 ms/step to
+~456 ms/step, and the learned half of GATE-1 moves from seconds to roughly 76
+minutes for 10 seeds x 1000 steps. The related note at
+`docs/hardware/m02-render-cost.md:65-66` ("M09 requires no cameras per ADR-005")
+repeats the superseded reading and is not authoritative; this paragraph governs.
 
 ---
 

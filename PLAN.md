@@ -30,8 +30,8 @@ later by Tester.
 |---|---|---|
 | Day 0 | Sept 10, 2026 | **Done.** bm-ptl reachable, OpenVINO sees CPU/GPU/NPU, trivial-model benchmark ran (`CONSTRAINTS.md:60-65`, `docs/hardware/bmptl-verification.md`). |
 | Day 1 | Sept 11, 2026 | **Today.** Planning + scaffold + scene v0. |
-| Day 2 | Sept 12, 2026 | Command layer, scripted controller, randomization, eval harness. |
-| Day 3 | Sept 13, 2026 | Demo collection, perception model, ACT training launch. **GATE-1 at end of day.** |
+| Day 2 | Sept 12, 2026 | Command layer, scripted controller, randomization, eval harness. **M09 collection launches on bm-ptl the moment M08 closes, and runs unattended overnight** — see the Day 3 schedule note. |
+| Day 3 | Sept 13, 2026 | Collection stops 08:00, perception model, ACT training launch. **GATE-1 at end of day, and it costs ~80 min of bm-ptl wall clock, not seconds.** |
 | Day 4 | Sept 14, 2026 | OpenVINO export + quantization + bm-ptl benchmark, voice input. |
 | Day 5 | Sept 15, 2026 | Full pipeline on bm-ptl, bug hunt, docs, repo public. |
 | Day 6 | Sept 16, 2026 | Final 10-seed recorded run, submission assembly, submit. |
@@ -295,21 +295,78 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
      `--executor learned` requires no change to harness code (verified by
      compliance-reviewer against ADR-006).
   4. Re-running with the same seeds and executor reproduces the same summary numbers.
+  5. **Camera selection is derived from the executor, not from a global default**, per
+     ADR-022's corrected Consequences. The two scoring modes are not interchangeable:
+     - `--executor scripted` → `cameras=None`. State-only is *correct* here: the
+       scripted controller reads `get_state()` and never consumes an image.
+       0.20 ms/step, physics only.
+     - `--executor learned` → cameras **required**, and the set must equal M11's
+       training-time set (`front`, `armA_wrist`, `armB_wrist`), ~456 ms/step. Tester
+       verifies that requesting `--executor learned` with rendering disabled **fails
+       loudly** rather than feeding the policy an image-free obs dict. An ACT policy
+       cannot produce an action without images, so a silent state-only learned run is a
+       defect, not a fast path.
+     - Video capture → all five cameras (~809.86 ms/step), enabled **only** on the final
+       winning seed, once, not per seed of every run.
+  6. Every `summary.json` / `manifest.json` records which cameras were rendered, so a
+     scripted-branch number and a learned-branch number can never be compared without the
+     difference in observation streams being visible.
 - **Budget.** 5 hours.
 
 ---
 
 ### Day 3
 
+**Day 3 schedule, re-planned after the ADR-022 correction (Sept 11).** At the corrected
+~456 ms/step, M09's collection is ~8.9 h of bm-ptl wall clock for 70,000 steps, and the
+learned half of GATE-1 is a further ~76 min. **Day 3 cannot hold a 9-hour daytime M09
+alongside M10, M11 and an 80-minute gate — 9 + 5 + 76 min already overruns the day before
+M11's Kaggle queue is counted.** The reshuffle, stated rather than absorbed silently:
+
+| Slot | Work | Where |
+|---|---|---|
+| Day 2, on M08 close | Launch M09 collection, unattended, after a 15-min smoke run | bm-ptl |
+| Day 2 night → Day 3 08:00 | M09 collects (~9 h of otherwise-idle wall clock) | bm-ptl |
+| Day 3 08:00 | Stop collection on the clock; validate + upload dataset | bm-ptl → kaggle |
+| Day 3 08:00–13:00 | M10 (laptop wiring can have started during collection) | laptop + kaggle |
+| Day 3 ~12:30 | Launch M11 ACT training | kaggle |
+| Day 3 18:30 | Start GATE-1: scripted (2 s) + learned (~76 min) | bm-ptl |
+| Day 3 ~20:00 | GATE-1 decision recorded in DECISIONS.md | — |
+
+**What I recommend cutting if this still does not fit: the dataset, not the gate and not
+M10.** Degrade M09 to the pre-committed 4 h / ~31,500-step run and accept a smaller
+demonstration set. The rubric cost is concentrated and bounded: a thin dataset mainly
+raises the probability that GATE-1 selects the scripted branch, and the scripted branch
+already carries end-to-end completion and bimanual coordination (30 pts, via M06+M07),
+OpenVINO (20 pts, via M10+F2), robustness across 10 seeds (15 pts, via M07+M08) and
+reproducibility (10 pts). The exposure is a slice of the 20-pt VLA/multi-modal line —
+and even there, M05's grounder plus M10's OpenVINO-served perception still answer it.
+By contrast, cutting M10 would put the 20-pt OpenVINO criterion on the ML branch's
+critical path, which is exactly the dependency F2 exists to break; and skipping the
+80-minute gate would mean choosing a branch without evidence. **Do not cut M10. Do not
+shorten the gate. Cut dataset size.**
+
+I have measured none of this. The 0.20 / 152.25 / 809.86 ms/step figures are Tester's
+(`docs/hardware/m02-render-cost.md:11-15`); every duration above is arithmetic on them,
+not an observation of a collection run.
+
 #### M09 — Demonstration dataset collection
 - **Purpose.** Run the scripted controller over many randomized seeds and log
   observation/action pairs in LeRobot dataset format, so ACT can be trained
   (brief p2 objective 4: train or fine-tune using LeRobot or compatible tooling).
+  **Collection runs with cameras enabled — `['front', 'armA_wrist', 'armB_wrist']`.**
+  The scripted controller reads `get_state()` to *choose* actions (ADR-005); the camera
+  frames are *logged* because M11's ACT policy is camera-conditioned and M10's PoseNet
+  trains on images. ADR-005 governs action selection, not dataset contents — see the
+  correction paragraph in ARCHITECTURE ADR-022's Consequences.
 - **Inputs.** M06, M07, M08.
 - **Outputs.** `scripts/collect_demos.py`, a dataset on disk plus a Kaggle-uploadable
   archive, and `docs/dataset-card.md` (episode count, cameras, resolution, action space,
   seeds used, success filter applied).
-- **Agent.** builder. **Runs on.** laptop (dataset upload target: kaggle).
+- **Agent.** builder. **Runs on.** **bm-ptl** (dataset upload target: kaggle). Corrected
+  from "laptop": MuJoCo cannot import on the laptop (ADR-020, `DECISIONS.md:147-170`), and
+  the 456 ms/step render cost is Arc B390 time on bm-ptl. This wall clock is **not
+  recoverable** — bm-ptl expires Sept 17 00:15 (`CONSTRAINTS.md:5`).
 - **Depends on.** M06, M07, M08.
 - **Done when.**
   1. Only successful episodes are kept; the filter criterion and the kept/attempted
@@ -319,9 +376,48 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
      (off-by-one here silently destroys imitation learning).
   3. The training seed set and the evaluation seed set 0–9 are **disjoint**, asserted in
      code. Evaluating on training seeds would invalidate the robustness claim.
-  4. Dataset card states exactly which observation streams the policy will receive.
-- **Budget.** 4 hours, mostly wall-clock collection. Start it early and work M10 while
-  it runs.
+  4. Dataset card states exactly which observation streams the policy will receive, and
+     names the three rendered cameras and their resolution explicitly.
+  5. The collector writes **episode-by-episode, append-only, and is resumable**: killing
+     it mid-run loses at most the in-flight episode, and re-launching continues rather
+     than restarting. Tester verifies by interrupting a short run and resuming it. This
+     is what makes the unattended overnight window in the budget below safe to take.
+
+- **Budget (revised — supersedes "4 hours, mostly wall-clock collection").**
+  **0.5 h attended setup + a bounded unattended collection window on bm-ptl.**
+  At the corrected ~456 ms/step (ADR-022; `docs/hardware/m02-render-cost.md:11-15`),
+  70,000 attempted steps is **~8.9 h** of wall clock (70,000 x 0.456 s = 31,920 s), and a
+  4 h window buys **~31,500 attempted steps** (14,400 s / 0.456 s).
+  **Decision: take the overnight window, not the 4-hour Day-3 slot.**
+  - **Primary plan.** Launch collection on bm-ptl as soon as M08 closes on Day 2
+    (Sept 12) and let it run unattended overnight into Day 3 morning. Collection is
+    bm-ptl wall clock, not developer hours, so ~9 h costs nothing from the Day-3 working
+    day and leaves Day 3 intact for M10 and M11. Target 70,000 attempted steps; **the
+    stop condition is the clock (08:00 Day 3), not the step count** — done-when 5 makes
+    whatever has landed by then a usable dataset.
+  - **Mandatory pre-flight (15 min, attended).** A 2-episode smoke run with cameras on,
+    checked for correct frame shapes, non-blank images, and time-aligned action logging
+    (done-when 2), before the unattended run starts. An unsupervised 9 h run that was
+    broken at minute one is the single worst outcome available on Day 3.
+  - **Pre-committed degradation, decided now and not renegotiated at 08:00.** If M08 does
+    not close in time to launch on Day 2 night, M09 becomes a **4 h Day-3-morning run at
+    ~31,500 attempted steps** and the dataset ships at that size. No extension into the
+    afternoon: M11 must launch on Kaggle by ~12:30 to have a checkpoint for GATE-1.
+  - **Attempted vs kept.** 456 ms/step is charged on *attempted* steps; done-when 1 keeps
+    only successful episodes, so kept steps are strictly fewer by the success-filter
+    ratio. That ratio is **unmeasured** — it is an output of M06, not an assumption here.
+    Tester reports attempted-vs-kept; if it is poor, the dataset shrinks and that is
+    reported honestly rather than fixed by overrunning the window.
+  - **Optional 20-min lever, time-boxed, unverified.** The 152 ms/camera figure is at the
+    env default 640x480, and ACT consumes a much smaller input. Rendering at ACT's input
+    resolution *may* cut per-frame cost if the dominant term is pixel readback
+    (suspect (a), `docs/hardware/m02-render-cost.md:58-63`). **I have not measured this
+    and claim no speedup.** Measure it once in the pre-flight; if it does not clearly
+    help, proceed at 640x480 unchanged and do not investigate further.
+  - **Correction to the old "work M10 while it runs".** M10 *depends on* this dataset
+    (M10 Inputs, below), so only M10's **laptop-side wiring** (`PerceptionBackend`,
+    `StatePerception`, `VisionPerception` plumbing) overlaps with collection. M10's
+    **training** cannot start until the dataset exists and is uploaded.
 
 #### M10 — Vision perception model (PoseNet) and its OpenVINO path
 - **Purpose.** A small CNN mapping camera images to object poses / keypoints, trained on
@@ -361,10 +457,12 @@ docs/           learn/, video-script.md, slides.md, cover-image-brief.md
   wall-clock collection on bm-ptl. Size the demonstration dataset to fit one collection
   window, or plan a two-session split — and note bm-ptl expires Sept 17
   (`CONSTRAINTS.md:5`), so this wall-clock is not recoverable.
-  **This contradicts ADR-022's stated consequence that M09 runs with no cameras.**
-  ADR-005's privileged state governs how the scripted controller *chooses* actions; it
-  does not mean the logged dataset can omit images. ADR-022 needs correcting — flagged,
-  not silently patched here.
+  **Resolved Sept 11.** This note previously flagged a contradiction with ADR-022's
+  "M09 runs with no cameras". ADR-022's Consequences have since been corrected: ADR-005's
+  privileged state governs how the scripted controller *chooses* actions and does not
+  permit the logged dataset to omit images. M09 now collects with three cameras at
+  ~456 ms/step, on the overnight window set out in M09's revised budget. No open
+  contradiction remains.
 - **Outputs.** `scripts/train_act.py`, `configs/act.yaml`, a Kaggle notebook/kernel
   spec committed to the repo, a checkpoint pulled back to the laptop, and a training log
   with the loss curve saved as an artifact.
@@ -390,6 +488,25 @@ half-working ML."
 Decide with evidence from `scripts/evaluate.py`, reported by **tester**. Decision owner:
 the **user**, on planner's recommendation. Record the outcome in DECISIONS.md against
 ADR-008.
+
+**Timing budget for the gate itself: reserve 80+ minutes of bm-ptl wall clock, and start
+it no later than 18:30 on Day 3.** The gate is not free, and the earlier reading of
+ADR-022 that implied it costs ~2 seconds was wrong (see ADR-022's correction paragraph).
+Per M08 done-when 5:
+- **Scripted branch**, `cameras=None`: 10 seeds x 1000 steps x 0.20 ms ≈ **2 s**.
+- **Learned branch**, three cameras at ~456 ms/step: 10 x 1000 x 0.456 s = 4,560 s ≈
+  **76 min**. This is not optional — a learned executor cannot be scored state-only.
+- **Both branches, as the gate requires for a comparison:** ≈ **76 min**, so budget
+  **80+ min** including setup and artifact writing.
+- Video capture is **not** part of the gate. All five cameras at ~809.86 ms/step is
+  ~13.5 min per 1000-step episode (`docs/hardware/m02-render-cost.md:47-51`); it runs
+  once, on the final winning seed, in M19 — never across the gate's 10 seeds.
+
+If the 80-minute learned-branch run cannot start by 18:30 on Day 3, **do not slide the
+gate into Day 4** — take the scripted branch on the evidence available and record the
+timeout itself as the deciding reason in DECISIONS.md. `CONSTRAINTS.md:50-52` sets the
+end of Day 3 as the decision point; a gate that slips is the failure mode the fallback
+exists to prevent.
 
 **Take the learned branch only if all of these hold:**
 1. M11 produced a checkpoint and `--executor learned` runs 10/10 seeds without crashing.
@@ -658,6 +775,10 @@ improvising.
 End of each day, before stopping:
 1. tester runs `scripts/evaluate.py` on seeds 0–9 with the current best executor and
    files a report. The demo must be recordable *every* evening from Day 3 onward.
+   **Cost note (ADR-022 correction):** this is ~2 s when the current best executor is
+   scripted, but ~76 min when it is learned (10 x 1000 x 456 ms). On the learned branch,
+   start the nightly run at latest 22:00 and let it finish unattended; do not shorten it
+   to fewer seeds, because ADR-018 fixes the seed set.
 2. docs-writer updates README status and the relevant `SUBMISSION.md` checkboxes.
 3. Commit and push. A demo that exists only on one laptop is not a deliverable.
 4. If a module's done-when criteria were not met, it rolls to the next day and the day's
