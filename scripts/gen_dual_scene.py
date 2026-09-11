@@ -352,19 +352,30 @@ TEMPLATE = """<?xml version="1.0"?>
     <!-- Furniture / prop materials (ours, not upstream) -->
     <material name="table_material" rgba="0.55 0.40 0.25 1"/>
     <material name="drawer_material" rgba="0.42 0.28 0.18 1"/>
-    <!-- drawer_box_material: distinct blue for the drawer box itself (M02
-         drawer_view fix, defect 2). It previously shared drawer_material
-         (brown) with the static housing, so a single still frame could not
-         be read as open or closed -- only a before/after pair was legible.
-         Blue, not red, to stay visually distinct from mug_material below
-         (0.75 0.15 0.15, red) elsewhere in the same scene. -->
-    <material name="drawer_box_material" rgba="0.15 0.35 0.85 1"/>
+    <!-- M02 colour pass: the palette grew one object at a time (drawer_box
+         went blue in 9860072 to separate it from its brown housing; the mug
+         was independently red) and ended up with two blues (drawer_box vs.
+         water_bottle) that a still frame or cover image cannot tell apart.
+         This block is one deliberate, whole-palette pass instead of another
+         one-off patch: every prop gets a distinct, saturated, high-contrast
+         colour, chosen so no two props (and no prop vs. the brown
+         table/drawer housing) share a hue. drawer_box_material is now RED
+         (it previously borrowed the "distinct from brown housing" blue that
+         the bottle also used); mug_material/mug_handle_material move from
+         red to GREEN so they no longer collide with drawer_box_material;
+         bottle_material becomes an opaque, saturated BLUE (dropping the old
+         0.55 alpha -- partial transparency let the table colour bleed
+         through and hurt colour-only identification, which is the explicit
+         bar for this pass). plate_material (off-white) and
+         fork_material/spoon_material (silver-grey) already matched the
+         target palette and are unchanged. -->
+    <material name="drawer_box_material" rgba="0.85 0.10 0.10 1"/>
     <material name="plate_material" rgba="0.92 0.92 0.88 1"/>
-    <material name="mug_material" rgba="0.75 0.15 0.15 1"/>
-    <material name="mug_handle_material" rgba="0.75 0.15 0.15 1"/>
+    <material name="mug_material" rgba="0.10 0.75 0.20 1"/>
+    <material name="mug_handle_material" rgba="0.10 0.75 0.20 1"/>
     <material name="fork_material" rgba="0.72 0.73 0.76 1"/>
     <material name="spoon_material" rgba="0.72 0.73 0.76 1"/>
-    <material name="bottle_material" rgba="0.25 0.55 0.85 0.55"/>
+    <material name="bottle_material" rgba="0.10 0.40 0.95 1"/>
 
     <!-- SO-101 meshes and part materials, referenced by BOTH arm copies below.
          Shared, not duplicated, because mesh geometry is not per-instance data
