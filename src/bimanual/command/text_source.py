@@ -112,6 +112,16 @@ def print_all_commands(source: CommandSource) -> None:
     function works identically whether it is handed a `TextCommandSource`
     or a `VoiceCommandSource` (see tests/test_command_source.py for the
     parameterised proof).
+
+    The demo / manual smoke test that exercises this used to live in this
+    module's `if __name__ == "__main__":` block, but running this file with
+    `python -m bimanual.command.text_source` re-imports it under a second
+    module identity (`__main__`) in addition to its package identity
+    (`bimanual.command.text_source`), because `bimanual/command/__init__.py`
+    already imports this module eagerly. Python warns about exactly this
+    (RuntimeWarning: found in sys.modules ... prior to execution). The demo
+    now lives in `scripts/demo_command_source.py`, which imports this module
+    only via its package path, so there is only ever one identity for it.
     """
     while True:
         event = source.poll()
@@ -119,30 +129,3 @@ def print_all_commands(source: CommandSource) -> None:
             break
         print(f"[{event.source_id}] {event.text!r} (confidence={event.confidence})")
     source.close()
-
-
-if __name__ == "__main__":
-    # Demo / manual smoke test, guarded per the Windows-first entry-point
-    # convention. Run with a literal command:
-    #     python -m bimanual.command.text_source --command "open the drawer"
-    # or pipe stdin:
-    #     echo "open the drawer" | python -m bimanual.command.text_source
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--command",
-        type=str,
-        default=None,
-        help="A single literal command. If omitted, reads from stdin.",
-    )
-    parser.add_argument(
-        "--file",
-        type=Path,
-        default=None,
-        help="A file with one command per line.",
-    )
-    args = parser.parse_args()
-
-    demo_source: CommandSource = TextCommandSource(text=args.command, file=args.file)
-    print_all_commands(demo_source)
