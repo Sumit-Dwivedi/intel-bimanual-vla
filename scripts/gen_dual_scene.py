@@ -80,16 +80,38 @@ FRONT_CAM_FOVY = 55
 #
 # Fix: a camera BELOW tabletop height (table surface z=0.35), on the -y
 # side past where the open drawer protrudes, angled UP and toward +y so it
-# looks across the drawer's slide axis instead of along it. Rather than
-# hand-computing a look-at (as the front camera above must, since it aims
-# at a fixed point), this camera uses mode="targetbody" target="drawer":
-# MuJoCo re-aims it at the `drawer` body's own origin every frame, which
-# is exactly the point that moves as drawer_slide goes from 0 to 0.15 --
-# so the same fixed camera pose tracks the drawer whether it is closed or
-# open, and the two states are expected to look visibly different (the
-# open drawer is both closer to the camera and its front face is in clear
-# view, where the closed drawer sits retracted toward the housing).
+# looks across the drawer's slide axis instead of along it.
+#
+# M02 defect fix (two bugs found on re-render, both confirmed by rendering
+# the scene open and closed, not assumed):
+#
+# 1. This camera originally used mode="targetbody" target="drawer", which
+#    makes MuJoCo re-aim the camera at the `drawer` body's own origin every
+#    frame -- exactly the point that moves as drawer_slide goes from 0 to
+#    0.15. That re-aiming is the bug, not a feature: it keeps the drawer
+#    centred in frame while the background (housing, table) swings past
+#    behind it, so a viewer reads the drawer opening as the CAMERA moving,
+#    not the drawer -- the opposite of what this camera is for. The fix is
+#    a FIXED orientation, computed once via the same look_at_xyaxes()
+#    helper the front camera above uses, aimed at the drawer's CLOSED rest
+#    position (DRAWER_CAM_TARGET, the world position of the `drawer` body
+#    at drawer_slide=0 -- see the drawer body's pos in the template below).
+#    With a fixed background, the drawer visibly slides toward the camera
+#    as it opens instead of the scene appearing to rotate around it.
+# 2. The drawer box and its housing shared `drawer_material` (see the
+#    template's `<body name="drawer">` below), so a single still frame
+#    could not be told apart as open or closed by colour alone -- only a
+#    before/after pair was legible. Fixed in the template's <asset> block:
+#    the drawer box now gets its own `drawer_box_material` (blue),
+#    contrasting with the housing's brown `drawer_material`.
 DRAWER_CAM_POS = (0.0, -0.55, 0.15)
+# Drawer body world position at drawer_slide=0 (closed): the `drawer`
+# body sits at local pos (0,0,0) inside `drawer_housing`, which is placed
+# at world (0,-0.05,0.28) -- see the template's <body name="drawer_housing">
+# below. Aiming here (rather than at the housing's own origin, which is
+# the same point) is what keeps the background fixed while the drawer
+# slides toward -y and toward the camera as it opens.
+DRAWER_CAM_TARGET = (0.0, -0.05, 0.28)
 DRAWER_CAM_FOVY = 50
 
 
@@ -129,6 +151,9 @@ def look_at_xyaxes(pos, target, world_up=(0.0, 0.0, 1.0)):
 _FRONT_RIGHT, _FRONT_UP = look_at_xyaxes(FRONT_CAM_POS, FRONT_CAM_TARGET)
 FRONT_CAM_XYAXES = "%.4f %.4f %.4f %.4f %.4f %.4f" % (_FRONT_RIGHT + _FRONT_UP)
 FRONT_CAM_POS_STR = "%.4f %.4f %.4f" % FRONT_CAM_POS
+
+_DRAWER_RIGHT, _DRAWER_UP = look_at_xyaxes(DRAWER_CAM_POS, DRAWER_CAM_TARGET)
+DRAWER_CAM_XYAXES = "%.4f %.4f %.4f %.4f %.4f %.4f" % (_DRAWER_RIGHT + _DRAWER_UP)
 
 # ---- geometry / layout constants (see ADR-021 for the reach-derived rationale) ----
 TABLE_TOP_Z = 0.35   # table surface height above the floor (m)
@@ -246,6 +271,7 @@ def main():
         front_cam_xyaxes=FRONT_CAM_XYAXES,
         front_cam_fovy=FRONT_CAM_FOVY,
         drawer_cam_pos="%.4f %.4f %.4f" % DRAWER_CAM_POS,
+        drawer_cam_xyaxes=DRAWER_CAM_XYAXES,
         drawer_cam_fovy=DRAWER_CAM_FOVY,
     )
     DEST.parent.mkdir(parents=True, exist_ok=True)
@@ -326,6 +352,13 @@ TEMPLATE = """<?xml version="1.0"?>
     <!-- Furniture / prop materials (ours, not upstream) -->
     <material name="table_material" rgba="0.55 0.40 0.25 1"/>
     <material name="drawer_material" rgba="0.42 0.28 0.18 1"/>
+    <!-- drawer_box_material: distinct blue for the drawer box itself (M02
+         drawer_view fix, defect 2). It previously shared drawer_material
+         (brown) with the static housing, so a single still frame could not
+         be read as open or closed -- only a before/after pair was legible.
+         Blue, not red, to stay visually distinct from mug_material below
+         (0.75 0.15 0.15, red) elsewhere in the same scene. -->
+    <material name="drawer_box_material" rgba="0.15 0.35 0.85 1"/>
     <material name="plate_material" rgba="0.92 0.92 0.88 1"/>
     <material name="mug_material" rgba="0.75 0.15 0.15 1"/>
     <material name="mug_handle_material" rgba="0.75 0.15 0.15 1"/>
@@ -368,7 +401,7 @@ TEMPLATE = """<?xml version="1.0"?>
       <geom name="drawer_housing_right" type="box" size="0.005 0.10 0.05" pos="0.115 0 0" material="drawer_material"/>
       <body name="drawer" pos="0 0 0">
         <joint name="drawer_slide" type="slide" axis="0 -1 0" range="0 0.15" damping="5" frictionloss="0.5"/>
-        <geom name="drawer_box" type="box" size="0.10 0.08 0.04" mass="0.30" material="drawer_material" friction="0.6 0.005 0.0001"/>
+        <geom name="drawer_box" type="box" size="0.10 0.08 0.04" mass="0.30" material="drawer_box_material" friction="0.6 0.005 0.0001"/>
       </body>
     </body>
 
@@ -431,11 +464,15 @@ TEMPLATE = """<?xml version="1.0"?>
     <camera name="front" pos="{front_cam_pos}" xyaxes="{front_cam_xyaxes}" fovy="{front_cam_fovy}"/>
     <!-- drawer_view: low, angled up, on the -y side past the open drawer's
          protrusion (see DRAWER_CAM_* comment above for the empirical
-         reasoning). mode="targetbody" target="drawer" re-aims at the
-         drawer body's own origin every frame, so it tracks the drawer as
-         drawer_slide goes from 0 (closed) to 0.15 (open) without a
-         hand-computed look-at. -->
-    <camera name="drawer_view" pos="{drawer_cam_pos}" mode="targetbody" target="drawer" fovy="{drawer_cam_fovy}"/>
+         reasoning). FIXED orientation via xyaxes (M02 drawer_view fix,
+         defect 1), NOT mode="targetbody" -- targetbody re-aimed this
+         camera at the moving `drawer` body every frame, which kept the
+         drawer centred while the background swung past it, reading as
+         camera motion rather than the drawer opening. xyaxes is aimed
+         once at the drawer's CLOSED rest position (DRAWER_CAM_TARGET), so
+         the background stays fixed and the drawer visibly slides toward
+         the camera as drawer_slide goes from 0 to 0.15. -->
+    <camera name="drawer_view" pos="{drawer_cam_pos}" xyaxes="{drawer_cam_xyaxes}" fovy="{drawer_cam_fovy}"/>
   </worldbody>
 
   <actuator>
