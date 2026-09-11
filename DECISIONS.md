@@ -11,11 +11,11 @@ being ratified by the user rather than proposed.
 
 ---
 
-## M01 — SO-101 asset adopted from TheRobotStudio/SO-ARM100 (fulfills ADR-016)
+## M02 prerequisite: SO-101 asset acquisition — adopted from TheRobotStudio/SO-ARM100 (fulfills ADR-016)
 
 **Recorded:** Sept 11, 2026 · **Closes:** RISK-01 · **Fulfills:** ADR-016
 
-Per M01's search order (`PLAN.md` M01), option (a) — the Intel Hack-a-thon Resources
+Per the user-specified search order for this prerequisite, option (a) — the Intel Hack-a-thon Resources
 bundle referenced by a button on the challenge platform page
 (`docs/challenge/Screenshot 2026-09-11 132213.png`) — could not be reached: no URL for
 it appears anywhere in the challenge-brief PDF (checked programmatically for link
