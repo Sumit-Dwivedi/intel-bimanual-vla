@@ -28,6 +28,6 @@ No free body's z-coordinate dropped below the floor threshold.
 **Caveat:** this probe catches interpenetration only *indirectly*, via the floor
 check (a large separation impulse launches a prop, which then falls and trips
 `FLOOR_Z`) — it never asserts on `data.contact.dist` directly; acceptable for
-verifying this static scene, to be revisited if M04's controller tests reveal
+verifying this static scene, to be revisited if M06's controller tests reveal
 contact anomalies that an indirect check would miss.
 
