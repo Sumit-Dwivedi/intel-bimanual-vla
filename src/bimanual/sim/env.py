@@ -47,8 +47,9 @@ _DEFAULT_SCENE_PATH = (
 # Cameras rendered into every observation by default. Discovered from the
 # model at load time in practice (see `_camera_names`), but declared here for
 # reference: this is the M02 scene's full camera set (ARCHITECTURE.md section
-# 1, "overhead camera, front camera, per-arm wrist cameras").
-_EXPECTED_CAMERAS = ("overhead", "front", "armA_wrist", "armB_wrist")
+# 1, "overhead camera, front camera, per-arm wrist cameras", plus the M02(e)
+# drawer_view camera added for demo visibility of the drawer-open action).
+_EXPECTED_CAMERAS = ("overhead", "front", "armA_wrist", "armB_wrist", "drawer_view")
 
 
 class TableSettingEnv:
@@ -130,19 +131,22 @@ class TableSettingEnv:
     def reset(self, seed: int = 0) -> dict:
         """Reset physics to the model's compiled initial state.
 
+        Obs schema (identical to `step()`'s, and derived from the scene's
+        cameras at load time, not hardcoded -- see `_build_obs`): 'qpos'
+        (nq,) float64, 'qvel' (nv,) float64, plus one `<camera_name>` key per
+        camera defined in the MJCF (currently 'overhead', 'front',
+        'armA_wrist', 'armB_wrist', 'drawer_view'), each an (H, W, 3) uint8
+        RGB ndarray.
+
         Args:
             seed: Seeds `self.np_random` reproducibly. Two `reset(seed=0)`
                 calls in independent processes produce byte-identical
-                `qpos`/`qvel`/`rgb` because MuJoCo's own state reset
+                `qpos`/`qvel`/camera images because MuJoCo's own state reset
                 (`mj_resetData`) is itself deterministic; the seed governs
                 only this env's own RNG stream for future randomized use.
 
         Returns:
-            Observation dict with keys:
-                'qpos': (nq,) float64 ndarray, joint positions.
-                'qvel': (nv,) float64 ndarray, joint velocities.
-                '<camera_name>_rgb': (H, W, 3) uint8 ndarray, one per camera
-                    discovered in the scene (see `_camera_names`).
+            Observation dict; see the obs schema note above.
         """
         self._seed = seed
         self.np_random = np.random.default_rng(seed)
@@ -154,6 +158,9 @@ class TableSettingEnv:
 
     def step(self, action) -> tuple[dict, bool, dict]:
         """Advance physics by one timestep under `action`.
+
+        Obs schema: identical to `reset()`'s -- see that docstring's "Obs
+        schema" note.
 
         Args:
             action: length-`model.nu` (12: 6 actuators x 2 arms) array-like
@@ -213,12 +220,17 @@ class TableSettingEnv:
     # ------------------------------------------------------------------
 
     def _build_obs(self) -> dict:
+        # Obs keys are the MJCF camera names themselves (no "_rgb" suffix),
+        # derived from `self._camera_names` (discovered from the model, see
+        # __init__) rather than hardcoded -- adding a camera to the scene
+        # (e.g. M02(e)'s drawer_view) therefore shows up in obs automatically
+        # with no change needed here.
         obs = {
             "qpos": np.array(self.data.qpos, dtype=np.float64, copy=True),
             "qvel": np.array(self.data.qvel, dtype=np.float64, copy=True),
         }
         for name in self._camera_names:
-            obs[f"{name}_rgb"] = self.render(name)
+            obs[name] = self.render(name)
         return obs
 
     def __enter__(self) -> "TableSettingEnv":
