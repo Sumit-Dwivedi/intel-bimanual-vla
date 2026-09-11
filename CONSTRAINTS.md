@@ -58,3 +58,9 @@ controller as the "policy." Rubric rewards complete pipeline over half-working M
 - bm-ptl (Windows): OpenVINO conversion, NPU/iGPU benchmark, demo recording
 - Kaggle: GPU training (30 hrs/week free, CLI-driven)
 - Not using: Colab, physical hardware, Intel Tiber training nodes
+
+## Day 0 Status (verified)
+- bm-ptl connected via SSH jump host
+- OpenVINO installed, all three devices (CPU/GPU/NPU) confirmed working
+- Trivial-model benchmark ran successfully on all devices
+- Environment pinned in requirements-bmptl.txt
