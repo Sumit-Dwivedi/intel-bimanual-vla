@@ -350,6 +350,23 @@ JAW_COLLISION_MESHES = {
 # meshes -- what actually gets RENDERED -- are completely untouched.
 FINE_JAW_TIP_RADIUS_M = "0.015"
 
+# ---- M06a grasp fix ladder RETEST (Sept 12, 2026) ----------------------
+# Fix B's top-centre plate offset (reverted in skills_scripted.py) never
+# converged at waypoint 1, so fixes C (closure force) and D (fine jaw
+# collision geometry) were never actually exercised -- the skill never
+# reached GRIP. With B reverted back to the rim offset, C and D are
+# retested one at a time, in the SAME cumulative order as the original
+# ladder, so each fix's own marginal contribution is isolated rather than
+# always measured together. This flag gates fix D's effect ON/OFF at
+# generation time so Step 2 of the retest (fix C alone, D disabled -- the
+# bulky mesh collision geoms stay active, unmodified except for fix A's
+# friction) can be measured separately from Step 3 (fix C + fix D
+# together, this flag flipped back on). Fix A's friction change and fix
+# C's ctrl-limit/hold-duration change in skills_scripted.py are NOT gated
+# here -- they were never implicated in masking anything and stay applied
+# throughout the retest.
+APPLY_FIX_D_FINE_JAW_COLLISION = False
+
 
 def apply_fine_jaw_collision(arm_root, prefix: str) -> int:
     """M06a grasp fix D. Disables the two bulky jaw MESH collision geoms
@@ -545,12 +562,18 @@ def main():
     # bulky mesh collision geoms keep their (inert) friction attribute
     # rather than having it stripped back out, which is harmless and
     # keeps this diff additive rather than partially reverting fix A.
-    for arm_root, prefix in ((arm_a, "armA_"), (arm_b, "armB_")):
-        n_added = apply_fine_jaw_collision(arm_root, prefix)
-        assert n_added == 2, (
-            f"{prefix}: expected to add exactly 2 fine jaw tip collision geoms "
-            f"(fixed + moving), added {n_added}"
-        )
+    #
+    # Gated by APPLY_FIX_D_FINE_JAW_COLLISION (retest ladder, Sept 12,
+    # 2026): OFF isolates fix C from fix D so each fix's own marginal
+    # contribution can be measured separately (see that constant's
+    # comment above).
+    if APPLY_FIX_D_FINE_JAW_COLLISION:
+        for arm_root, prefix in ((arm_a, "armA_"), (arm_b, "armB_")):
+            n_added = apply_fine_jaw_collision(arm_root, prefix)
+            assert n_added == 2, (
+                f"{prefix}: expected to add exactly 2 fine jaw tip collision geoms "
+                f"(fixed + moving), added {n_added}"
+            )
 
     # Wrist camera: a bare <camera>, no mesh geometry. so101_new_calib_camera.xml
     # (also in scenes/so101/, provenance in scenes/so101/PROVENANCE.md) shows a
