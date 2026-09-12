@@ -365,7 +365,7 @@ FINE_JAW_TIP_RADIUS_M = "0.015"
 # C's ctrl-limit/hold-duration change in skills_scripted.py are NOT gated
 # here -- they were never implicated in masking anything and stay applied
 # throughout the retest.
-APPLY_FIX_D_FINE_JAW_COLLISION = False
+APPLY_FIX_D_FINE_JAW_COLLISION = True
 
 
 def apply_fine_jaw_collision(arm_root, prefix: str) -> int:
