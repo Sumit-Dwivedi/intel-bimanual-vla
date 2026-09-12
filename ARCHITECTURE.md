@@ -1061,6 +1061,102 @@ RISK-12. This ADR does not make the plan comfortable. It makes the plan's failur
 
 ---
 
+### ADR-024 — IK strategy for a 5-DoF arm against a 6-DoF task space: relax orientation, solve position exactly
+
+**Context.** M06a (`PLAN.md` M06, `src/bimanual/control/ik.py`) must turn a
+`SkillCall` into joint targets for the SO-101 arm. The compiled model exposes
+six `<position>` actuators per arm (`so101_dual_table.xml`'s `<actuator>`
+block), but the sixth, `armX_gripper`, drives only the jaw hinge on
+`armX_moving_jaw_so101_v1` — it contributes nothing to end-effector pose.
+That leaves five *positioning* joints (`shoulder_pan`, `shoulder_lift`,
+`elbow_flex`, `wrist_flex`, `wrist_roll`) against a 6-DoF task space (3
+position + 3 orientation), documented in advance by `docs/learn/06-ik-and-
+skills.md`: "a 5-DoF arm generally cannot hit an arbitrary position *and*
+orientation." Something must be relaxed.
+
+A second, easily-confused naming question sits next to this one and is
+resolved here too: `<body name="armX_gripper">` is the body driven by the
+`armX_wrist_roll` joint (it carries the fixed half of the gripper mechanism
+and the `armX_gripperframe` site); `armX_moving_jaw_so101_v1` is a CHILD of
+that body, driven by the separate `armX_gripper` joint/actuator (the jaw
+open/close hinge), so its position additionally shifts as the jaw opens or
+closes. An IK target aimed at the moving jaw instead of the gripperframe
+site would drift every time a skill opens or closes the jaw.
+
+**Options.**
+- (a) Relax orientation about `wrist_roll`: solve position exactly (3
+  equations) using all five joints in a damped-least-squares Jacobian solve,
+  and accept whatever orientation the redundant (5 unknowns, 3 constraints)
+  solution falls into. No orientation target is ever specified.
+- (b) Constrain to a 5-DoF target: xyz plus two orientation angles (e.g. the
+  gripper's approach direction), dropping only roll about the approach axis.
+  This uses all 5 DoF against a fully-determined 5-equation system, closer
+  to a real solution but requires building and maintaining an orientation
+  error term (e.g. an axis-angle or rotation-log residual restricted to two
+  axes) on top of the position Jacobian, and a decision about which two
+  orientation axes matter for a parallel-jaw-style grasp.
+
+**Decision.** (a). `ik.solve_position_ik` (`src/bimanual/control/ik.py`)
+targets only the 3D position of the `armX_gripperframe` site, via damped
+least squares (Levenberg-Marquardt) on `mujoco.mj_jacSite`'s 3xN position
+Jacobian restricted to the 5 positioning joints' columns. No orientation
+term exists in the solver. This is the simpler of the two options and was
+chosen on that basis, not because it was measured to be more accurate —
+see Consequences for what that trade cost in practice.
+
+**Consequences, including what this cost in practice (measured, not
+projected).**
+
+*The `handoff` consequence, stated in advance and then observed.* With no
+orientation control, the two arms' grippers meet in the shared ~0.10 m
+overlap band (`skills_scripted.py`'s `HANDOFF_TRANSFER_XY`) at whatever
+approach angle each arm's redundant solve happens to fall into — there is no
+guarantee the two jaws are compatibly oriented at the meeting point.
+`run_handoff` compensates only positionally (`HANDOFF_SIDE_OFFSET_M` keeps
+the two gripper targets from occupying the identical point), not by aligning
+either arm's approach orientation. This is exactly the risk this ADR's
+Decision accepted, and it is not a hypothetical: M06a's tests measured it
+directly (see below) — `handoff` never got far enough to test the meeting
+itself, because the prerequisite `pick` by the origin arm did not reliably
+grasp the object in the first place.
+
+*The grasp-reliability consequence, discovered empirically while building
+M06a and reported here rather than papered over.* Tracing a failed
+`pick(mug)` attempt (`bimanual.control.skills_scripted`) found that the
+`armX_gripperframe` site is measurably NOT co-located with the point where
+the fixed and moving jaw surfaces actually meet: probing both at one
+converged grasp configuration put the true "pinch center" roughly
+(-0.024, -0.023, +0.050) m away from the site (`ik.py`'s target reference)
+in world coordinates at that configuration. Because this module's IK never
+controls orientation (this ADR's Decision), that offset is not a constant
+correctable by a fixed vector — re-deriving it at a different target and
+re-testing moved the *object* even further from the true pinch zone, not
+closer, since a different position target produces a different arm
+configuration and therefore a different world-frame offset. Separately, the
+moving jaw's own collision mesh has a measured bounding-sphere radius
+(`model.geom_rbound`) of ~6.35 cm (the fixed-side reference geoms up to
+~8.4 cm) — large relative to the props (mug body radius 3.5 cm, plate
+radius 9 cm but only 1.2 cm thick) — so the arm's approach frequently
+contacts and displaces the light, freely-jointed prop before any controlled
+pinch can form. Both effects were verified with `mujoco`'s own contact and
+geometry introspection (`data.contact`, `model.geom_rbound`,
+`model.geom_xpos` at controlled joint angles), not inferred from failure
+alone.
+
+**What this means for M06a's shipped result, stated plainly.** `pick`,
+`place` and `handoff` are implemented as closed control loops with correct
+step-budget, joint-limit and diagnostic behaviour (see DECISIONS.md's M06a
+entry for the measured numbers), but did not reliably clear the required
+lift margin for `plate` or `mug` in testing. This is recorded as the honest
+result of this decision, not hidden behind a passing test: fixing it
+without touching `src/bimanual/sim/` (out of this module's scope) would
+need option (b) above — enough orientation control to consistently present
+the jaw's pinch plane to the object — or a contact-feedback correction loop
+this module does not build. Both are flagged here as the concrete follow-up
+this ADR's Decision implies, rather than left as an unexplained gap.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

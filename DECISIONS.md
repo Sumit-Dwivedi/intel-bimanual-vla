@@ -11,6 +11,70 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06a — Scripted IK skills: ik.py, skills_scripted.py, executor.py, run_skill.py
+
+**Recorded:** Sept 12, 2026 · **Follows:** ADR-024 (IK strategy), ADR-010 (bimanual
+handoff), ADR-023 (scripted controller is the shipped policy) · **Consumes:** M02's
+`TableSettingEnv`, M05's `SkillCall` · **Feeds:** M06b (`pour`, not built here)
+
+Built per `PLAN.md` M06a scope: `open_drawer`, `pick`, `place`, `handoff` only —
+`pour` is explicitly M06b and is not implemented (`ScriptedSkillExecutor.execute()`
+returns a labelled failed `SkillResult` for it rather than raising). Every skill
+returns `SkillResult(success, reason, frames_used)`; `frames_used` counts
+`env.step()` calls (a step BUDGET, per `ik.DEFAULT_STEP_BUDGET`, not a wall-clock
+timer), so a timeout is `success=False, reason="timeout..."` at a fixed step count
+regardless of host speed.
+
+**ADR-024 records the IK strategy**: position-only damped-least-squares IK over
+the arm's 5 positioning joints (excluding the jaw), targeting the `armX_gripperframe`
+site — orientation is relaxed entirely, not partially. `ScriptedSkillExecutor`
+asserts `TableSettingEnv(cameras=None)` at its entry point (ADR-023: state-only,
+~0.20 ms/step) and catches `ValueError` narrowly, re-raising `UngroundedCommandError`
+explicitly rather than letting a broad `except ValueError` swallow it — the M05 trap
+Tester flagged, guarded here even though this layer cannot reach it today.
+
+**Honest result, measured on `bm-ptl` via `tests/test_skills.py` and
+`scripts/run_skill.py` (seed 0):**
+
+| Skill | Result | Measured delta | frames_used |
+|---|---|---|---|
+| `open_drawer(A)` | **FAIL** | `drawer_slide` qpos stayed at 0.0000 (target ≥0.14) | 3000 (timeout) |
+| `pick(A, plate)` | **FAIL** | plate z: 0.3560 → 0.3529 (target ≥0.3800) | 543 |
+| `place(A, plate)` | **FAIL** (aborted at its internal `pick`) | plate z: 0.3560 → 0.3529 | 543 |
+| `handoff(A→B, mug)` | **FAIL** (aborted at its internal `pick`) | mug z: 0.3900 → 0.3825 | 552 |
+
+Two independently diagnosed root causes, not one ambiguous failure:
+1. **`open_drawer` is blocked by scene geometry**, not by the controller. MuJoCo's
+   own contact list shows `table_top` in contact with an (unnamed) arm mesh geom at
+   z≈0.35 directly above the drawer housing — the `table_top` box spans the entire
+   table footprint with no cutout above the drawer, so the drawer sits fully
+   enclosed beneath a solid slab with no top-down or side access. Verified by
+   contact inspection, not assumed. Cannot be fixed without editing
+   `src/bimanual/sim/assets/so101_dual_table.xml`, which is out of this module's
+   scope — flagged here for the planner/compliance-reviewer as a scene defect, not
+   silently worked around.
+2. **`pick`/`place`/`handoff` do not reliably grasp**, for the reason ADR-024's
+   Consequences records in detail: the `armX_gripperframe` site is measurably not
+   co-located with the jaw's true pinch point (~2-5 cm lateral, ~5 cm vertical
+   offset measured at one configuration, not constant across configurations because
+   orientation is uncontrolled), and the jaw's collision mesh (`geom_rbound` up to
+   ~8.4 cm) is large relative to the props, so the approach frequently displaces the
+   object before a pinch can form.
+
+**What is NOT in question:** `scripts/run_skill.py`'s diagnostics
+(`max_joint_limit_violation`, MuJoCo `data.warning` counts) were checked on every
+run above and were zero or negligible (max observed `3.5e-6`) — PLAN.md M06
+done-when 4 (no joint-limit/self-collision violation) holds even where the task
+itself fails. The IK solver itself converges reliably in the kinematic sense
+(sub-centimetre residual within single-digit iterations) and drives real,
+stable physical motion; the gap is entirely in grasp mechanics, diagnosed above,
+not in the control loop, the step-budget contract, or the executor's dispatch.
+
+Per instruction, this was reported at this point rather than iterated on further:
+"a partial, honestly-reported M06a is far more useful than a late one."
+
+---
+
 ## M04 — CommandSource ABC with Text and Voice implementations (voice stub)
 
 **Recorded:** Sept 12, 2026 · **Follows:** ADR-002 · **Feeds:** M05
