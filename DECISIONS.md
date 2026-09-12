@@ -11,6 +11,100 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06a grasp fix ladder — final diagnostic: `pick(A, mug)` and `pick(A, bottle)` after all four fixes
+
+**Recorded:** Sept 12, 2026 · **Follows:** M06a grasp fixes A-D (all four
+applied, none made `pick(A, plate)` succeed) · **No code change in this
+entry** -- diagnostic only, per the task's "IF ALL FOUR FAIL" instruction
+
+With all four fixes committed and none clearing `pick(A, plate)`'s
+`z > 0.38` bar, `pick(A, mug)` and `pick(A, bottle)` were run on bm-ptl
+(same scene, same control stack, all four fixes in effect) to check
+whether the grasp machinery works at all, or whether it is broken in
+general.
+
+**`pick(A, mug)`: fails at waypoint 1 (approach), a convergence failure --
+the ALREADY-DOCUMENTED reach limit, not a new finding.**
+`waypoint 1 (approach) failed [convergence (IK residual=0.0532 m >=
+0.01 m)]`, `frames_used=500`, `mug z: initial=0.3900 final=0.3827
+delta=-0.0073`, no MuJoCo warnings. This matches ADR-027's own already-
+reported finding almost exactly (`mug_at_rest` does not converge for arm
+A from the home pose, residual ~0.12 m there vs. 0.0532 m here for the
+hover point specifically -- same reach-limit class of failure, not the
+grasp-reliability gap this task's four fixes targeted). Arm A simply
+cannot reach the mug's grasp-point hover position from its current base
+placement; this is orthogonal to fixes A-D and would not be fixed by any
+of them.
+
+**`pick(A, bottle)`: reaches "did not lift" (every waypoint validated),
+but the actual outcome is worse than that phrase suggests, and is
+reported here as a collision anomaly, not softened.**
+`frames_used=1560` (consistent with the skill running all 4 waypoints --
+approach, descend, grip, retreat -- rather than stopping early),
+`water_bottle z: initial=0.4400 final=0.0298 delta=-0.4102`, no MuJoCo
+warnings, `max_joint_limit_violation` unchanged from baseline. A delta of
+-0.41 m is not "stayed on the table and didn't lift" -- `TABLE_SURFACE_Z`
+is 0.35 and the bottle started at 0.44 (already elevated, its own initial
+placement); ending at z=0.0298 is consistent with the bottle being
+knocked off the table entirely and coming to rest on the floor (a
+cylinder of radius 0.03 m lying on its side has a centre height in
+exactly this range). This is NOT caught by ADR-027's per-waypoint
+collision check, because that check only monitors arm-vs-`table_top` and
+cross-arm contacts -- it was never designed to detect the arm
+contacting and flinging a PROP, which is exactly ADR-024's own
+already-documented "the arm's approach frequently contacts and displaces
+the light, freely-jointed prop before any controlled pinch can form."
+The bottle is tall (0.09 m + cap) relative to the mug/plate, and the
+approach/descend waypoints evidently strike it before the jaw can close
+around a stable grasp.
+
+**Conclusion, stated as the task asks: genuinely informative, not just
+"everything fails."** Neither `mug` nor `bottle` "lifts cleanly" -- so
+this is NOT the clean "grasp machinery works, plate is just the hardest
+object" result the task's framing offered as one possible outcome.
+Instead: `mug` is blocked by a DIFFERENT, already-documented problem
+(arm reach, not grasp mechanics) and `bottle` surfaces a THIRD problem
+(the approach knocks the object away before a pinch forms) that fixes
+A-D do not address because none of them add obstacle-aware approach
+planning or orientation control -- both explicitly out of this task's
+scope (`ik.py`/`executor.py` not to be modified). The honest summary: of
+the three objects tried under this control stack (plate, mug, bottle),
+none currently lifts successfully; the three failures are for three
+different, non-overlapping reasons (grasp-reliability/friction-adjacent
+for the plate; kinematic reach for the mug; approach-collision
+displacement for the bottle).
+
+**Recommendation for the user to decide (not implemented): reshaping the
+plate prop.** The plate is OUR hand-authored prop
+(`scripts/gen_dual_scene.py`'s `<body name="plate">`), not upstream
+geometry, so changing it is not an ADR-016/ADR-021 concern the way
+touching `scenes/so101/` would be. Giving it a raised rim or a thicker
+edge (e.g. an outer ring geom a few mm taller than the current 1.2 cm
+disc, or simply increasing the disc's own thickness) would give a
+parallel-jaw gripper an actual vertical lip to catch, which a flat disc
+fundamentally does not offer regardless of friction (fix A), grasp-point
+placement (fix B), closure force (fix C), or collision-geometry
+resolution (fix D) -- all four fixes operated on the GRIPPER side of the
+problem; none changed the fact that the OBJECT itself presents no
+catchable feature to a jaw with no orientation control. I think this
+would plausibly help, and probably more than any of fixes A-D did,
+because it attacks the part of the problem those four fixes could not
+reach: a jaw approaching from an uncontrolled angle needs a feature it
+cannot slide past, and a rim or thickened edge is exactly that, whereas
+a razor-thin flat disc is exactly the shape a rimless pinch is most
+likely to slip off of. It would involve: adding one or two additional
+`<geom>` elements to the `plate` body in `gen_dual_scene.py`'s
+hand-authored template (e.g. a thin annular ring approximated by MuJoCo's
+primitive shapes, or simply a taller cylinder), re-deriving
+`GRASP_POINT_OFFSET_M["plate"]` for the new geometry (the rim's radius
+and height would both change), and re-running the ADR-027 regression
+tests to confirm no new tunneling. This is a real prop-geometry change
+the user may want reviewed before it is made, not a decision for this
+task to take unilaterally -- flagged here per the task's explicit
+instruction to recommend, not implement.
+
+---
+
 ## M06a grasp fix D — fine collision geom on jaw tips; INSUFFICIENT, and not actually exercised; all four fixes now applied and none succeeded
 
 **Recorded:** Sept 12, 2026 · **Follows:** M06a grasp fix C (insufficient,
