@@ -140,8 +140,26 @@ OBJECT_BODY_NAME = {
 #: joint pegged at its limit. Swapping which side of a SYMMETRIC feature is
 #: targeted is a caller-side reachability choice, not a change to `ik.py`
 #: or to what "the plate's rim" means physically.
+#:
+#: **M06a grasp fix B (attempted, see DECISIONS.md for the measured
+#: result): `"plate"` retargeted from the rim, `(0, 0.09, 0)`, to the
+#: top-centre, `(0, 0, 0.005)`.** Recorded honestly, not softened: this
+#: was tried because fix A (jaw friction) did not move the plate's z at
+#: all, and a rim grasp with NO orientation control (ADR-024 -- the jaw's
+#: approach angle is whatever the redundant 5-joint solve falls into) may
+#: simply not be presenting the jaw's pinch plane across the rim's edge.
+#: But a flat, thin disc (radius 0.09 m, 1.2 cm thick, `plate_geom`) has
+#: NOTHING to pinch directly above its centre -- a parallel-jaw gripper
+#: closing there closes on the plate's flat face from both sides only if
+#: the jaw's own pinch-plane happens to straddle the rim on some axis; if
+#: it does not, the jaws close on empty space above the disc, or contact
+#: the flat top/bottom faces and can only grip by friction against gravity
+#: with no rim to catch, not by a true mechanical pinch. This is a
+#: physically weaker grasp than the rim offset it replaces, tried anyway
+#: per the task's stop-and-try-anyway instruction, not represented as
+#: sound in general.
 GRASP_POINT_OFFSET_M = {
-    "plate": np.array([0.0, 0.09, 0.0]),
+    "plate": np.array([0.0, 0.0, 0.005]),
     "mug": np.array([0.0475, 0.0, 0.0]),
     "fork": np.array([-0.015, 0.0, 0.0]),
     "spoon": np.array([-0.01, 0.0, 0.0]),

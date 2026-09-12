@@ -11,6 +11,45 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06a grasp fix B — plate grasp-point moved to the top-centre; INSUFFICIENT and physically unsound
+
+**Recorded:** Sept 12, 2026 · **Follows:** M06a grasp fix A (insufficient)
+
+**What changed.** `GRASP_POINT_OFFSET_M["plate"]` in
+`src/bimanual/control/skills_scripted.py` moved from the rim,
+`(0, 0.09, 0)`, to the top-centre, `(0, 0, 0.005)`.
+
+**Result, measured on bm-ptl (`scripts/run_skill.py --skill pick --object
+plate --arm A --seed 0`): INSUFFICIENT, and worse than fix A, not merely
+equal.** The skill now fails at waypoint 1 (APPROACH -- the hover point
+above the grasp point, before any descent) with a convergence failure:
+`IK residual=0.0226 m >= 0.01 m`, `frames_used=500` (one waypoint's step
+cap only). `pytest tests/test_skills.py`: 4 failed / 4 passed, the SAME
+4 pre-existing failures and the SAME 2 ADR-027 regression tests still
+passing -- no tunneling was introduced; the skill fails cleanly rather
+than badly.
+
+**Reported plainly, as the task requires: this is not just "still
+failing", it is the expected physical outcome of an unsound approach.** A
+plate is a flat disc (radius 0.09 m, 1.2 cm thick). A parallel-jaw
+gripper closing directly above its centre has nothing to pinch unless it
+happens to catch the rim on some axis -- the same "no orientation
+control" limitation ADR-024 already documents (the jaw's approach angle
+is whatever the redundant 5-joint solve falls into, never chosen). Here
+the failure is even more basic than "closes on empty space": the
+APPROACH hover point itself did not kinematically converge for arm A at
+this position, before the descend/grip stages were ever reached. This
+result does not by itself prove top-centre grasping is impossible in
+general (a different hover height or a different arm base pose might
+converge), but it does confirm the task's warning was correct to flag:
+**a flat disc gives a parallel-jaw gripper nothing to pinch from directly
+above, and this attempt is honestly reported as a worse outcome than the
+rim offset it replaced, not a partial improvement.**
+
+Per the task's fix ladder, proceeding to Fix C (closure force).
+
+---
+
 ## M06a grasp fix A — jaw friction raised on the generated arm copies only
 
 **Recorded:** Sept 12, 2026 · **Follows:** ADR-027 (waypoint staging; left the
