@@ -533,6 +533,76 @@ def _contact_counts(env) -> dict[str, int]:
     return counts
 
 
+#: ADR-027 Step 5 (arm-vs-prop collision check, Sept 12 2026). ADR-027's own
+#: per-waypoint validation (`_contact_counts`/`_validate_against_baseline`
+#: above) only ever watched arm-vs-`table_top` and cross-arm contacts -- it
+#: was never designed to catch the arm contacting and displacing a PROP.
+#: That gap is exactly what DECISIONS.md's `pick(A, bottle)` diagnostic
+#: found: every waypoint "validated" cleanly while the bottle was actually
+#: knocked off the table (z 0.4400 -> 0.0298, consistent with landing on
+#: the floor). This threshold is an ABSOLUTE penetration depth, unlike
+#: `TABLE_COLLISION_DEPTH_TOL_M`'s baseline-relative delta: a controlled
+#: pinch grasp is EXPECTED to touch its own target object, so this bar is
+#: deliberately looser than the sub-millimetre table-graze tolerance --
+#: loose enough to let a normal, gentle grasp contact through, tight enough
+#: to catch a violent, uncontrolled impact before it flings an object away.
+PROP_COLLISION_DEPTH_TOL_M = 0.005
+
+#: Canonical prop body names this check watches: every FREE-JOINT prop in
+#: the scene (`OBJECT_BODY_NAME`'s values, excluding `"drawer"`, which has a
+#: slide joint, not a free joint, and is the one body `open_drawer` is
+#: SUPPOSED to contact).
+_FREE_JOINT_PROP_BODY_NAMES = tuple(v for v in OBJECT_BODY_NAME.values() if v != "drawer")
+
+
+def _prop_geom_ids(model) -> dict[str, set[int]]:
+    """Every geom id belonging to each free-joint prop body (ADR-027 Step 5).
+
+    Looked up by BODY id, not a hardcoded geom name, so a prop that (like
+    the reshaped `plate`, fix E) is built from more than one geom is still
+    covered completely without this function needing to know its shape.
+    """
+    out: dict[str, set[int]] = {}
+    for body_name in _FREE_JOINT_PROP_BODY_NAMES:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id == -1:
+            continue
+        out[body_name] = {g for g in range(model.ngeom) if int(model.geom_bodyid[g]) == body_id}
+    return out
+
+
+def _prop_collision_violations(env) -> dict[str, float]:
+    """Return `{prop_body_name: deepest_penetration_m}` for every free-joint
+    prop currently in contact with EITHER arm at a depth deeper than
+    `-PROP_COLLISION_DEPTH_TOL_M` (ADR-027 Step 5). Empty dict if none.
+
+    Deliberately NOT baseline-relative (unlike `_contact_counts`'s
+    table/cross-arm counts): a prop resting quietly against another prop or
+    the table before a skill ever starts is not what this check is for --
+    it is checked once per waypoint against the CURRENT contact list, and a
+    contact this deep at ANY waypoint is worth naming regardless of what
+    was already touching before the skill began.
+    """
+    model, data = env.model, env.data
+    arm_geoms = _arm_geom_ids(model, "A") | _arm_geom_ids(model, "B")
+    prop_geoms = _prop_geom_ids(model)
+    violations: dict[str, float] = {}
+    for i in range(data.ncon):
+        c = data.contact[i]
+        dist = float(c.dist)
+        if dist >= -PROP_COLLISION_DEPTH_TOL_M:
+            continue
+        g1, g2 = int(c.geom1), int(c.geom2)
+        for prop_name, geoms in prop_geoms.items():
+            if (g1 in arm_geoms and g2 in geoms) or (g2 in arm_geoms and g1 in geoms):
+                # Track the DEEPEST violation per prop, not merely the first
+                # contact found (a prop can have more than one geom, e.g.
+                # the reshaped plate's foot+dish).
+                if prop_name not in violations or dist < violations[prop_name]:
+                    violations[prop_name] = dist
+    return violations
+
+
 def _validate_against_baseline(env, arm: str, target_pos, baseline: dict) -> tuple[bool, str | None, float]:
     """Check BOTH bars a waypoint must clear (ADR-027): IK convergence
     (re-queried after the physical drive settles, so it reflects wherever
@@ -559,6 +629,22 @@ def _validate_against_baseline(env, arm: str, target_pos, baseline: dict) -> tup
             f"collision (cross_arm contacts={counts['cross_arm']} vs baseline "
             f"{baseline['cross_arm']}; arm{arm}-vs-table_top contacts={counts[table_key]} "
             f"vs baseline {baseline[table_key]})",
+            solution.position_error_m,
+        )
+
+    # ADR-027 Step 5: arm-vs-PROP collision, the gap `pick(A, bottle)`'s
+    # diagnostic exposed (every waypoint validated clean while the arm
+    # knocked the bottle onto the floor). Named explicitly per the task
+    # instruction: any free-joint prop deeper than PROP_COLLISION_DEPTH_TOL_M
+    # in contact with an arm geom is a validation failure naming the prop.
+    prop_violations = _prop_collision_violations(env)
+    if prop_violations:
+        named = ", ".join(
+            f"{name} (dist={depth:.4f} m)" for name, depth in sorted(prop_violations.items())
+        )
+        return (
+            False,
+            f"collision (arm-vs-prop: {named}; threshold={-PROP_COLLISION_DEPTH_TOL_M} m)",
             solution.position_error_m,
         )
     return True, None, solution.position_error_m
