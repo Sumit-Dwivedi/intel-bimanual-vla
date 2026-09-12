@@ -39,9 +39,11 @@ Tester flagged, guarded here even though this layer cannot reach it today.
 | Skill | Result | Measured delta | frames_used |
 |---|---|---|---|
 | `open_drawer(A)` | **FAIL** | `drawer_slide` qpos stayed at 0.0000 (target ≥0.14) | 3000 (timeout) |
-| `pick(A, plate)` | **FAIL** | plate z: 0.3560 → 0.3529 (target ≥0.3800) | 543 |
-| `place(A, plate)` | **FAIL** (aborted at its internal `pick`) | plate z: 0.3560 → 0.3529 | 543 |
+| `pick(A, plate)` | **FAIL** | plate z: 0.3560 → 0.3531 (target ≥0.3800) | 542 |
+| `place(A, plate)` | **FAIL** (aborted at its internal `pick`) | plate z: 0.3560 → 0.3531 | 542 |
 | `handoff(A→B, mug)` | **FAIL** (aborted at its internal `pick`) | mug z: 0.3900 → 0.3825 | 552 |
+
+(Numbers above are bm-ptl's, via `scripts/run_skill.py --seed 0`, matching `tests/test_skills.py`'s numbers to within floating-point noise across the two hosts.)
 
 Two independently diagnosed root causes, not one ambiguous failure:
 1. **`open_drawer` is blocked by scene geometry**, not by the controller. MuJoCo's
