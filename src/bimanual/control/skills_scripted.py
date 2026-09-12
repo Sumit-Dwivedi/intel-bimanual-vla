@@ -173,10 +173,21 @@ OBJECT_BODY_NAME = {
 #: measured (ADR-027) to be the reachable side of a symmetric feature from
 #: arm A's "home" pose; the dish is circular so any direction is an
 #: equally valid PHYSICAL grasp feature, only some are REACHABLE.
+#: **M06a grasp fix (from `docs/hardware/m06-grip-diagnostic.md`).** The
+#: diagnostic's full 60-step GRIP timeline found the STATIC pad's own world
+#: z sitting at 0.3510-0.3512 m -- AT OR BELOW `TABLE_SURFACE_Z=0.35`, while
+#: the fork body itself rests at z=0.3538 m. Across all 60 logged steps the
+#: only contact recorded is static-pad-vs-`table_top`; pad-vs-fork never
+#: occurs once, and the fork body moves a total of 0.000034 m -- consistent
+#: with zero force ever reaching it, because the pinch target was being
+#: driven into the tabletop, not toward the fork's handle. `"fork"`'s z
+#: offset moves from 0.0 to +0.004 m so the pinch point sits above the
+#: table surface (0.35 + small margin) instead of into it, close to the
+#: fork body's own resting height (0.3538 m) rather than 2-3 mm below it.
 GRASP_POINT_OFFSET_M = {
     "plate": np.array([0.0, 0.06, 0.009]),
     "mug": np.array([0.0475, 0.0, 0.0]),
-    "fork": np.array([-0.015, 0.0, 0.0]),
+    "fork": np.array([-0.015, 0.0, 0.004]),
     "spoon": np.array([-0.01, 0.0, 0.0]),
     "bottle": np.array([0.0, 0.0, 0.02]),
 }
@@ -236,7 +247,17 @@ APPROACH_DESCENT_STEPS = 500
 #: 60-step value is not expected alone to change the outcome; it is applied
 #: because the task specifies it as part of fix C, alongside driving ctrl
 #: to the actuator's own closure limit below.)
-GRIP_HOLD_FRAMES = 60
+#:
+#: **M06a grasp fix (from `docs/hardware/m06-grip-diagnostic.md`): raised
+#: 60 -> 300.** 300 frames allows full jaw closure at observed ~0.007
+#: rad/step; 60 frames only reached 22% closure and jaws remained wide open
+#: (0.111 m gap). The diagnostic's per-step timeline showed the gripper
+#: joint (`armA_gripper`) travelling qpos 1.7449 -> 1.3215 over the 60
+#: logged GRIP steps -- 0.42 rad of the joint's ~1.92 rad range (22%),
+#: continuously and without stall -- with pad separation still 0.111 m at
+#: step 60 (essentially wide open). At that observed rate, full closure
+#: needs roughly 275 steps, so 300 gives a small margin past that.
+GRIP_HOLD_FRAMES = 300
 
 #: ADR-027. How far, in metres, `open_drawer`'s PULL waypoint drags the
 #: drawer along `drawer_slide`'s axis (`(0, -1, 0)`) -- chosen to match the
