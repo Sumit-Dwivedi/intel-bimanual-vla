@@ -11,6 +11,55 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06a Fix D reverted — it disabled all gripper contact, not merely a neutral change
+
+**Recorded:** Sept 12, 2026 · **Relates to:** ADR-024 (grasp-reliability gap) ·
+**Reverts:** the M06a Fix D commits below (`1a099e3` re-enable, and the
+`apply_fine_jaw_collision()` mechanism they added)
+
+Independent measurement, done outside this repo's own retest ladder, found that
+Fix D's replacement jaw-tip collision spheres sit exactly on each jaw's rotation
+axis (`jnt_pos=(0,0,0)` in the jaw body's own local frame,
+`scripts/probe_jaw_kinematics_debug.py`) and therefore **do not move at all** as
+the jaw opens or closes: measured gap between the two spheres was `+0.00618 m`
+at both the closed limit (-0.1745 rad) and the open limit (+1.7453 rad),
+identical to five decimal places. Combined with Fix D setting
+`contype="0" conaffinity="0"` on the two real jaw MESH collision geoms (the only
+collision geometry that has ever been observed to move with the joint,
+`scripts/probe_jaw_opening.py`), the compiled gripper in HEAD could not contact
+anything at all. This was previously recorded as "NEUTRAL, no regression"
+because the retest ladder's only signal was plate-z, and plate-z did not move
+appreciably whether Fix D's spheres were present or not — that measurement
+masked a total loss of gripper contact rather than confirming Fix D was inert.
+
+**What changed.** `scripts/gen_dual_scene.py`: removed `apply_fine_jaw_collision()`,
+its call in `main()`, `FINE_JAW_TIP_RADIUS_M`, and `APPLY_FIX_D_FINE_JAW_COLLISION`
+— deleted rather than left as a disabled flag, since a flag that silently zeroes
+gripper contact when flipped on is the exact landmine this revert exists to
+remove. The two jaw MESH collision geoms (`JAW_COLLISION_MESHES`) are left
+exactly as Fix A set them: `friction="1.5 0.1 0.001"`, `contype`/`conaffinity`
+unset (MuJoCo default — collision-enabled). No visual (`class="visual"`) geom
+was touched. Regenerated `src/bimanual/sim/assets/so101_dual_table.xml`;
+`git diff --stat -- scenes/so101/` confirmed empty before commit.
+
+**Verification on bm-ptl, reported plainly (worse, as anticipated, not
+hidden):** `python scripts/run_skill.py --skill pick --object plate --arm A --seed 0`
+→ `result: success=False frames_used=296`, `reason: waypoint 1 (approach) failed
+[collision (arm-vs-prop: plate (dist=-0.0081 m); threshold=-0.005 m)]`,
+`measured: plate z: initial=0.3550 final=0.3516 delta=-0.0034`. This is a
+smaller/worse delta than the retest ladder's own Step 4 number
+(`delta=-0.0026`) because with real jaw collision restored, the arm-vs-prop
+debounce check (added in that same retest's Step 5) now fires on APPROACH
+before the skill ever reaches GRIP — with Fix D's contact-disabled gripper, the
+same approach path produced no arm-vs-prop contact to detect, so the skill ran
+further before failing. `pytest tests/test_skills.py`: **5 failed / 3 passed**,
+identical in count and in the specific failing tests to the retest ladder's own
+already-recorded final state (same `test_pick_plate_waypoints_progress_without_collision`
+failure at `dist=-0.0081 m`) — this revert introduces no new regression beyond
+what was already open and already flagged for the user to decide.
+
+---
+
 ## M06a grasp fix ladder RETEST (Steps 1-5) — Fix B reverted, C/D re-isolated, E (plate reshape) applied, Step 5 (arm-vs-prop validation) added and corrected twice
 
 **Recorded:** Sept 12, 2026 · **Follows:** the original fix-ladder entries below (fix
