@@ -425,19 +425,33 @@ def _drive_to_target(
     gripper_fraction: float,
     max_steps: int,
     pos_tol: float = POS_CONVERGENCE_TOL_M,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, dict]:
     """One closed-loop phase: repeatedly solve IK toward `target_pos` and
     step physics (holding the other arm still via `_hold_ctrl`) until the
     arm's gripperframe site is within `pos_tol` of the target, or
     `max_steps` `env.step()` calls have been spent.
 
-    Returns (converged, steps_used). `converged=False` at `max_steps` is a
-    normal outcome for a hard subgoal, not necessarily a bug -- the caller
-    (`_run_waypoint`/`_run_dwell` below) decides what that means for overall
-    skill success/failure.
+    Returns (converged, steps_used, prop_violations). `converged=False` at
+    `max_steps` is a normal outcome for a hard subgoal, not necessarily a bug
+    -- the caller (`_run_waypoint`/`_run_dwell` below) decides what that
+    means for overall skill success/failure.
+
+    **ADR-027 Step 5: checked on EVERY physics step, not once at the end.**
+    A first attempt at the arm-vs-prop check (`_prop_collision_violations`)
+    only sampled contacts once, after this loop already finished -- and
+    `pick(A, bottle)` still flung the bottle onto the floor with that
+    version in place (measured: frames_used=1560, every waypoint reported
+    clean, final z=0.0296). The reason: a transient, violent impact can
+    knock a light, freely-jointed prop away and the contact can fully
+    resolve (the two geoms separate) within the SAME waypoint's up-to-500
+    step budget, long before a single post-hoc check ever runs. Sampling
+    every step catches the collision at the moment it actually happens,
+    while the geoms are still interpenetrating, and stops driving further
+    steps immediately rather than continuing to push into (or having
+    already flung away) the prop.
     """
     if max_steps <= 0:
-        return False, 0
+        return False, 0, {}
 
     target = np.asarray(target_pos, dtype=np.float64).reshape(3)
     site_id = _site_id(env.model, ik.gripperframe_site_name(arm))
@@ -451,19 +465,37 @@ def _drive_to_target(
         env.step(ctrl)
         steps += 1
 
+        prop_violations = _prop_collision_violations(env)
+        if prop_violations:
+            return False, steps, prop_violations
+
         actual = env.data.site_xpos[site_id]
         if np.linalg.norm(target - actual) < pos_tol:
-            return True, steps
-    return False, steps
+            return True, steps, {}
+    return False, steps, {}
 
 
-def _dwell(env, arm: str, hold_pos, gripper_fraction: float, n_steps: int) -> int:
+def _dwell(
+    env,
+    arm: str,
+    hold_pos,
+    gripper_fraction: float,
+    n_steps: int,
+    target_object: str | None = None,
+) -> tuple[int, dict]:
     """Hold `arm`'s gripperframe near `hold_pos` for `n_steps`, commanding
     `gripper_fraction` on the jaw throughout. Used to let a grasp/release
     settle (contact + PD) without asking the arm to travel anywhere.
-    Returns the number of steps actually taken (may be less than
-    `n_steps` if the caller is out of step budget -- callers pass
-    `min(N, remaining)`).
+    Returns `(steps_taken, prop_violations)`; `steps_taken` may be less than
+    `n_steps` if the caller is out of step budget (callers pass
+    `min(N, remaining)`) or if a prop violation (ADR-027 Step 5, checked
+    every step -- see `_drive_to_target`'s docstring) cuts the dwell short.
+
+    `target_object` names the skill's OWN current target (e.g. `"plate"`
+    during `pick`'s GRIP dwell) so that dwell's deliberate, expected contact
+    with it is not itself reported as a violation -- a GRIP/RELEASE dwell
+    exists specifically to make that contact. `None` (the default, used by
+    `open_drawer`, whose target is not a free-joint prop) exempts nothing.
     """
     gripper_ctrl = _gripper_ctrl(env.model, arm, gripper_fraction)
     target = np.asarray(hold_pos, dtype=np.float64).reshape(3)
@@ -472,7 +504,21 @@ def _dwell(env, arm: str, hold_pos, gripper_fraction: float, n_steps: int) -> in
         ctrl = _hold_ctrl(env)
         _write_arm_ctrl(ctrl, env.model, arm, solution.joint_angles, gripper_ctrl)
         env.step(ctrl)
-    return n_steps
+
+        # ADR-027 Step 5: a GRIP/RELEASE dwell is EXPECTED to contact the
+        # skill's own current target object (that is the whole point of a
+        # dwell) -- so a violation is only reported here for a prop OTHER
+        # than the one this dwell is deliberately closing/opening on. A
+        # violent, unintended knock against a THIRD prop (or the target
+        # itself well past a controlled pinch depth, if `target_object` is
+        # not supplied) is still caught; the intended pinch itself is not
+        # penalised for the same contact it exists to make.
+        violations = _prop_collision_violations(env)
+        if target_object is not None:
+            violations = {k: v for k, v in violations.items() if k != OBJECT_BODY_NAME.get(target_object)}
+        if violations:
+            return i + 1, violations
+    return n_steps, {}
 
 
 # ---------------------------------------------------------------------------
@@ -603,12 +649,19 @@ def _prop_collision_violations(env) -> dict[str, float]:
     return violations
 
 
-def _validate_against_baseline(env, arm: str, target_pos, baseline: dict) -> tuple[bool, str | None, float]:
+def _validate_against_baseline(
+    env, arm: str, target_pos, baseline: dict, target_object: str | None = None
+) -> tuple[bool, str | None, float]:
     """Check BOTH bars a waypoint must clear (ADR-027): IK convergence
     (re-queried after the physical drive settles, so it reflects wherever
     the arm actually ended up) and collision (no NEW cross-arm or
     arm-vs-table_top contact versus `baseline`, a snapshot taken once at
-    this skill call's start).
+    this skill call's start, plus the ADR-027 Step 5 arm-vs-prop check).
+
+    `target_object` (same meaning as `_dwell`'s parameter) exempts a skill's
+    own deliberate current target from the arm-vs-prop check's POST-hoc
+    sample, consistent with the in-loop exemption `_dwell` already applies
+    -- a GRIP/RELEASE dwell's whole purpose is to contact that object.
 
     Returns (ok, reason, ik_residual_m). `reason` is None when `ok`.
     """
@@ -638,6 +691,9 @@ def _validate_against_baseline(env, arm: str, target_pos, baseline: dict) -> tup
     # instruction: any free-joint prop deeper than PROP_COLLISION_DEPTH_TOL_M
     # in contact with an arm geom is a validation failure naming the prop.
     prop_violations = _prop_collision_violations(env)
+    if target_object is not None:
+        exempt_body = OBJECT_BODY_NAME.get(target_object)
+        prop_violations = {k: v for k, v in prop_violations.items() if k != exempt_body}
     if prop_violations:
         named = ", ".join(
             f"{name} (dist={depth:.4f} m)" for name, depth in sorted(prop_violations.items())
@@ -667,8 +723,30 @@ def _run_waypoint(
     INFO line per waypoint (arm, target, frames used, pass/fail and why) so
     a Tester enabling logging gets a per-waypoint frame breakdown without
     this module's public `SkillResult` needing a new field for it.
+
+    ADR-027 Step 5: if `_drive_to_target`'s per-step check already caught a
+    prop violation (a transient knock mid-loop), that is reported
+    IMMEDIATELY -- the drive already stopped early, and the post-hoc
+    `_validate_against_baseline` check would no longer see it once the
+    knocked prop has separated and flown off. No `target_object` exemption
+    here: `_run_waypoint` drives APPROACH/DESCEND/RETREAT/PULL, none of
+    which are supposed to be in deliberate contact with anything yet (that
+    is `_run_dwell`'s GRIP/RELEASE job).
     """
-    _, steps = _drive_to_target(env, arm, target_pos, gripper_fraction, max_steps, pos_tol=pos_tol)
+    _, steps, in_loop_violations = _drive_to_target(
+        env, arm, target_pos, gripper_fraction, max_steps, pos_tol=pos_tol
+    )
+    if in_loop_violations:
+        named = ", ".join(
+            f"{name} (dist={depth:.4f} m)" for name, depth in sorted(in_loop_violations.items())
+        )
+        reason = f"collision (arm-vs-prop: {named}; threshold={-PROP_COLLISION_DEPTH_TOL_M} m)"
+        logger.info(
+            "waypoint arm=%s target=%s frames_used=%d ok=False reason=%s",
+            arm, np.round(np.asarray(target_pos, dtype=np.float64), 4).tolist(), steps, reason,
+        )
+        return False, steps, reason
+
     ok, reason, residual = _validate_against_baseline(env, arm, target_pos, baseline)
     logger.info(
         "waypoint arm=%s target=%s frames_used=%d ik_residual=%.4f ok=%s%s",
@@ -685,12 +763,30 @@ def _run_dwell(
     gripper_fraction: float,
     n_steps: int,
     baseline: dict,
+    target_object: str | None = None,
 ) -> tuple[bool, int, str | None]:
     """Dwell at `hold_pos` (a GRIP or RELEASE waypoint, ADR-027) while
     opening/closing the jaw, then validate exactly like `_run_waypoint`.
+
+    `target_object` is threaded to both `_dwell` (in-loop exemption) and
+    `_validate_against_baseline` (post-hoc exemption) so this dwell's own
+    deliberate contact with the object it is picking/placing/handing off is
+    never itself reported as a violation (ADR-027 Step 5) -- an UNEXPECTED
+    prop (or the target at a genuinely violent depth mid-dwell) still is.
     """
-    steps = _dwell(env, arm, hold_pos, gripper_fraction, n_steps)
-    ok, reason, residual = _validate_against_baseline(env, arm, hold_pos, baseline)
+    steps, in_loop_violations = _dwell(env, arm, hold_pos, gripper_fraction, n_steps, target_object=target_object)
+    if in_loop_violations:
+        named = ", ".join(
+            f"{name} (dist={depth:.4f} m)" for name, depth in sorted(in_loop_violations.items())
+        )
+        reason = f"collision (arm-vs-prop: {named}; threshold={-PROP_COLLISION_DEPTH_TOL_M} m)"
+        logger.info(
+            "dwell arm=%s target=%s frames_used=%d ok=False reason=%s",
+            arm, np.round(np.asarray(hold_pos, dtype=np.float64), 4).tolist(), steps, reason,
+        )
+        return False, steps, reason
+
+    ok, reason, residual = _validate_against_baseline(env, arm, hold_pos, baseline, target_object=target_object)
     logger.info(
         "dwell arm=%s target=%s frames_used=%d ik_residual=%.4f ok=%s%s",
         arm, np.round(np.asarray(hold_pos, dtype=np.float64), 4).tolist(), steps, residual, ok,
@@ -747,7 +843,9 @@ def run_pick(env, arm: str, target_object: str, step_budget: int = ik.DEFAULT_ST
 
     # Waypoint 3: GRIP -- close the jaw and hold so contact/friction settles
     # before the arm is asked to move again.
-    ok, used, reason = _run_dwell(env, arm, grasp_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    ok, used, reason = _run_dwell(
+        env, arm, grasp_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline, target_object=target_object
+    )
     frames += used
     remaining -= used
     if not ok:
@@ -845,7 +943,9 @@ def run_place(
         return SkillResult(False, f"waypoint 2 (descend to destination) failed [{reason}]", frames)
 
     # Waypoint 3: RELEASE -- open the jaw and hold so the object settles.
-    ok, used, reason = _run_dwell(env, arm, lower_target, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    ok, used, reason = _run_dwell(
+        env, arm, lower_target, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline, target_object=target_object
+    )
     frames += used
     remaining -= used
     if not ok:
@@ -962,14 +1062,20 @@ def run_handoff(
         return SkillResult(False, f"waypoint 4 (to_arm descend) failed [{reason}]", frames)
 
     # Waypoint 5: to_arm GRIP -- close and hold.
-    ok, used, reason = _run_dwell(env, to_arm, receiving_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    ok, used, reason = _run_dwell(
+        env, to_arm, receiving_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok:
         return SkillResult(False, f"waypoint 5 (to_arm grip) failed [{reason}]", frames)
 
     # Waypoint 6: from_arm RELEASE -- open and hold.
-    ok, used, reason = _run_dwell(env, from_arm, transfer_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    ok, used, reason = _run_dwell(
+        env, from_arm, transfer_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok:
