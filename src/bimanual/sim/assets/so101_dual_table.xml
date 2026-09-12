@@ -193,9 +193,23 @@
     <!-- Manipulable props (free joints). All placed within the arms'
          overlapping reach band, y in [-0.05, 0.08], resting on the table
          surface (z=0.35). -->
-    <body name="plate" pos="-0.1500 0.0000 0.3560">
+    <!-- M06a grasp fix E (Sept 12 2026 retest ladder Step 4): plate reshaped
+         from a single flush disc (radius 0.09, half-height 0.006, resting
+         with its bottom face directly on table_top -- CONFIRMED flush,
+         zero gap, see PLATE_POS's comment above) to a two-geom foot+dish
+         profile, the affordance real dinnerware gives a parallel-jaw
+         gripper: the dish overhangs its own foot by
+         (PLATE_DISH_RADIUS_M - PLATE_FOOT_RADIUS_M) = 0.03 m, with a
+         PLATE_FOOT_HALF_HEIGHT_M*2 = 0.01 m gap underneath the overhang
+         for the lower jaw to enter. Fixes A-D (friction, grasp-point
+         offset, closure force, jaw collision geometry) all operate on the
+         GRIPPER side of the problem and, once actually exercised (fix B
+         reverted), measured ZERO effect on the plate's z -- this is the
+         first fix in the ladder that changes the OBJECT's own geometry. -->
+    <body name="plate" pos="-0.1500 0.0000 0.3550">
       <freejoint name="plate_free"/>
-      <geom name="plate_geom" type="cylinder" size="0.09 0.006" mass="0.15" material="plate_material" friction="0.9 0.005 0.0001"/>
+      <geom name="plate_foot" type="cylinder" size="0.0300 0.0050" pos="0 0 0" mass="0.05" material="plate_material" friction="0.9 0.005 0.0001"/>
+      <geom name="plate_dish" type="cylinder" size="0.0600 0.0040" pos="0 0 0.0090" mass="0.10" material="plate_material" friction="0.9 0.005 0.0001"/>
     </body>
 
     <body name="mug" pos="0.0500 -0.0300 0.3900">
@@ -410,7 +424,7 @@
        deepest -0.0597 m) -- the two arms' own extended-forward default
        posture, not any prop or the drawer, was the collision source. -->
   <keyframe>
-    <key name="home" qpos="0.000000 -0.150000 0.000000 0.356000 1.000000 0.000000 0.000000 0.000000 0.050000 -0.030000 0.390000 1.000000 0.000000 0.000000 0.000000 -0.050000 0.050000 0.356000 1.000000 0.000000 0.000000 0.000000 0.000000 0.080000 0.356000 1.000000 0.000000 0.000000 0.000000 0.220000 0.000000 0.440000 1.000000 0.000000 0.000000 0.000000 0.000000 -1.200000 -1.600000 0.000000 0.000000 1.745329 0.000000 -1.200000 -1.600000 0.000000 0.000000 1.745329"/>
+    <key name="home" qpos="0.000000 -0.150000 0.000000 0.355000 1.000000 0.000000 0.000000 0.000000 0.050000 -0.030000 0.390000 1.000000 0.000000 0.000000 0.000000 -0.050000 0.050000 0.356000 1.000000 0.000000 0.000000 0.000000 0.000000 0.080000 0.356000 1.000000 0.000000 0.000000 0.000000 0.220000 0.000000 0.440000 1.000000 0.000000 0.000000 0.000000 0.000000 -1.200000 -1.600000 0.000000 0.000000 1.745329 0.000000 -1.200000 -1.600000 0.000000 0.000000 1.745329"/>
   </keyframe>
 
   <equality/>

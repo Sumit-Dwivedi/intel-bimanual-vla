@@ -253,7 +253,44 @@ HOME_WRIST_ROLL = 0.0
 # instead of two literals that could drift apart. Order matches the
 # worldbody document order in TEMPLATE (plate, mug, fork, spoon,
 # water_bottle), which is also the order MuJoCo assigns qpos slots in.
-PLATE_POS = (-0.15, 0.00, 0.356)
+#: M06a grasp fix E (plate reshape, Sept 12 2026 retest ladder Step 4):
+#: PLATE_POS's z moves from 0.356 (old flush single-disc rest height,
+#: table_top surface 0.35 + the old disc's own half-thickness 0.006 --
+#: CONFIRMED flush: 0.35+0.006=0.356 exactly, zero gap under it) to 0.355,
+#: now the FOOT cylinder's own centre-rest height (0.35 + FOOT_HALF_HEIGHT_M
+#: 0.005). See the plate body's two-geom template below for why: fixes A-D
+#: all operated on the GRIPPER side (friction, grasp offset, closure force,
+#: collision geometry) and none moved the plate's z at all once actually
+#: exercised (DECISIONS.md, retest ladder) -- because a flat disc resting
+#: FLUSH on the table gives a parallel jaw nothing to slide under. A foot
+#: ring gives the plate the SAME affordance real dinnerware has: the dish
+#: overhangs its own foot, leaving a gap a jaw can enter from below.
+PLATE_POS = (-0.15, 0.00, 0.355)
+
+#: M06a grasp fix E. Foot cylinder: narrower and shorter, resting directly
+#: on the table (bottom flush with table_top's surface, 0.35). Its RADIUS
+#: (0.03) is deliberately smaller than the dish's (0.06) so the dish
+#: overhangs it by 0.03 m all the way around -- see PLATE_DISH_RADIUS_M.
+PLATE_FOOT_RADIUS_M = 0.03
+PLATE_FOOT_HALF_HEIGHT_M = 0.005  # 1.0 cm total height
+
+#: M06a grasp fix E. Dish cylinder: the plate's actual eating surface,
+#: same outer radius (0.06) and thickness (0.008 total, previously 0.012)
+#: as the geometry the grasp-point offsets were originally derived
+#: against, sitting directly on top of the foot. Its bottom sits at
+#: `PLATE_POS[2] + PLATE_FOOT_HALF_HEIGHT_M = 0.36`, 0.01 m ABOVE the
+#: table surface (0.35) -- exactly the gap under the overhanging rim a
+#: jaw needs to slide into, matching the dimensions this fix's own
+#: measurement pass (`scripts/probe_jaw_opening.py`: measured jaw
+#: separation ranges ~0.025-0.036 m between fully closed and fully open,
+#: comfortably wider than this 0.01 m gap and the dish's own 0.008 m
+#: thickness) confirmed the gripper can actually fit into.
+PLATE_DISH_RADIUS_M = 0.06
+PLATE_DISH_HALF_HEIGHT_M = 0.004  # 0.8 cm total height
+#: Local z offset (relative to the plate BODY's own origin, which sits at
+#: the foot's centre) of the dish geom's centre: foot's own half-height
+#: (reaching the foot's top surface) plus the dish's own half-height.
+PLATE_DISH_LOCAL_Z_M = PLATE_FOOT_HALF_HEIGHT_M + PLATE_DISH_HALF_HEIGHT_M
 MUG_POS = (0.05, -0.03, 0.39)
 FORK_POS = (-0.05, 0.05, 0.356)
 SPOON_POS = (0.00, 0.08, 0.356)
@@ -635,6 +672,11 @@ def main():
         drawer_cam_xyaxes=DRAWER_CAM_XYAXES,
         drawer_cam_fovy=DRAWER_CAM_FOVY,
         plate_pos=_fmt_pos(PLATE_POS),
+        plate_foot_radius="%.4f" % PLATE_FOOT_RADIUS_M,
+        plate_foot_half_height="%.4f" % PLATE_FOOT_HALF_HEIGHT_M,
+        plate_dish_radius="%.4f" % PLATE_DISH_RADIUS_M,
+        plate_dish_half_height="%.4f" % PLATE_DISH_HALF_HEIGHT_M,
+        plate_dish_local_z="%.4f" % PLATE_DISH_LOCAL_Z_M,
         mug_pos=_fmt_pos(MUG_POS),
         fork_pos=_fmt_pos(FORK_POS),
         spoon_pos=_fmt_pos(SPOON_POS),
@@ -819,9 +861,23 @@ TEMPLATE = """<?xml version="1.0"?>
     <!-- Manipulable props (free joints). All placed within the arms'
          overlapping reach band, y in [-0.05, 0.08], resting on the table
          surface (z=0.35). -->
+    <!-- M06a grasp fix E (Sept 12 2026 retest ladder Step 4): plate reshaped
+         from a single flush disc (radius 0.09, half-height 0.006, resting
+         with its bottom face directly on table_top -- CONFIRMED flush,
+         zero gap, see PLATE_POS's comment above) to a two-geom foot+dish
+         profile, the affordance real dinnerware gives a parallel-jaw
+         gripper: the dish overhangs its own foot by
+         (PLATE_DISH_RADIUS_M - PLATE_FOOT_RADIUS_M) = 0.03 m, with a
+         PLATE_FOOT_HALF_HEIGHT_M*2 = 0.01 m gap underneath the overhang
+         for the lower jaw to enter. Fixes A-D (friction, grasp-point
+         offset, closure force, jaw collision geometry) all operate on the
+         GRIPPER side of the problem and, once actually exercised (fix B
+         reverted), measured ZERO effect on the plate's z -- this is the
+         first fix in the ladder that changes the OBJECT's own geometry. -->
     <body name="plate" pos="{plate_pos}">
       <freejoint name="plate_free"/>
-      <geom name="plate_geom" type="cylinder" size="0.09 0.006" mass="0.15" material="plate_material" friction="0.9 0.005 0.0001"/>
+      <geom name="plate_foot" type="cylinder" size="{plate_foot_radius} {plate_foot_half_height}" pos="0 0 0" mass="0.05" material="plate_material" friction="0.9 0.005 0.0001"/>
+      <geom name="plate_dish" type="cylinder" size="{plate_dish_radius} {plate_dish_half_height}" pos="0 0 {plate_dish_local_z}" mass="0.10" material="plate_material" friction="0.9 0.005 0.0001"/>
     </body>
 
     <body name="mug" pos="{mug_pos}">

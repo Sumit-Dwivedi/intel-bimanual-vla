@@ -155,8 +155,26 @@ OBJECT_BODY_NAME = {
 #: offset (no orientation control, so the jaw's pinch plane may not
 #: straddle the rim) is not disproven by this revert -- it is simply the
 #: only offset that lets the rest of the ladder actually run.
+#: **M06a grasp fix E (plate reshape, retest ladder Step 4).** The plate
+#: body itself was reshaped in `scripts/gen_dual_scene.py` (foot cylinder
+#: r=0.03 h=0.010 at the body origin, dish cylinder r=0.06 h=0.008 sitting
+#: on top, local z offset 0.009 m) after fixes A-D -- all on the GRIPPER
+#: side -- measured zero effect once actually exercised (fix B reverted).
+#: `"plate"`'s offset moves from the OLD flush-disc rim, `(0, 0.09, 0)`
+#: (radius of the old single 0.09 m disc, z=0 since the old disc had no
+#: vertical structure to aim at), to the NEW dish's overhanging rim:
+#: `(0, PLATE_DISH_RADIUS_M, PLATE_DISH_LOCAL_Z_M)` = `(0, 0.06, 0.009)` --
+#: the dish's own radius (its outer edge, where it overhangs the narrower
+#: foot by 0.03 m) at the dish's own local z centre (0.009 m above the
+#: plate body's origin, which sits at the foot's centre). This targets the
+#: 0.01 m gap under the overhang directly, so the lower jaw has somewhere
+#: to go instead of pressing against a flush table contact. Y direction
+#: (not X or -Y) is kept from the prior rim offset because it was already
+#: measured (ADR-027) to be the reachable side of a symmetric feature from
+#: arm A's "home" pose; the dish is circular so any direction is an
+#: equally valid PHYSICAL grasp feature, only some are REACHABLE.
 GRASP_POINT_OFFSET_M = {
-    "plate": np.array([0.0, 0.09, 0.0]),
+    "plate": np.array([0.0, 0.06, 0.009]),
     "mug": np.array([0.0475, 0.0, 0.0]),
     "fork": np.array([-0.015, 0.0, 0.0]),
     "spoon": np.array([-0.01, 0.0, 0.0]),
