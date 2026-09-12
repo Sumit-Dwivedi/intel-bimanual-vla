@@ -354,6 +354,110 @@ JAW_COLLISION_MESHES = {
     "moving_jaw_so101_v1",
 }
 
+# ---- ADR-028: finger-pad primitives (replaces the convex-hull jaw mesh
+# collision for grasp purposes) -----------------------------------------
+# **Root cause, measured (docs/hardware/grasp-envelope.md), independent of
+# the cited sources below.** MuJoCo collapses a `type="mesh"` collision
+# geom to its CONVEX HULL unless a convex decomposition is declared, and
+# none is declared anywhere in this asset. Both jaw parts
+# (`wrist_roll_follower_so101_v1`, fixed; `moving_jaw_so101_v1`, moving)
+# are non-convex C-shaped housings; their hulls fill in the concavities and
+# overlap by 2-3.5 cm at EVERY angle across the joint's full range (measured
+# via `mujoco.mj_geomDistance` between the exact named pair, not minimised
+# over all geom pairs -- the pitfall ADR-024/the grasp-envelope report both
+# flag). There is no opening at any angle, and the caliper sweep confirmed
+# it functionally: 0 of 30 test-box thicknesses (2-60 mm) achieved sustained
+# two-jaw contact. This is the documented MuJoCo finger-pad pattern for
+# mesh-gripper collision (MuJoCo GitHub issue #239's upstream recommendation;
+# also reported working for SO-101 grasping specifically at
+# https://ggando.com/blog/so101-rl-lift and taught at
+# https://maegantucker.com/ECE4560/assignment8-so101/): disable collision
+# on the bulky mesh geoms (visual rendering unchanged) and add small BOX
+# primitives at the two jaws' actual contact-surface locations instead.
+#
+# **Why this is NOT the same mistake as Fix D (reverted above).** Fix D's
+# replacement sphere sat at local `pos="0 0 0"` on the moving jaw body --
+# exactly on that body's own hinge rotation axis -- so it never moved as
+# the jaw opened or closed (measured: identical gap at both joint limits to
+# five decimal places). The pad positions below are NOT on either body's
+# rotation axis: `moving_finger_pad`'s local pos (-0.01136, -0.076, 0.019)
+# is offset in all three axes from the moving jaw body's origin, so it
+# moves with the jaw as the hinge rotates. Step 3 (this generator's own
+# verification pass, run from `scripts/run_skill.py`-adjacent tooling, see
+# DECISIONS.md) explicitly re-measures pad separation across three joint
+# angles specifically to catch a repeat of the Fix D failure mode before
+# any pick attempt is trusted.
+#
+# **Positions are verbatim from the task's own citations**, expressed in
+# each PARENT BODY's own local frame (`static_finger_pad` is a child of
+# `armX_gripper`; `moving_finger_pad` is a child of
+# `armX_moving_jaw_so101_v1`). Because these arm copies are byte-faithful
+# renamed deep copies of the upstream body tree (ADR-016/ADR-021, only the
+# base repositioned), the local frames match upstream and the cited values
+# transfer directly without re-derivation.
+STATIC_PAD_POS = "-0.008875 0.0 -0.100"
+MOVING_PAD_POS = "-0.01136 -0.076 0.019"
+PAD_HALF_SIZE = "0.00125 0.00125 0.00125"
+PAD_FRICTION = "1 0.05 0.001"
+
+
+def disable_jaw_mesh_collision(arm_root) -> int:
+    """ADR-028 Step 1: set `contype="0" conaffinity="0"` on the two jaw MESH
+    collision geoms (`JAW_COLLISION_MESHES`) within this already-renamed arm
+    subtree, in place -- the convex-hull overlap documented above means
+    these geoms can never form a genuine pinch, so they are removed from
+    collision entirely (visual rendering, a separate `class="visual"` copy,
+    is untouched). Returns the number of geoms changed so `main()` can
+    assert exactly 2 per arm, the same loud-failure convention
+    `apply_jaw_friction` already uses.
+    """
+    n = 0
+    for geom in arm_root.iter("geom"):
+        if geom.get("class") == "collision" and geom.get("mesh") in JAW_COLLISION_MESHES:
+            geom.set("contype", "0")
+            geom.set("conaffinity", "0")
+            n += 1
+    return n
+
+
+def _find_body(arm_root, name):
+    for b in arm_root.iter("body"):
+        if b.get("name") == name:
+            return b
+    raise ValueError(f"body {name!r} not found while adding ADR-028 finger pads")
+
+
+def add_finger_pads(arm_root, prefix) -> None:
+    """ADR-028 Step 2: add one small box collision geom as a child of each
+    jaw body -- `static_finger_pad` on `{prefix}gripper` (the fixed jaw),
+    `moving_finger_pad` on `{prefix}moving_jaw_so101_v1` (the moving jaw).
+    These are the ONLY collision geometry that can form a genuine pinch now
+    that the bulky mesh geoms are collision-disabled (see
+    `disable_jaw_mesh_collision` above).
+    """
+    fixed_body = _find_body(arm_root, prefix + "gripper")
+    static_pad = ET.SubElement(fixed_body, "geom")
+    static_pad.set("name", prefix + "static_finger_pad")
+    static_pad.set("type", "box")
+    static_pad.set("size", PAD_HALF_SIZE)
+    static_pad.set("pos", STATIC_PAD_POS)
+    static_pad.set("friction", PAD_FRICTION)
+    static_pad.set("rgba", "1 0.5 0.5 0.8")
+    static_pad.set("contype", "1")
+    static_pad.set("conaffinity", "1")
+
+    moving_body = _find_body(arm_root, prefix + "moving_jaw_so101_v1")
+    moving_pad = ET.SubElement(moving_body, "geom")
+    moving_pad.set("name", prefix + "moving_finger_pad")
+    moving_pad.set("type", "box")
+    moving_pad.set("size", PAD_HALF_SIZE)
+    moving_pad.set("pos", MOVING_PAD_POS)
+    moving_pad.set("friction", PAD_FRICTION)
+    moving_pad.set("rgba", "0.5 0.5 1 0.8")
+    moving_pad.set("contype", "1")
+    moving_pad.set("conaffinity", "1")
+
+
 # ---- M06a grasp fix D: REVERTED (Sept 12, 2026) ------------------------
 # Fix D used to disable the two bulky jaw MESH collision geoms
 # (`contype="0" conaffinity="0"`, the same convention this scene uses for
@@ -534,10 +638,23 @@ def main():
         )
 
     # M06a grasp fix D: REVERTED (see the "M06a grasp fix D: REVERTED"
-    # comment block above). No call here any more -- the bulky jaw MESH
-    # collision geoms fix A already touched are left as the only jaw
-    # collision geometry, with normal (unset -> MuJoCo default) contype/
-    # conaffinity, so the gripper can make contact again.
+    # comment block above). No call here any more -- superseded by ADR-028
+    # below, which disables the same bulky jaw MESH collision geoms again,
+    # this time for a measured, documented reason (convex-hull overlap) and
+    # replaced with pads that are NOT on either jaw's rotation axis.
+
+    # ADR-028: disable the (measured, permanently self-overlapping) jaw MESH
+    # collision and add finger-pad primitives at the documented pinch
+    # locations instead. Asserted at exactly 2 disabled geoms per arm (same
+    # loud-failure convention as apply_jaw_friction above).
+    for arm_root, prefix in ((arm_a, "armA_"), (arm_b, "armB_")):
+        n_disabled = disable_jaw_mesh_collision(arm_root)
+        assert n_disabled == 2, (
+            f"{prefix}: expected to disable exactly 2 jaw mesh collision geoms "
+            f"(fixed + moving), found {n_disabled} -- JAW_COLLISION_MESHES may no "
+            f"longer match the upstream asset's mesh names"
+        )
+        add_finger_pads(arm_root, prefix)
 
     # Wrist camera: a bare <camera>, no mesh geometry. so101_new_calib_camera.xml
     # (also in scenes/so101/, provenance in scenes/so101/PROVENANCE.md) shows a

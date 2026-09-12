@@ -11,6 +11,134 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-028 — Finger-pad primitives (MuJoCo convex-hull fix), pads verified to move, but no `pick()` reaches GRIP under the current approach-collision check
+
+**Recorded:** Sept 12, 2026 · **Follows:** `docs/hardware/grasp-envelope.md`
+(diagnostic: 0 of 30 caliper thicknesses achieved sustained two-jaw contact,
+convex hulls overlap -0.0206..-0.0345 m at every joint angle) · **Cites:**
+MuJoCo GitHub issue #239's documented finger-pad pattern for mesh-gripper
+collision, https://ggando.com/blog/so101-rl-lift (reports working SO-101
+grasping with this pattern), https://maegantucker.com/ECE4560/assignment8-so101/
+(course material teaching it) · **Not accessed**, per instruction — cited only.
+
+**Context.** `docs/hardware/grasp-envelope.md` measured the root cause
+directly: MuJoCo collapses a `type="mesh"` collision geom to its convex hull
+with no decomposition declared anywhere in this asset, and both jaw parts
+(`wrist_roll_follower_so101_v1`, `moving_jaw_so101_v1`) are non-convex
+C-shaped housings whose hulls overlap at every angle in the joint's range
+(-0.03454 m closed to -0.02062 m at the least-overlapping angle). No object
+placed there can ever be read as anything but embedded in solid material on
+both sides.
+
+**Options.** (a) weld-based grasping — rejected, a workaround that reads as
+not-really-grasping and would need disclosure; (b) finger-pad primitives per
+the cited pattern — **chosen**; (c) non-prehensile manipulation — rejected,
+scope change.
+
+**Decision (b), implemented in `scripts/gen_dual_scene.py` only** (never
+`scenes/so101/`, confirmed empty diff below): (1) `disable_jaw_mesh_collision()`
+sets `contype="0" conaffinity="0"` on the same two jaw MESH collision geoms
+`JAW_COLLISION_MESHES` already identifies (visual rendering, a separate
+`class="visual"` copy, untouched); (2) `add_finger_pads()` adds one
+`type="box" size="0.00125 0.00125 0.00125"` collision geom per jaw, at the
+task's own verbatim positions: `static_finger_pad` at local `pos="-0.008875
+0.0 -0.100"` as a child of `{prefix}gripper` (the fixed jaw body), and
+`moving_finger_pad` at local `pos="-0.01136 -0.076 0.019"` as a child of
+`{prefix}moving_jaw_so101_v1` (the moving jaw body) — both bodies asserted to
+resolve to a real match. `friction="1 0.05 0.001"`, `contype="1"
+conaffinity="1"` on both pads, exactly as specified.
+
+**Why this is not a repeat of the reverted Fix D.** Fix D's replacement
+sphere sat at local `pos="0 0 0"` on the moving jaw body — exactly on that
+body's own hinge rotation axis — so it never moved as the jaw opened or
+closed (identical gap to five decimals at both joint limits, DECISIONS.md's
+Fix D revert entry). `moving_finger_pad`'s local pos is offset in all three
+axes from that origin, so this is a structurally different placement, not
+merely a re-application of the same mistake — and Step 3 below exists
+specifically to catch a repeat before anything downstream is trusted.
+
+**Step 3 gate — pad separation across joint angle, measured on bm-ptl**
+(`scripts/probe_pad_separation.py`, new diagnostic script, not shipped skill
+code; reads `armA_static_finger_pad`/`armA_moving_finger_pad` world
+`geom_xpos` directly, resetting to the "home" keyframe then overriding only
+`armA_gripper`'s qpos per angle):
+
+| angle | qpos (rad) | pad separation (m) |
+|---|---:|---:|
+| fully closed | -0.1745 | **0.00600** |
+| midway | +0.7850 | **0.07621** |
+| fully open | +1.7453 | **0.13188** |
+
+Spread across the three angles: 0.12589 m. **GATE PASSED** — separation
+changes materially and monotonically with joint angle (smallest near
+closed, as expected for a pinch point), the opposite of Fix D's
+identical-to-five-decimals failure. Both pad geoms genuinely move with
+their respective bodies.
+
+**Step 4 — pick(A, ·) in force order, run on bm-ptl, reported exactly as
+measured, not softened.** `pytest tests/test_skills.py` first, to confirm no
+new regression from the generator change: **5 failed / 3 passed**,
+byte-for-byte the same specific failures already on record in the "M06a Fix
+D reverted" entry above (including `test_pick_plate_waypoints_progress_without_collision`,
+already flagged there as a pre-existing, undecided conflict with ADR-027's
+own regression-test requirement — not newly broken by this change).
+
+| Prop | Result | frames_used | reason | z delta | crossed lift threshold? |
+|---|---|---:|---|---:|---|
+| fork | FAIL | 313 | `waypoint 1 (approach) failed [collision (arm-vs-prop: fork (dist=-0.0072 m); threshold=-0.005 m)]` | -0.0035 | no |
+| spoon | FAIL | 306 | `waypoint 1 (approach) failed [collision (arm-vs-prop: fork (dist=-0.0055 m); threshold=-0.005 m)]` — **anomaly:** target is spoon, the collision reported is against the *fork* prop, sitting nearby | -0.0021 | no |
+| plate | FAIL | 296 | `waypoint 1 (approach) failed [collision (arm-vs-prop: plate (dist=-0.0081 m); threshold=-0.005 m)]` | -0.0034 | no |
+| mug | FAIL | 317 | `waypoint 1 (approach) failed [collision (arm-vs-prop: mug (dist=-0.0090 m); threshold=-0.005 m)]` | -0.0028 | no |
+| water_bottle | FAIL | 256 | `waypoint 1 (approach) failed [collision (arm-vs-prop: water_bottle (dist=-0.0061 m); threshold=-0.005 m)]` | -0.0007 | no |
+
+**Honest interpretation: none of the three outcomes the task's own
+interpretation guide anticipated is quite what happened, and that mismatch
+is itself the finding.** All five props fail identically at **waypoint 1
+(APPROACH)** — before the skill ever reaches DESCEND or GRIP. The pad
+geometry this ADR adds is therefore **not exercised at all** by any of these
+five runs; the pinch never gets a chance to form. This is not new: it is
+**ADR-027 Step 5's own already-documented arm-vs-prop collision check**
+(`skills_scripted.py`, out of this task's scope to touch) firing during the
+blind, obstacle-unaware IK approach path (ADR-024) — the same condition that
+entry already flagged for the plate specifically ("the arm's blind approach
+path was apparently ALREADY grazing the plate during ordinary APPROACH even
+with the original flush geometry"), now confirmed to occur identically for
+**all five** props, not only the plate.
+
+**Proof this is unrelated to the pad fix, not just an assertion:** `pick(A,
+plate)`'s numbers here (`dist=-0.0081 m`, `frames_used=296`) are **bit-for-bit
+identical** to the pre-ADR-028 baseline recorded in the "M06a Fix D reverted"
+entry above, measured when the jaw mesh collision was still enabled and no
+pads existed. Changing the jaw's collision geometry from mesh to pads
+produced **zero** change to this failure, which is the expected result if —
+and only if — the contact triggering it belongs to a different arm geom
+entirely (most plausibly the wrist/forearm, brushing the prop during
+approach), not the jaw. That is consistent with, not contradicted by, this
+fix: the pad fix targets the PINCH, and the approach-phase collision check
+fires well before any pinch is attempted.
+
+**No further action taken in this commit, per its own explicit
+instruction** ("Do NOT modify prop masses, IK strategy, or grasp offsets...
+we are testing the pad fix in isolation"): `skills_scripted.py`'s
+arm-vs-prop debounce/threshold logic and `ik.py`'s obstacle-unaware approach
+path are both out of scope here, and neither was touched. **What this commit
+proves:** the convex-hull geometry defect diagnosed in `docs/hardware/
+grasp-envelope.md` is fixed at the geometry level (Step 3's gate) and does
+not regress anything measured before (Step 4's pytest/plate parity). **What
+it does not yet prove:** whether the fixed geometry actually grasps
+anything, because no skill run in this commit reaches the GRIP waypoint for
+any prop — that remains blocked by the separate, already-documented
+approach-collision gap, and by the `±3.35 N` actuator ceiling for plate/mug/
+bottle specifically, neither of which this commit addresses.
+
+`git diff --stat -- scenes/so101/` confirmed empty before commit. Files
+changed: `scripts/gen_dual_scene.py` (`disable_jaw_mesh_collision`,
+`add_finger_pads`, wired into `main()`), the regenerated
+`src/bimanual/sim/assets/so101_dual_table.xml`, and
+`scripts/probe_pad_separation.py` (new diagnostic, not shipped skill code).
+
+---
+
 ## M06a Fix D reverted — it disabled all gripper contact, not merely a neutral change
 
 **Recorded:** Sept 12, 2026 · **Relates to:** ADR-024 (grasp-reliability gap) ·
