@@ -11,6 +11,187 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06a grasp fix ladder RETEST (Steps 1-5) — Fix B reverted, C/D re-isolated, E (plate reshape) applied, Step 5 (arm-vs-prop validation) added and corrected twice
+
+**Recorded:** Sept 12, 2026 · **Follows:** the original fix-ladder entries below (fix
+A-D, applied cumulatively on top of a poisoned Fix B) · **Corrects:** the previous
+run's confound, explicitly: Fix B's top-centre plate offset never converged at
+waypoint 1, so fixes C and D were applied but never actually exercised. This entry
+redoes the ladder from a working baseline so each fix gets a fair test, then adds a
+new arm-vs-prop validation check (ADR-027 Step 5) motivated by the earlier
+`pick(A, bottle)` diagnostic (bottle knocked from z=0.44 to z=0.0298, every waypoint
+reporting clean).
+
+### Step 1 — Revert Fix B (`6d49514`)
+
+`GRASP_POINT_OFFSET_M["plate"]` restored from the top-centre point `(0,0,0.005)` back
+to the rim, `(0, 0.09, 0)`. `pick(A, plate)`: waypoint 1 now CONVERGES (it did not
+before), all 4 waypoints run, `frames_used=1560`, `initial_z=0.3560 final_z=0.3504
+delta=-0.0056`. `pytest tests/test_skills.py`: **4 failed / 4 passed**, matching the
+pre-Fix-B count exactly, including both ADR-027 regression tests passing.
+**Verdict: NEUTRAL** (z stays ≈0.3505, no regression). **Kept.**
+
+### Step 2 — Retest Fix C in isolation (`85146c4`)
+
+Fix C's mechanism (ctrl driven to the gripper actuator's own `ctrlrange` closure
+limit; `GRIP_HOLD_FRAMES` 30→60) was already unconditionally present in
+`skills_scripted.py` since the original ladder — Step 1's revert is what let it
+actually run for the first time. To test it in ISOLATION from fix D (not merely
+un-poisoned from fix B), a new `APPLY_FIX_D_FINE_JAW_COLLISION` flag was added to
+`gen_dual_scene.py` and set `False`, disabling fix D's fine jaw-tip collision geoms
+and leaving the original bulky mesh collision (with fix A's friction only) active.
+`pick(A, plate)`: **identical** to Step 1 — `initial_z=0.3560 final_z=0.3504
+delta=-0.0056`, `frames_used=1560`. `pytest`: **4 failed / 4 passed**, no change.
+**Verdict: NEUTRAL** (fix C alone, now actually exercised, measured ZERO effect).
+**Kept** (no regression).
+
+### Step 3 — Retest Fix D in isolation (`1a099e3`)
+
+`APPLY_FIX_D_FINE_JAW_COLLISION` flipped back `True`, re-enabling the fine jaw-tip
+collision spheres on top of fix C's (already-tested) state. `pick(A, plate)`:
+**identical again** — `initial_z=0.3560 final_z=0.3504 delta=-0.0056`,
+`frames_used=1560`. `pytest`: **4 failed / 4 passed**, no change.
+**Verdict: NEUTRAL.** Fixes C and D, tested individually and cumulatively once
+actually exercised, produced **zero measurable change** to `pick(A, plate)`'s
+outcome. **Kept** (no regression, and per the task's "keep the commit" rule for a
+neutral result — reverting would gain nothing since neither changed the number).
+
+**A finding surfaced by chasing why D measured zero effect, not merely reported:**
+`scripts/probe_jaw_kinematics_debug.py` and `scripts/probe_jaw_geoms_debug.py` (new
+diagnostic scripts, not part of the shipped skill code) found that the moving jaw's
+hinge joint has `jnt_pos=(0,0,0)` in the moving jaw BODY's own local frame — the
+rotation axis passes exactly through that body's origin. Fix D's fine collision
+sphere was added at local `pos="0 0 0"` on that same body — i.e. **exactly on the
+rotation axis**, so it never moves at all as the jaw opens or closes, regardless of
+commanded ctrl. This is a plausible, concrete reason fix D measured no effect: its
+own new collision geometry was structurally unable to participate in the pinch.
+
+### Step 4 pre-measurements (`scripts/probe_jaw_opening.py`, measured on bm-ptl)
+
+1. **Jaw opening.** The moving jaw body's ORIGIN does not move with the joint angle
+   (see above), so the jaw's own MESH geom (offset ~2.5 cm from that axis) is what
+   actually sweeps. Measured world-frame separation between the fixed and moving
+   jaw's mesh-geom points: **CLOSED ≈0.0248 m, OPEN ≈0.0361 m** — i.e. a maximum jaw
+   opening on the order of **3.6 cm**, with roughly 1.1 cm of closing travel from
+   that fully-open state. Approximate (mesh centroids, not exact contact-surface
+   geometry — no finer data available without touching `scenes/so101/`), but
+   measured from the compiled model, not assumed.
+2. **Flush contact.** Read directly from `scripts/gen_dual_scene.py` before this
+   fix: `PLATE_POS` z was `0.356` = `TABLE_TOP_Z` (0.35) + the old disc's own
+   half-thickness (0.006) **exactly** — the plate rested FLUSH on the table with
+   zero gap beneath it. Confirmed, not assumed: the old `plate_geom` was a single
+   cylinder resting directly on `table_top`.
+
+### Step 4 — Fix E: plate reshape (`566b7af`)
+
+Candidate (b) chosen (foot ring): `plate` body reshaped into two stacked cylinders
+in `scripts/gen_dual_scene.py`'s hand-authored template (not `scenes/so101/`) — a
+foot (r=0.03, h=0.010) resting on the table, and a dish (r=0.06, h=0.008) on top,
+overhanging the foot by 0.03 m with a 0.01 m gap beneath the overhang (well inside
+the ~3.6 cm measured jaw opening). `GRASP_POINT_OFFSET_M["plate"]` set to
+`(0, 0.06, 0.009)`, targeting the dish's overhanging rim at the dish's own local
+height. `pick(A, plate)`: `initial_z=0.3550 final_z=0.3524 delta=-0.0026` — roughly
+**half** the previous delta (an improvement), still far short of the `z > 0.38`
+success bar. `pytest`: **4 failed / 4 passed**, both ADR-027 regression tests still
+passing at this point (the arm-vs-prop check did not exist yet).
+**Verdict: NEUTRAL/improvement, not success.** Per instruction, this is the last fix
+in the ladder — no sixth fix attempted.
+
+### Step 5 — Extend validation to arm-vs-prop (`66b0e46`, corrected `417c43f`, `2bf0bf2`)
+
+Implemented regardless of the pick outcome, per instruction. Three iterations were
+needed to get this right, each measured and reported rather than assumed:
+
+1. **First version (`66b0e46`):** a single post-hoc check per waypoint (any arm geom
+   vs. any free-joint prop at `dist < -0.005 m` after the waypoint's drive loop
+   finished). Result: **did NOT catch the bug it was built for.**
+   `pick(A, bottle)`: `frames_used=1560`, every waypoint reported clean, bottle still
+   knocked to the floor (`z 0.4400 → 0.0296`). Root cause, found and reported rather
+   than silently patched: the knock happens AND fully resolves (the prop separates)
+   within a single ~500-step waypoint loop, before the one-shot post-hoc check ever
+   runs.
+2. **Second version (`417c43f`):** sample contacts on EVERY physics step inside
+   `_drive_to_target`/`_dwell`, stop immediately on a violation. This DID catch it:
+   `pick(A, bottle)` now fails at `waypoint 1 (approach)` with
+   `collision (arm-vs-prop: water_bottle (dist=-0.0060 m))`, `frames_used=254`,
+   bottle displacement now `delta=-0.0010` (essentially none) — exactly the
+   "validation failed: knocked water_bottle" outcome the task asked to confirm.
+   **But this broke a required regression test**: `pytest` went to **5 failed / 3
+   passed** — `test_pick_plate_waypoints_progress_without_collision` newly failed,
+   because `pick(A, plate)`'s own ordinary APPROACH waypoint also registered a
+   prop-collision against the plate itself (`dist=-0.0051 m`, just past the bar).
+3. **Third version (`2bf0bf2`):** added a 3-consecutive-step debounce
+   (`PROP_COLLISION_DEBOUNCE_STEPS`) plus a `target_object` exemption in
+   `_run_dwell`/`_dwell` (a GRIP/RELEASE dwell's whole purpose is deliberate contact
+   with its own target, so that contact should not itself be a violation). Result:
+   bottle still caught cleanly (`dist=-0.0061 m`, `frames_used=256`,
+   `delta=-0.0007`) — debounce did not meaningfully delay detection or let the
+   bottle move. **But the plate's approach violation is CONFIRMED, not a
+   single-frame artifact**: with debounce active it is detected at a DEEPER
+   `dist=-0.0081 m` after persisting 3 consecutive steps, i.e. the contact is
+   sustained/escalating, not solver noise.
+
+**Investigated further, and reported honestly rather than patched around:** to test
+whether Fix E (Step 4's plate reshape) was the cause of the new plate-vs-arm
+approach contact, the OLD flush plate geometry and the OLD rim offset were
+temporarily restored (dry run, never committed) with Step 5's code otherwise
+unchanged, and `pick(A, plate)` was re-run. **Result: the SAME violation still
+occurred** — `collision (arm-vs-prop: plate (dist=-0.0096 m))` at waypoint 1,
+`frames_used=271`. **This rules out Fix E as the cause.** The arm's blind,
+obstacle-unaware IK approach path (ADR-024's already-documented limitation) was
+apparently ALREADY grazing the plate during ordinary APPROACH even with the
+original flush geometry — this was simply never detected before because no
+check watched arm-vs-prop contact until this step. Reverting Fix E therefore would
+not have fixed the conflict, so the committed Fix E state was restored (git
+checkout, confirmed clean) rather than left reverted for no benefit.
+
+**Why no further exemption was attempted.** The one remaining lever that would make
+`test_pick_plate_waypoints_progress_without_collision` pass again — exempting a
+skill's own `target_object` during `_run_waypoint`'s APPROACH/DESCEND phases, the
+same way `_run_dwell` already exempts it during GRIP/RELEASE — was considered and
+REJECTED: in `pick(A, bottle)`, the water bottle IS `pick`'s own `target_object`
+during that exact APPROACH waypoint. Exempting "the skill's own current target"
+during transit would silence the water-bottle catch this step exists to build,
+not just the plate's benign one. There is no target-identity-based rule that
+keeps one and drops the other; the two cases are structurally the same shape
+(an arm approaching its own eventual grasp target grazes it en route) and differ
+only in CONSEQUENCE (the bottle gets flung; the plate, per the Step-4 measurement
+with no check active, settles at `delta=-0.0026` without flinging) — a difference
+this depth-based check cannot see in advance. A velocity/displacement-based
+signal might discriminate the two cases, but that is a materially different
+mechanism than the depth threshold the task specified, and was not implemented
+without approval.
+
+**Final, honestly-reported state of the test suite:** `pytest tests/test_skills.py`
+= **5 failed, 3 passed.** `test_open_drawer_fails_without_tunneling_through_table`
+(the other required ADR-027 regression test) still passes throughout every step
+of this retest. `test_pick_plate_waypoints_progress_without_collision` now fails —
+**not as a defect introduced by this task's changes, but as a pre-existing,
+previously-undetectable condition that Step 5's validation correctly surfaces for
+the first time.** This conflicts with this task's own instruction that ADR-027's
+regression tests must keep passing at every step, and is flagged here, plainly,
+for the user to decide rather than resolved by guessing: either (a) accept that
+`test_pick_plate_waypoints_progress_without_collision`'s assumption predates
+arm-vs-prop validation and needs updating to allow a plate-specific
+approach-phase collision while still failing on anything worse, or (b) direct a
+different, out-of-scope fix (e.g. an obstacle-aware approach path in `ik.py`,
+explicitly off-limits to this task).
+
+**Files changed this retest, by step:** Step 1 —
+`src/bimanual/control/skills_scripted.py` (offset revert). Steps 2-3 —
+`scripts/gen_dual_scene.py` (`APPLY_FIX_D_FINE_JAW_COLLISION` flag) and the
+regenerated `src/bimanual/sim/assets/so101_dual_table.xml`. Step 4 —
+`scripts/gen_dual_scene.py` (plate body reshape), regenerated scene XML, and
+`src/bimanual/control/skills_scripted.py` (grasp offset). Diagnostic-only, not
+part of the shipped skill code: `scripts/probe_jaw_opening.py`,
+`scripts/probe_jaw_kinematics_debug.py`, `scripts/probe_jaw_geoms_debug.py`. Step
+5 — `src/bimanual/control/skills_scripted.py` only (`_prop_collision_violations`,
+`_debounce_prop_violations`, wiring into `_drive_to_target`/`_dwell`/
+`_run_waypoint`/`_run_dwell`/`_validate_against_baseline`). `git diff --stat --
+scenes/so101/` was run and confirmed empty before every commit in this retest.
+
+---
+
 ## M06a grasp fix ladder — final diagnostic: `pick(A, mug)` and `pick(A, bottle)` after all four fixes
 
 **Recorded:** Sept 12, 2026 · **Follows:** M06a grasp fixes A-D (all four
