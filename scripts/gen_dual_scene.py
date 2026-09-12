@@ -401,22 +401,46 @@ PAD_HALF_SIZE = "0.00125 0.00125 0.00125"
 PAD_FRICTION = "1 0.05 0.001"
 
 
-def disable_jaw_mesh_collision(arm_root) -> int:
-    """ADR-028 Step 1: set `contype="0" conaffinity="0"` on the two jaw MESH
-    collision geoms (`JAW_COLLISION_MESHES`) within this already-renamed arm
-    subtree, in place -- the convex-hull overlap documented above means
-    these geoms can never form a genuine pinch, so they are removed from
-    collision entirely (visual rendering, a separate `class="visual"` copy,
-    is untouched). Returns the number of geoms changed so `main()` can
-    assert exactly 2 per arm, the same loud-failure convention
-    `apply_jaw_friction` already uses.
+def disable_jaw_mesh_collision(arm_root, prefix) -> int:
+    """ADR-028 Step 1 (M06a Fix A, completed): set `contype="0"
+    conaffinity="0"` on every MESH collision geom that is a DIRECT child of
+    either jaw BODY -- `"{prefix}gripper"` (fixed jaw) or
+    `"{prefix}moving_jaw_so101_v1"` (moving jaw) -- within this
+    already-renamed arm subtree, in place.
+
+    **Why body membership, not `JAW_COLLISION_MESHES` (mesh name), decides
+    this now.** The original version of this function matched geoms by
+    upstream `mesh` reference, the same set `apply_jaw_friction` uses
+    (`{"wrist_roll_follower_so101_v1", "moving_jaw_so101_v1"}`) -- correct
+    for friction (only the two genuine pinch surfaces should get the raised
+    jaw friction) but incomplete for collision-disabling. An independent
+    measurement (M06a Fix A follow-up) found `"{prefix}gripper"` (the fixed
+    jaw body) carries a SECOND mesh collision geom this mesh-name filter
+    never touched: `sts3215_03a_v1`, the wrist_roll servo's own housing
+    mesh, rigidly mounted on that same body. That exact mesh name is reused
+    at 4 other joints per arm (shoulder, elbow, wrist_flex, wrist_roll
+    itself) with legitimate, wanted collision there, so it cannot be
+    disabled by mesh name globally -- doing so would blind the whole arm to
+    table/prop contact at those joints. Matching by BODY membership instead
+    (only the two jaw bodies, and only their own direct-child geoms, not
+    entering nested bodies) reaches the leftover fixed-side hull without
+    touching any other joint's copy of the same mesh. Visual rendering (the
+    separate `class="visual"` copy) is untouched either way.
+
+    Returns the number of geoms changed so `main()` can assert an exact
+    count per arm, the same loud-failure convention `apply_jaw_friction`
+    already uses.
     """
+    jaw_body_names = {prefix + "gripper", prefix + "moving_jaw_so101_v1"}
     n = 0
-    for geom in arm_root.iter("geom"):
-        if geom.get("class") == "collision" and geom.get("mesh") in JAW_COLLISION_MESHES:
-            geom.set("contype", "0")
-            geom.set("conaffinity", "0")
-            n += 1
+    for body in arm_root.iter("body"):
+        if body.get("name") not in jaw_body_names:
+            continue
+        for geom in body.findall("geom"):
+            if geom.get("type") == "mesh" and geom.get("class") == "collision":
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+                n += 1
     return n
 
 
@@ -648,11 +672,13 @@ def main():
     # locations instead. Asserted at exactly 2 disabled geoms per arm (same
     # loud-failure convention as apply_jaw_friction above).
     for arm_root, prefix in ((arm_a, "armA_"), (arm_b, "armB_")):
-        n_disabled = disable_jaw_mesh_collision(arm_root)
-        assert n_disabled == 2, (
-            f"{prefix}: expected to disable exactly 2 jaw mesh collision geoms "
-            f"(fixed + moving), found {n_disabled} -- JAW_COLLISION_MESHES may no "
-            f"longer match the upstream asset's mesh names"
+        n_disabled = disable_jaw_mesh_collision(arm_root, prefix)
+        assert n_disabled == 3, (
+            f"{prefix}: expected to disable exactly 3 jaw-body mesh collision geoms "
+            f"(fixed jaw's own follower mesh + the wrist_roll servo housing mesh "
+            f"colocated on the same fixed-jaw body + the moving jaw mesh), found "
+            f"{n_disabled} -- jaw body names or mesh structure may have changed "
+            f"upstream"
         )
         add_finger_pads(arm_root, prefix)
 

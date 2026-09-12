@@ -11,6 +11,166 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06a fixes: target-prop exemption, complete jaw collision disable, fork test
+
+**Recorded:** Sept 12, 2026 · **Follows:** ADR-027 (waypoint staging),
+ADR-028 (finger-pad primitives, "no `pick()` reaches GRIP under the
+current approach-collision check") · **Fixes:** the two gaps ADR-028's own
+"What it does not yet prove" section named · **Touches:**
+`scripts/gen_dual_scene.py`, `src/bimanual/control/skills_scripted.py`
+only (`scenes/so101/`, `ik.py`, `executor.py`'s interface, `command/`,
+`language/` all untouched)
+
+### Fix A -- completed the jaw mesh collision disable
+
+Independent measurement found `armA_gripper` (the fixed jaw body) still
+carried a SECOND collidable mesh geom alongside `armA_static_finger_pad`:
+`sts3215_03a_v1`, the wrist_roll servo's own housing mesh, rigidly mounted
+on that same body. `disable_jaw_mesh_collision`'s original filter matched
+by upstream `mesh` NAME (`JAW_COLLISION_MESHES`, shared with
+`apply_jaw_friction`) and only ever touched
+`wrist_roll_follower_so101_v1`/`moving_jaw_so101_v1` -- it never saw this
+second mesh. That same mesh name (`sts3215_03a_v1`) is reused at 4 OTHER
+joints per arm (shoulder, elbow, wrist_flex, wrist_roll), each needing its
+collision left alone, so the fix could not be "disable this mesh name
+everywhere" -- it had to be "disable every mesh-type collision geom that
+is a direct child of either jaw BODY" instead. `disable_jaw_mesh_collision`
+now takes `prefix` and matches by body name
+(`{prefix}gripper`, `{prefix}moving_jaw_so101_v1`), asserting exactly 3
+disabled geoms per arm (the fixed jaw's own follower mesh + the colocated
+servo housing mesh + the moving jaw mesh) instead of 2.
+
+Verified on bm-ptl: a one-off assertion script (not shipped) confirmed 12
+jaw-body mesh geoms total (both arms, visual + collision classes) all read
+`contype=0 conaffinity=0` in the compiled model -- PASS.
+`scripts/probe_pad_separation.py` re-run gives **bit-for-bit identical**
+numbers to ADR-028's own gate (fully closed 0.00600 m, midway 0.07621 m,
+fully open 0.13188 m, spread 0.12589 m) -- **GATE PASSED, unchanged**, as
+required (this fix touches a different geom than the pads it measures).
+
+### Fix B -- target-prop exemption in the arm-vs-prop check, corrected per instruction
+
+ADR-027 Step 5's arm-vs-prop check already had a PARTIAL target exemption
+(`_dwell`/`_run_dwell`/`_validate_against_baseline` all accepted
+`target_object` and fully excluded it from the violation dict), but two
+gaps made it useless for actually picking anything up: (1) it was a full,
+unconditional exemption with no depth limit at all -- a true crush would
+never be caught; (2) `_run_waypoint`/`_drive_to_target`, which drive
+APPROACH/DESCEND/RETREAT, never accepted `target_object` at all, so the
+exemption never applied to the phases where a `pick` actually closes in on
+its target -- exactly why `pick(A, plate)` (and, this task confirms,
+every other prop) was failing at **waypoint 1 (APPROACH)** against its own
+target, before ever reaching GRIP.
+
+Added module-level `CRUSH_THRESHOLD_M = -0.02` (target-prop contact deeper
+than this indicates crushing, not grasping; legitimate approach contacts
+were measured at -0.007..-0.009 m, so -0.02 m leaves clear margin).
+`_prop_collision_violations` now takes `target_body` and applies
+`CRUSH_THRESHOLD_M` to the named target prop and the tight, unconditional
+`PROP_COLLISION_DEPTH_TOL_M` (0.005 m) to every OTHER prop -- this single
+function is now the one place both the in-loop check
+(`_drive_to_target`/`_dwell`, checked every physics step) and the post-hoc
+check (`_validate_against_baseline`) call, so the two can never drift
+apart. `target_object` is threaded through `_run_waypoint` and every
+`_run_waypoint`/`_run_dwell` call site in `run_pick`, `run_place` and
+`run_handoff` (`run_open_drawer` untouched -- its target is the drawer,
+not a free-joint prop).
+
+**The brief's original instruction ("RETREAT: strict against ALL props")
+was corrected before implementation, per the task's own explicit
+correction, and independently confirmed necessary here**: a successful
+`pick`'s RETREAT is the arm LIFTING the object it just grasped --
+continuing arm-vs-target contact there is the proof of success, not a
+defect. Implemented as instructed: **the target-prop exemption (capped at
+`CRUSH_THRESHOLD_M`) applies at every waypoint, APPROACH through RETREAT**;
+every non-target prop keeps the tight, unconditional bar at every
+waypoint including RETREAT -- the bystander protection (the `spoon`
+knocking `fork`, and the bottle-on-floor bug) is unweakened, since it was
+never keyed to the target at all. The task also offered a "cleaner"
+alternative -- exempt the target only while the gripper is commanded
+closed, so `place` turns strict again after RELEASE -- and flagged it as
+slightly more precise; **not implemented here**, in the interest of the
+45-minute time box and because the simpler always-exempt-the-target rule
+is what the corrected instruction asked for and is sufficient to unblock
+GRIP. Left as a candidate follow-up, not a defect.
+
+No context-threading was needed at the executor boundary:
+`ScriptedSkillExecutor._dispatch` (`executor.py`) already passes
+`skill_call.target_object` straight into `run_pick`/`run_place`/
+`run_handoff`, which is exactly the `target_object` this fix threads
+further inward -- `executor.py` itself needed no edit.
+
+**Regression check, `pytest tests/test_skills.py`: 4 failed / 4 passed**
+(previously 5 failed / 3 passed under the ADR-028 baseline).
+`test_open_drawer_reaches_near_limit` (IK residual=0.3183 m, unrelated,
+same already-documented non-reachability from ADR-027) and
+`test_handoff_mug_ends_held_by_arm_b` (IK residual=0.0532 m, byte-for-byte
+identical to the baseline recorded above) are unaffected. **`test_pick_
+plate_waypoints_progress_without_collision`, previously failing and
+flagged as an open, undecided conflict with ADR-027's own regression-test
+requirement, now PASSES** -- Fix B is precisely why: plate's APPROACH no
+longer trips on touching its own target. `test_pick_plate_lifts_above_
+table` still fails, but for a DIFFERENT reason than before: previously it
+never got past waypoint 1 (collision, frames_used=296); now all 4
+waypoints run to completion (frames_used=1560) and it fails only the
+final lift-margin check (`final_z=0.3523`, delta=-0.0027, needed
++0.03) -- consistent with, not contradicting, the already-documented
+plate force-ceiling gap (5.89 N required vs 3.35 N actuator ceiling).
+`test_place_plate_returns_to_table_rest` still fails, cascading from the
+same nested-pick failure as before.
+
+### Fix C -- fork test first
+
+`pick(A, fork)`, fresh env, seed=0 (`GRASP_POINT_OFFSET_M["fork"]=(-0.015,
+0, 0)`, `GRIP_HOLD_FRAMES=60`, `CLEARANCE_HEIGHT_M=0.08`):
+
+| waypoint | ok | frames_used | ik_residual (m) |
+|---|---|---:|---:|
+| APPROACH | True | 500 | 0.0085 |
+| DESCEND | True | 500 | 0.0026 |
+| GRIP (dwell) | True | 60 (full budget, no early cutoff) | 0.0043 |
+| RETREAT | True | 500 | 0.0099 |
+
+Final `SkillResult`: `success=False`, `reason="did not lift fork:
+initial_z=0.3560 final_z=0.3538 margin_required=0.03"`, `frames_used=1560`.
+Fork z: initial 0.3560 -> final 0.3538, **delta -0.0022** (it did not rise
+at all; if anything it settled slightly lower). Success bar per this
+task (`z > 0.37`, table surface 0.35 + 0.02 m lift): **not met, by a wide
+margin** -- the fork was never off the table.
+
+**This is a genuinely new failure shape, not one of the three the task's
+own interpretation guide anticipated, and per this task's explicit stop
+rule it is reported here rather than chased further.** Every one of the
+four named waypoints reports `ok=True` -- no collision violation, IK
+residual under `ik.IK_POSITION_TOLERANCE_M` (0.01 m) at each -- which is
+exactly what Fix A/B were built to achieve, and for the first time in
+this module's whole retest history, they achieved it: nothing here is a
+named-waypoint collision or convergence failure. The failure is entirely
+in `run_pick`'s own post-RETREAT measurement -- the object was commanded
+gripped and lifted, but its measured height barely moved. Contact data at
+the GRIP waypoint (`ik_residual=0.0043 m`, dwell ran its full 60-frame
+budget with no violation reported by either the in-loop or post-hoc
+check) is consistent with the pads and fork being close enough to be in
+each other's vicinity, but does not by itself prove a sustained pinch
+formed -- and the outcome (no lift) says it did not. Candidate causes
+not investigated here (any change to them is explicitly out of this
+fix's scope -- grasp offsets, pad geometry and IK strategy are all named
+as untouchable in this task's own constraints): the fork's grasp offset,
+the 2.5 mm pad half-size relative to a thin utensil handle, or a
+friction/contact-settling issue specific to a light, small, freely-jointed
+body. **Per Fix C's own branching instruction ("If fork FAILS: STOP..."),
+the spoon/plate/mug/water_bottle sweep was NOT run** -- fork did not
+succeed, so there is nothing to build on top of yet.
+
+`git diff --stat -- scenes/so101/` confirmed empty before commit. Ledger
+per the ADR-028 convention: the generated arms (`src/bimanual/sim/assets/
+so101_dual_table.xml`) now carry Fix A's completed jaw-mesh collision
+disable (3 geoms/arm) on top of ADR-028's friction and finger pads;
+`scripts/gen_dual_scene.py` and `src/bimanual/control/skills_scripted.py`
+hold the corresponding generator/skill-logic changes.
+
+---
+
 ## ADR-028 — Finger-pad primitives (MuJoCo convex-hull fix), pads verified to move, but no `pick()` reaches GRIP under the current approach-collision check
 
 **Recorded:** Sept 12, 2026 · **Follows:** `docs/hardware/grasp-envelope.md`

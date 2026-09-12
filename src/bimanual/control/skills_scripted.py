@@ -458,11 +458,19 @@ def _drive_to_target(
     gripper_fraction: float,
     max_steps: int,
     pos_tol: float = POS_CONVERGENCE_TOL_M,
+    target_object: str | None = None,
 ) -> tuple[bool, int, dict]:
     """One closed-loop phase: repeatedly solve IK toward `target_pos` and
     step physics (holding the other arm still via `_hold_ctrl`) until the
     arm's gripperframe site is within `pos_tol` of the target, or
     `max_steps` `env.step()` calls have been spent.
+
+    `target_object` (M06a Fix B) names the skill's OWN current target so
+    that touching it during this phase -- APPROACH or DESCEND, the phases
+    this function drives -- is checked against the looser
+    `CRUSH_THRESHOLD_M` bar instead of `PROP_COLLISION_DEPTH_TOL_M`.
+    Picking something up requires the gripper to approach and touch it;
+    `None` (the default) applies the tight bar to every prop, as before.
 
     Returns (converged, steps_used, prop_violations). `converged=False` at
     `max_steps` is a normal outcome for a hard subgoal, not necessarily a bug
@@ -504,6 +512,7 @@ def _drive_to_target(
     target = np.asarray(target_pos, dtype=np.float64).reshape(3)
     site_id = _site_id(env.model, ik.gripperframe_site_name(arm))
     gripper_ctrl = _gripper_ctrl(env.model, arm, gripper_fraction)
+    target_body = OBJECT_BODY_NAME.get(target_object) if target_object is not None else None
 
     steps = 0
     consecutive: dict[str, int] = {}
@@ -514,7 +523,7 @@ def _drive_to_target(
         env.step(ctrl)
         steps += 1
 
-        prop_violations = _prop_collision_violations(env)
+        prop_violations = _prop_collision_violations(env, target_body=target_body)
         confirmed = _debounce_prop_violations(consecutive, prop_violations)
         if confirmed:
             return False, steps, confirmed
@@ -543,12 +552,16 @@ def _dwell(
 
     `target_object` names the skill's OWN current target (e.g. `"plate"`
     during `pick`'s GRIP dwell) so that dwell's deliberate, expected contact
-    with it is not itself reported as a violation -- a GRIP/RELEASE dwell
-    exists specifically to make that contact. `None` (the default, used by
-    `open_drawer`, whose target is not a free-joint prop) exempts nothing.
+    with it is checked against the looser `CRUSH_THRESHOLD_M` bar (M06a Fix
+    B) instead of the tight `PROP_COLLISION_DEPTH_TOL_M` one -- a GRIP/
+    RELEASE dwell exists specifically to make that contact, but a contact
+    deep enough to indicate crushing rather than grasping is still a
+    failure. `None` (the default, used by `open_drawer`, whose target is
+    not a free-joint prop) applies the tight bar to every prop.
     """
     gripper_ctrl = _gripper_ctrl(env.model, arm, gripper_fraction)
     target = np.asarray(hold_pos, dtype=np.float64).reshape(3)
+    target_body = OBJECT_BODY_NAME.get(target_object) if target_object is not None else None
     consecutive: dict[str, int] = {}
     for i in range(n_steps):
         solution = ik.solve_position_ik(env.model, env.data, arm, target)
@@ -556,19 +569,16 @@ def _dwell(
         _write_arm_ctrl(ctrl, env.model, arm, solution.joint_angles, gripper_ctrl)
         env.step(ctrl)
 
-        # ADR-027 Step 5: a GRIP/RELEASE dwell is EXPECTED to contact the
-        # skill's own current target object (that is the whole point of a
-        # dwell) -- so a violation is only reported here for a prop OTHER
-        # than the one this dwell is deliberately closing/opening on. A
-        # violent, unintended knock against a THIRD prop (or the target
-        # itself well past a controlled pinch depth, if `target_object` is
-        # not supplied) is still caught; the intended pinch itself is not
-        # penalised for the same contact it exists to make. Also debounced
-        # (see `PROP_COLLISION_DEBOUNCE_STEPS`), same rationale as
+        # ADR-027 Step 5 / M06a Fix B: a GRIP/RELEASE dwell is EXPECTED to
+        # contact the skill's own current target object (that is the whole
+        # point of a dwell) -- so this dwell's own target gets the looser
+        # `CRUSH_THRESHOLD_M` bar, not a full exemption; a violent,
+        # unintended knock against a THIRD prop (tight bar, unconditional)
+        # or an actual crush of the target itself (past CRUSH_THRESHOLD_M)
+        # is still caught. Also debounced (see
+        # `PROP_COLLISION_DEBOUNCE_STEPS`), same rationale as
         # `_drive_to_target`.
-        violations = _prop_collision_violations(env)
-        if target_object is not None:
-            violations = {k: v for k, v in violations.items() if k != OBJECT_BODY_NAME.get(target_object)}
+        violations = _prop_collision_violations(env, target_body=target_body)
         confirmed = _debounce_prop_violations(consecutive, violations)
         if confirmed:
             return i + 1, confirmed
@@ -648,6 +658,28 @@ def _contact_counts(env) -> dict[str, int]:
 #: to catch a violent, uncontrolled impact before it flings an object away.
 PROP_COLLISION_DEPTH_TOL_M = 0.005
 
+#: M06a Fix B (target-prop exemption, Sept 12 2026). `PROP_COLLISION_DEPTH_TOL_M`
+#: is deliberately tight (0.005 m) because it exists to catch a BYSTANDER
+#: prop being grazed or knocked -- e.g. `pick(A, spoon)` clipping the
+#: nearby `fork`, or the arm brushing a prop it has no business touching.
+#: But that same tight bar, applied to the skill's OWN TARGET prop, makes
+#: every `pick`/`place`/`handoff` unrunnable: picking something up
+#: requires the gripper to touch it, and legitimate approach/grip contact
+#: measured -0.007 to -0.009 m deep (DECISIONS.md's ADR-028 entry), already
+#: past -0.005 m. `CRUSH_THRESHOLD_M` is the separate, looser bar that
+#: applies ONLY to the executing arm's own current target: contact with it
+#: is expected and allowed at every waypoint (APPROACH/DESCEND/GRIP/RETREAT
+#: alike -- see `_prop_collision_violations`'s docstring for why RETREAT is
+#: included), and is only a failure once it goes deep enough to indicate
+#: crushing rather than grasping. -0.02 m leaves clear margin above the
+#: -0.007..-0.009 m band those legitimate contacts were measured at, while
+#: still catching a genuinely pathological, ever-deepening penetration.
+#: Non-target props are NEVER exempted at any waypoint and keep the
+#: tighter `PROP_COLLISION_DEPTH_TOL_M` bar always -- that is the
+#: bystander protection this whole check exists for, and it must not be
+#: weakened.
+CRUSH_THRESHOLD_M = -0.02  # target-prop contact deeper than this indicates crushing, not grasping
+
 #: Canonical prop body names this check watches: every FREE-JOINT prop in
 #: the scene (`OBJECT_BODY_NAME`'s values, excluding `"drawer"`, which has a
 #: slide joint, not a free joint, and is the one body `open_drawer` is
@@ -671,10 +703,23 @@ def _prop_geom_ids(model) -> dict[str, set[int]]:
     return out
 
 
-def _prop_collision_violations(env) -> dict[str, float]:
+def _prop_collision_violations(env, target_body: str | None = None) -> dict[str, float]:
     """Return `{prop_body_name: deepest_penetration_m}` for every free-joint
-    prop currently in contact with EITHER arm at a depth deeper than
-    `-PROP_COLLISION_DEPTH_TOL_M` (ADR-027 Step 5). Empty dict if none.
+    prop currently in contact with EITHER arm deeper than its applicable
+    bar (ADR-027 Step 5, M06a Fix B). Empty dict if none.
+
+    `target_body` (a prop BODY NAME, already resolved via `OBJECT_BODY_NAME`
+    by the caller -- e.g. `_run_waypoint`/`_dwell`) is the skill's own
+    current target. Its bar is the looser `CRUSH_THRESHOLD_M`; every OTHER
+    free-joint prop's bar stays the tight `PROP_COLLISION_DEPTH_TOL_M`,
+    unconditionally, at every waypoint -- APPROACH, DESCEND, GRIP AND
+    RETREAT alike. This is deliberate, not an oversight: the exemption is
+    named per-CONTACT (which prop is touched), not per-PHASE (which
+    waypoint is running) or per-gripper-state (open vs closed), because a
+    successful `pick`'s RETREAT is the arm LIFTING the target while
+    holding it -- arm-vs-target contact there is the proof of success, not
+    a defect, and a phase-based rule that turned strict at RETREAT would
+    report every successful grasp as a failure.
 
     Deliberately NOT baseline-relative (unlike `_contact_counts`'s
     table/cross-arm counts): a prop resting quietly against another prop or
@@ -690,16 +735,18 @@ def _prop_collision_violations(env) -> dict[str, float]:
     for i in range(data.ncon):
         c = data.contact[i]
         dist = float(c.dist)
-        if dist >= -PROP_COLLISION_DEPTH_TOL_M:
-            continue
         g1, g2 = int(c.geom1), int(c.geom2)
         for prop_name, geoms in prop_geoms.items():
-            if (g1 in arm_geoms and g2 in geoms) or (g2 in arm_geoms and g1 in geoms):
-                # Track the DEEPEST violation per prop, not merely the first
-                # contact found (a prop can have more than one geom, e.g.
-                # the reshaped plate's foot+dish).
-                if prop_name not in violations or dist < violations[prop_name]:
-                    violations[prop_name] = dist
+            if not ((g1 in arm_geoms and g2 in geoms) or (g2 in arm_geoms and g1 in geoms)):
+                continue
+            bar = CRUSH_THRESHOLD_M if prop_name == target_body else -PROP_COLLISION_DEPTH_TOL_M
+            if dist >= bar:
+                continue
+            # Track the DEEPEST violation per prop, not merely the first
+            # contact found (a prop can have more than one geom, e.g. the
+            # reshaped plate's foot+dish).
+            if prop_name not in violations or dist < violations[prop_name]:
+                violations[prop_name] = dist
     return violations
 
 
@@ -712,10 +759,11 @@ def _validate_against_baseline(
     arm-vs-table_top contact versus `baseline`, a snapshot taken once at
     this skill call's start, plus the ADR-027 Step 5 arm-vs-prop check).
 
-    `target_object` (same meaning as `_dwell`'s parameter) exempts a skill's
-    own deliberate current target from the arm-vs-prop check's POST-hoc
-    sample, consistent with the in-loop exemption `_dwell` already applies
-    -- a GRIP/RELEASE dwell's whole purpose is to contact that object.
+    `target_object` (same meaning as `_dwell`'s parameter, M06a Fix B) gives
+    a skill's own deliberate current target the looser `CRUSH_THRESHOLD_M`
+    bar in the arm-vs-prop check's POST-hoc sample, instead of the tight
+    `PROP_COLLISION_DEPTH_TOL_M` one every other prop keeps -- consistent
+    with the in-loop check `_drive_to_target`/`_dwell` already apply.
 
     Returns (ok, reason, ik_residual_m). `reason` is None when `ok`.
     """
@@ -739,15 +787,17 @@ def _validate_against_baseline(
             solution.position_error_m,
         )
 
-    # ADR-027 Step 5: arm-vs-PROP collision, the gap `pick(A, bottle)`'s
-    # diagnostic exposed (every waypoint validated clean while the arm
-    # knocked the bottle onto the floor). Named explicitly per the task
-    # instruction: any free-joint prop deeper than PROP_COLLISION_DEPTH_TOL_M
-    # in contact with an arm geom is a validation failure naming the prop.
-    prop_violations = _prop_collision_violations(env)
-    if target_object is not None:
-        exempt_body = OBJECT_BODY_NAME.get(target_object)
-        prop_violations = {k: v for k, v in prop_violations.items() if k != exempt_body}
+    # ADR-027 Step 5 / M06a Fix B: arm-vs-PROP collision, the gap
+    # `pick(A, bottle)`'s diagnostic exposed (every waypoint validated clean
+    # while the arm knocked the bottle onto the floor). Any free-joint prop
+    # deeper than its applicable bar in contact with an arm geom is a
+    # validation failure naming the prop -- the tight
+    # `PROP_COLLISION_DEPTH_TOL_M` bar for every prop except this skill's
+    # own `target_object`, which gets the looser `CRUSH_THRESHOLD_M` bar
+    # instead (see `_prop_collision_violations`'s docstring for why this
+    # applies at every waypoint, RETREAT included).
+    target_body = OBJECT_BODY_NAME.get(target_object) if target_object is not None else None
+    prop_violations = _prop_collision_violations(env, target_body=target_body)
     if prop_violations:
         named = ", ".join(
             f"{name} (dist={depth:.4f} m)" for name, depth in sorted(prop_violations.items())
@@ -768,6 +818,7 @@ def _run_waypoint(
     max_steps: int,
     baseline: dict,
     pos_tol: float = POS_CONVERGENCE_TOL_M,
+    target_object: str | None = None,
 ) -> tuple[bool, int, str | None]:
     """Drive `arm` to `target_pos` (one APPROACH/DESCEND/RETREAT/PULL
     waypoint of a staged skill, ADR-027) and validate it against
@@ -782,13 +833,23 @@ def _run_waypoint(
     prop violation (a transient knock mid-loop), that is reported
     IMMEDIATELY -- the drive already stopped early, and the post-hoc
     `_validate_against_baseline` check would no longer see it once the
-    knocked prop has separated and flown off. No `target_object` exemption
-    here: `_run_waypoint` drives APPROACH/DESCEND/RETREAT/PULL, none of
-    which are supposed to be in deliberate contact with anything yet (that
-    is `_run_dwell`'s GRIP/RELEASE job).
+    knocked prop has separated and flown off.
+
+    `target_object` (M06a Fix B) is threaded to BOTH the in-loop check
+    (`_drive_to_target`) and the post-hoc one (`_validate_against_baseline`)
+    so the skill's own target gets the looser `CRUSH_THRESHOLD_M` bar at
+    EVERY waypoint this function drives -- APPROACH, DESCEND and RETREAT
+    alike, not merely `_run_dwell`'s GRIP/RELEASE. This is required, not
+    optional: `pick`'s APPROACH/DESCEND must be able to close in on and
+    touch its own target (that is the whole point of picking it up), and
+    `pick`'s RETREAT is the arm LIFTING the object it just grasped --
+    continuing arm-vs-target contact there is the proof the grasp is
+    holding, not a defect. Every OTHER prop keeps the tight bar
+    unconditionally, including at RETREAT -- that bystander protection is
+    never weakened by this parameter.
     """
     _, steps, in_loop_violations = _drive_to_target(
-        env, arm, target_pos, gripper_fraction, max_steps, pos_tol=pos_tol
+        env, arm, target_pos, gripper_fraction, max_steps, pos_tol=pos_tol, target_object=target_object
     )
     if in_loop_violations:
         named = ", ".join(
@@ -801,7 +862,7 @@ def _run_waypoint(
         )
         return False, steps, reason
 
-    ok, reason, residual = _validate_against_baseline(env, arm, target_pos, baseline)
+    ok, reason, residual = _validate_against_baseline(env, arm, target_pos, baseline, target_object=target_object)
     logger.info(
         "waypoint arm=%s target=%s frames_used=%d ik_residual=%.4f ok=%s%s",
         arm, np.round(np.asarray(target_pos, dtype=np.float64), 4).tolist(), steps, residual, ok,
@@ -882,14 +943,18 @@ def run_pick(env, arm: str, target_object: str, step_budget: int = ik.DEFAULT_ST
 
     # Waypoint 1: APPROACH -- hover at clearance height above the grasp point.
     hover = grasp_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
-    ok, used, reason = _run_waypoint(env, arm, hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, arm, hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object
+    )
     frames += used
     remaining -= used
     if not ok:
         return SkillResult(False, f"waypoint 1 (approach) failed [{reason}]", frames)
 
     # Waypoint 2: DESCEND -- onto the grasp point itself, gripper still open.
-    ok, used, reason = _run_waypoint(env, arm, grasp_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, arm, grasp_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object
+    )
     frames += used
     remaining -= used
     if not ok:
@@ -907,7 +972,13 @@ def run_pick(env, arm: str, target_object: str, step_budget: int = ik.DEFAULT_ST
 
     # Waypoint 4: RETREAT -- back to clearance height, gripper held closed.
     # This also doubles as the physical lift the success check below reads.
-    ok, used, reason = _run_waypoint(env, arm, hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    # target_object=target_object (M06a Fix B): the arm is LIFTING the
+    # object it just grasped here -- continuing contact with it is the
+    # proof of a successful grasp, not a defect, so it stays exempt (up to
+    # CRUSH_THRESHOLD_M) through RETREAT too.
+    ok, used, reason = _run_waypoint(
+        env, arm, hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object
+    )
     frames += used
     remaining -= used
 
@@ -981,7 +1052,10 @@ def run_place(
     # Waypoint 1: APPROACH -- above the destination at clearance height,
     # still holding the object (gripper closed).
     approach_above_dest = np.array([dest_xy[0], dest_xy[1], TABLE_SURFACE_Z + CLEARANCE_HEIGHT_M])
-    ok, used, reason = _run_waypoint(env, arm, approach_above_dest, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, arm, approach_above_dest, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok:
@@ -990,7 +1064,10 @@ def run_place(
     # Waypoint 2: DESCEND -- to the destination plus a small vertical offset
     # for a gentle release (PLACE_RELEASE_CLEARANCE_M), gripper still closed.
     lower_target = np.array([dest_xy[0], dest_xy[1], TABLE_SURFACE_Z + PLACE_RELEASE_CLEARANCE_M]) + offset
-    ok, used, reason = _run_waypoint(env, arm, lower_target, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, arm, lower_target, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok:
@@ -1008,7 +1085,10 @@ def run_place(
     # Waypoint 4: RETREAT -- back up to clearance height so the arm does not
     # drag the object off the table as it withdraws.
     retreat_target = lower_target + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
-    ok, used, reason = _run_waypoint(env, arm, retreat_target, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, arm, retreat_target, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
 
@@ -1086,14 +1166,20 @@ def run_handoff(
     # Waypoint 1: from_arm APPROACH -- above the transfer point at clearance
     # height, still holding the object.
     from_hover = transfer_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
-    ok, used, reason = _run_waypoint(env, from_arm, from_hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, from_arm, from_hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok:
         return SkillResult(False, f"waypoint 1 (from_arm approach) failed [{reason}]", frames)
 
     # Waypoint 2: from_arm DESCEND -- to the transfer point exactly.
-    ok, used, reason = _run_waypoint(env, from_arm, transfer_point, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, from_arm, transfer_point, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok:
@@ -1102,14 +1188,20 @@ def run_handoff(
     # Waypoint 3: to_arm APPROACH -- above the transfer point, offset to its
     # own side, gripper open.
     to_hover = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
-    ok, used, reason = _run_waypoint(env, to_arm, to_hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, to_arm, to_hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok:
         return SkillResult(False, f"waypoint 3 (to_arm approach) failed [{reason}]", frames)
 
     # Waypoint 4: to_arm DESCEND -- to the receiving point.
-    ok, used, reason = _run_waypoint(env, to_arm, receiving_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok, used, reason = _run_waypoint(
+        env, to_arm, receiving_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok:
@@ -1138,7 +1230,10 @@ def run_handoff(
     # Waypoint 7: from_arm RETREAT -- goes FIRST (staggered), back to
     # clearance height above the transfer point.
     from_retreat = from_hover
-    ok7, used, reason7 = _run_waypoint(env, from_arm, from_retreat, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    ok7, used, reason7 = _run_waypoint(
+        env, from_arm, from_retreat, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
     if not ok7:
@@ -1147,7 +1242,12 @@ def run_handoff(
     # Waypoint 8: to_arm RETREAT -- goes SECOND (staggered), lifting the
     # object away from the transfer point.
     to_lift = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
-    ok8, used, reason8 = _run_waypoint(env, to_arm, to_lift, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    # target_object=target_object (M06a Fix B): to_arm is now LIFTING the
+    # object it just gripped -- same rationale as pick's RETREAT above.
+    ok8, used, reason8 = _run_waypoint(
+        env, to_arm, to_lift, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+        target_object=target_object,
+    )
     frames += used
     remaining -= used
 
