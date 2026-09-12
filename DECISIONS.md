@@ -11,6 +11,92 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-025 — Drawer housing repositioning and IK pinch-point retargeting
+
+**Recorded:** Sept 12, 2026 · **Follows:** M06a's failure diagnosis (ADR-024) ·
+**Closes:** the two M06a root causes · **Supplements:** M02's done-when list
+retroactively
+
+M06a's four skills all failed. Two root causes, verified empirically, not
+assumed: (1) the drawer housing (`y=-0.05`) sat fully enclosed beneath the
+solid `table_top` slab, with no approach path — confirmed by MuJoCo's own
+contact list; (2) `ik.py`'s IK target, the upstream `armX_gripperframe` site,
+is ~8 cm from the jaws' actual pinch point (measured at rest, arm A).
+
+**Decision:** (a) move the drawer housing 12 cm outward, `y=-0.05` ->
+`y=-0.17`, via a generator edit in `scripts/gen_dual_scene.py`'s
+hand-authored table/drawer/props/cameras template only — the
+upstream-derived arm/mesh/material substitution was untouched
+(`git diff --stat -- scenes/so101/` stayed empty, ADR-016/ADR-021 preserved).
+The closed drawer face now sits flush with the table edge (`y=-0.25`); the
+housing overhangs the edge by 2 cm (accepted) and its z-span still clears the
+tabletop underside, so arm bases mounted on top do not collide with it.
+(b) retarget `ik.solve_position_ik` to the computed midpoint between the
+fixed jaw body (`armX_gripper`) and the moving jaw body
+(`armX_moving_jaw_so101_v1`), recomputed every solve from the current qpos
+via `mujoco.mj_jacBody` on both bodies (averaged), so the target tracks jaw
+motion. `armX_gripperframe` is left in the XML/`ik.py`, unused, for reference;
+a new `PINCH_POINT_OFFSET_M` constant documents the measured offset.
+
+**Verification, run on bm-ptl in this order:**
+1. Regenerated `src/bimanual/sim/assets/so101_dual_table.xml`; diff differs
+   from the previous version only in the drawer housing position, the
+   drawer_view camera's `xyaxes` (which follows `DRAWER_CAM_TARGET`, itself
+   derived from the same housing move), and comments.
+2. `scripts/probe_physics_stability.py` re-run: still **PASS**, unchanged
+   numbers (`docs/hardware/m02-physics-stability.md`).
+3. Re-rendered `docs/images/m02-scene.png`, `m02-drawer-view-closed.png`
+   (drawer_slide forced to 0.0), `m02-drawer-view-open.png` (forced to 0.15),
+   all at 1280x720.
+4. **New: `scripts/probe_reachability.py`, run BEFORE any skill**, per
+   instruction, because the risk that the drawer face might sit inside arm
+   A's own minimum-reach dead zone was explicitly flagged as something to
+   *test*, not assume. Result, recorded in full in
+   `docs/hardware/m06-reachability-probe.md`:
+   - **closed_drawer_face: FAIL for both arms** (residual 0.0226 m for arm A,
+     0.2135 m for arm B; tolerance 0.01 m). The predicted dead-zone risk was
+     real — the drawer move alone did not make the face reachable.
+   - **plate/mug/bottle at rest: PASS for both arms** (residuals
+     0.004–0.008 m, no new collision beyond a separately measured, pre-existing
+     baseline — see below).
+   - Per the task's explicit stop rule ("if the probe shows the drawer face
+     is still unreachable after the move, STOP — do not guess at a second
+     scene change"), a THIRD scene edit was **not** attempted. Instead, each
+     arm's actual reachable envelope was measured by a coarse grid sweep
+     (x in [-0.3,0.3], y in [-0.35,0.1], z in [0.2,0.5]): **95 reachable
+     points for arm A**, roughly x in [-0.30,0.30], y in [-0.28,0.10],
+     z in [0.30,0.50]; **57 for arm B**, roughly x in [-0.30,0.30],
+     y in [-0.12,0.10], z in [0.30,0.50] — full point lists in the report.
+     A future drawer position should be chosen from this measured envelope,
+     not guessed a third time.
+5. **Per the task's explicit reporting rule, the four skills
+   (`open_drawer`/`pick`/`place`/`handoff`) were NOT re-run this pass**,
+   since the probe did not fully pass: "if the probe fails, report the reach
+   envelope instead and stop."
+
+**A separate, unrelated finding, flagged not fixed:** building the
+reachability probe's collision check required measuring a baseline, and that
+measurement revealed arm A and arm B's DEFAULT REST poses already
+interpenetrate by up to ~6 cm (`armA_lower_arm` vs. `armB_wrist`),
+independent of any target and independent of both fixes above. This is an
+ADR-021 arm-placement question (the ~0.30 m reach / 0.50 m base-gap
+assumption was never checked against the compiled model's actual rest
+configuration), out of this module's scope to fix.
+
+**M02's own done-when list is retroactively incomplete.** M02 verified the
+scene compiles, renders and is physically stable — it never verified the
+scene is *reachable*. `scripts/probe_reachability.py` is the check that
+should have existed from M02 onward; it is added now as a documented
+supplement, against the evidence that surfaced this gap, not as a rewrite of
+what M02 originally claimed.
+
+Housekeeping: `pytest==9.1.1` added to `scripts/requirements-bmptl.txt`
+(matching `scripts/requirements-dev.txt`) and installed into `ov_env` on
+bm-ptl, so `tests/test_skills.py` can run through pytest where the simulation
+actually lives (ADR-020), rather than via direct function calls.
+
+---
+
 ## M06a — Scripted IK skills: ik.py, skills_scripted.py, executor.py, run_skill.py
 
 **Recorded:** Sept 12, 2026 · **Follows:** ADR-024 (IK strategy), ADR-010 (bimanual

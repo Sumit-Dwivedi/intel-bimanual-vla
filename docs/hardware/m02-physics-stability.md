@@ -31,3 +31,8 @@ check (a large separation impulse launches a prop, which then falls and trips
 verifying this static scene, to be revisited if M06's controller tests reveal
 contact anomalies that an indirect check would miss.
 
+**Re-run 2026-09-12 (ADR-025, drawer housing moved from y=-0.05 to y=-0.17):**
+re-ran unchanged after the drawer reposition; verdict is still **PASS** with
+the same numbers above. Kept here rather than re-appending, since nothing
+about this probe's own findings changed -- only the scene's drawer geometry
+did, and this probe does not touch the drawer.

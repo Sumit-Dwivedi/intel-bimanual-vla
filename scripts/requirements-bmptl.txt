@@ -2,3 +2,9 @@ numpy==2.4.6
 openvino==2026.3.1
 openvino-telemetry==2025.2
 mujoco==3.2.7
+
+# Test runner (ADR-025 housekeeping pin). Matches scripts/requirements-dev.txt
+# so tests/test_skills.py can run through pytest on bm-ptl (ov_env), where the
+# simulation actually lives (ADR-020) -- Tester had previously been reduced to
+# direct function calls here because pytest was unavailable in this venv.
+pytest==9.1.1

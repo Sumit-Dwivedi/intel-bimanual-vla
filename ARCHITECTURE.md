@@ -1157,6 +1157,117 @@ this ADR's Decision implies, rather than left as an unexplained gap.
 
 ---
 
+### ADR-025 — Drawer housing repositioning and IK pinch-point retargeting
+
+**Context.** M06a's four skills (`open_drawer`, `pick`, `place`, `handoff`) all
+failed (DECISIONS.md's M06a entry). Two root causes were verified empirically,
+not assumed: (1) `open_drawer` was blocked by scene geometry — MuJoCo's own
+contact list showed the drawer housing (at `y=-0.05`) fully enclosed beneath
+the solid `table_top` slab, with no top-down or side approach path; (2)
+`pick`/`place`/`handoff` did not reliably grasp because `ik.py`'s IK target,
+the upstream `armX_gripperframe` site, is measurably ~8 cm from the point
+where the jaws actually pinch (measured at rest on arm A: the site at
+(y=0.1414, z=0.5765) vs. the fixed jaw body `armA_gripper` at (y=0.0432,
+z=0.5844) and the moving jaw body `armA_moving_jaw_so101_v1` at (y=0.0666,
+z=0.6055)).
+
+**Options.**
+- (a) Leave the drawer position unchanged and try to fix grasping only. Does
+  not address `open_drawer` at all — the contact evidence shows the housing
+  has no reachable face regardless of grasp accuracy.
+- (b) Move the drawer housing outward (toward the table edge) so its closed
+  face is no longer entombed under the tabletop slab, and separately retarget
+  IK from `armX_gripperframe` to the actual pinch point, computed from live
+  body positions rather than a static site. **Considered and rejected within
+  this option:** correcting the old site target by a fixed offset vector
+  instead of recomputing a live pinch point — rejected because the site-to-
+  pinch offset is a LOCAL-frame vector that rotates with whatever orientation
+  the redundant 5-joint solve falls into (ADR-024), so its world-frame
+  direction is not constant across targets even though its magnitude is; a
+  fixed correction would be wrong everywhere except the one configuration it
+  was measured at.
+- (c) Redesign the gripper kinematics or add orientation control to guarantee
+  a consistent approach angle. Out of scope: touches `src/bimanual/sim/`
+  kinematics (ADR-016 forbids editing the adopted asset) and reopens ADR-024's
+  Decision, which this module's task scope explicitly did not authorize
+  revisiting.
+- (d) Assume the drawer reposition alone fixes reachability without measuring
+  it. Rejected on the grounds that M02 never checked reachability in the
+  first place (see Consequences) — repeating that mistake here would be the
+  same error twice.
+
+**Decision.** (b), plus a mandatory measurement step before trusting it:
+1. **Drawer housing moved 12 cm outward**, `y=-0.05` -> `y=-0.17`, via a
+   generator edit in `scripts/gen_dual_scene.py`'s hand-authored
+   table/drawer/props/cameras template (ADR-016/ADR-021 preserved — the
+   upstream-derived arm/mesh/material substitution was not touched, and
+   `git diff --stat -- scenes/so101/` remained empty). The closed drawer
+   face now sits flush with the table edge (`y=-0.25`) instead of 12 cm
+   inboard of it; the housing overhangs the table edge by 2 cm (accepted —
+   real drawer fronts commonly overhang) and its z-span still stops at the
+   tabletop underside, so arm bases mounted on top at `z=0.35` do not
+   collide with it.
+2. **IK retargeted to the computed pinch point.** `ik.solve_position_ik`
+   (`src/bimanual/control/ik.py`) now targets the midpoint between the fixed
+   jaw body (`armX_gripper`) and the moving jaw body
+   (`armX_moving_jaw_so101_v1`), recomputed every solve from the scratch
+   `MjData`'s current qpos (via `mujoco.mj_jacBody` on both bodies, averaged),
+   so the target tracks the jaw as it opens and closes. `armX_gripperframe`
+   is left in the XML and in `ik.gripperframe_site_name()`, unused by the
+   solver, for reference. A new `PINCH_POINT_OFFSET_M` constant documents the
+   measured ~8 cm offset that motivated the change.
+3. **A reachability probe (`scripts/probe_reachability.py`) was run BEFORE
+   any skill**, exactly because the risk above was explicitly flagged as
+   something to test, not assume: with the closed drawer face at `y=-0.25`,
+   it sits close to arm A's own base at `(0, -0.25, 0.35)`, plausibly inside
+   a 5-DoF arm's minimum-reach dead zone (an arm generally cannot fold back
+   onto its own mounting point). The probe measured this directly rather
+   than guessing.
+
+**Consequences.** M02's rendered PNGs regenerate (`docs/images/m02-scene.png`,
+`m02-drawer-view-closed.png`, `m02-drawer-view-open.png`, all re-rendered at
+1280x720; the physics-stability probe was re-run and still PASSes with
+unchanged numbers). The demo command's grammar and skill vocabulary remain
+valid — nothing in M04/M05 changed.
+
+**The reachability probe's own result must be reported plainly, not
+softened:** the drawer-face target still FAILED for both arms (residual
+0.0226 m for arm A, 0.2135 m for arm B, tolerance 0.01 m; see
+`docs/hardware/m06-reachability-probe.md`) — the predicted dead-zone risk was
+real. Per this module's own stop rule, this triggered a STOP rather than a
+third scene guess: the arm's actual reachable envelope was measured instead
+(a coarse grid sweep, ~95 reachable points for arm A and ~57 for arm B,
+reported in full in the probe's report) so a future drawer position can be
+chosen from measured data. `pick`/`place`/`handoff`'s three non-drawer targets
+(plate/mug/bottle at rest) all PASSED the same probe for both arms (residuals
+0.004–0.008 m, no new collision) — the pinch-point retarget did not break
+basic kinematic reachability for the objects those three skills actually use.
+Per the task's explicit reporting rule ("if the probe fails, report the reach
+envelope instead and stop"), the four skills were **not** re-run this pass;
+re-running them is deferred until a reachable drawer position is chosen from
+the envelope data.
+
+**A genuine, separate finding surfaced by building this probe, flagged but
+not fixed here:** at the default rest pose (`reset(seed=0)`, before any IK
+solve), arm A and arm B already interpenetrate substantially — up to ~6 cm
+penetration between `armA_lower_arm` and `armB_wrist`, independent of any
+target. This is an ADR-021 arm-placement/rest-pose question (the ~0.30 m
+reach / 0.50 m base-gap assumption was never checked against the compiled
+model's actual rest configuration), not a consequence of either fix in this
+ADR, and fixing it is out of this module's scope.
+
+**M02's own done-when list is retroactively incomplete, and this is the
+supplement, not a rewrite of history.** M02 verified the scene *compiles*,
+*renders*, and is *physically stable* (no NaN, no tunneling) — it never
+verified the scene is *reachable*. That gap is exactly why the drawer
+geometry defect surfaced only now, at M06, rather than at M02 when the scene
+was authored. `scripts/probe_reachability.py` is the check M02's done-when
+list should have included from the start; it is added now, against M06's
+findings, as a documented retroactive supplement to M02 rather than a claim
+that M02's original done-when criteria were met with reachability included.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

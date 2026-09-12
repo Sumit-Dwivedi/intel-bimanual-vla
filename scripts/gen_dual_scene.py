@@ -72,11 +72,17 @@ FRONT_CAM_FOVY = 55
 # top surface z=0.35), which occludes the drawer (housed at z=0.28,
 # entirely below the tabletop) from directly above. `front` looks along
 # -x, roughly parallel to the drawer's slide axis (0,-1,0) rather than
-# across it, so the 3 cm the open drawer protrudes past the table's
-# y=-0.25 edge (drawer body world y goes from -0.05 at slide=0 to -0.20 at
+# across it, so the amount the open drawer protrudes past the table's
+# y=-0.25 edge (drawer body world y goes from -0.17 at slide=0 to -0.32 at
 # slide=0.15=range max; its front face -- box half-extent 0.08 in y --
-# reaches y=-0.20-0.08=-0.28, i.e. 3 cm past the table edge) is not legible
-# from that angle either.
+# reaches y=-0.32-0.08=-0.40, i.e. 15 cm past the table edge) is not
+# legible from that angle either.
+#
+# M06a reachability fix (ADR-025): drawer_housing moved from y=-0.05 to
+# y=-0.17 so the CLOSED drawer face sits flush with the table edge
+# (y=-0.25) instead of tucked 20 cm inboard of it, underneath the solid
+# table_top slab with no approach path. See DRAWER_CAM_TARGET below, which
+# tracks this same move.
 #
 # Fix: a camera BELOW tabletop height (table surface z=0.35), on the -y
 # side past where the open drawer protrudes, angled UP and toward +y so it
@@ -107,11 +113,12 @@ FRONT_CAM_FOVY = 55
 DRAWER_CAM_POS = (0.0, -0.55, 0.15)
 # Drawer body world position at drawer_slide=0 (closed): the `drawer`
 # body sits at local pos (0,0,0) inside `drawer_housing`, which is placed
-# at world (0,-0.05,0.28) -- see the template's <body name="drawer_housing">
-# below. Aiming here (rather than at the housing's own origin, which is
-# the same point) is what keeps the background fixed while the drawer
-# slides toward -y and toward the camera as it opens.
-DRAWER_CAM_TARGET = (0.0, -0.05, 0.28)
+# at world (0,-0.17,0.28) -- see the template's <body name="drawer_housing">
+# below (ADR-025: moved from -0.05 to -0.17). Aiming here (rather than at
+# the housing's own origin, which is the same point) is what keeps the
+# background fixed while the drawer slides toward -y and toward the
+# camera as it opens.
+DRAWER_CAM_TARGET = (0.0, -0.17, 0.28)
 DRAWER_CAM_FOVY = 50
 
 
@@ -404,8 +411,27 @@ TEMPLATE = """<?xml version="1.0"?>
     <!-- Drawer (prismatic joint). A small cabinet tucked under the tabletop
          near arm A's edge (y=-0.25). The drawer body slides out along -y
          (towards arm A) on a slide joint; housing walls are static geoms
-         with no joint. -->
-    <body name="drawer_housing" pos="0 -0.05 0.28">
+         with no joint.
+
+         ADR-025 (M06a reachability fix): housing moved from y=-0.05 to
+         y=-0.17 (12 cm outward). At y=-0.05 the CLOSED drawer face sat at
+         y=-0.13 -- 12 cm inboard of the table edge (y=-0.25), entirely
+         enclosed under the solid table_top slab with no approach path
+         from outside, which is why open_drawer failed in M06a (verified
+         by contact inspection, DECISIONS.md M06a entry). At y=-0.17, the
+         closed face is at y=-0.17-0.08=-0.25, flush with the table edge.
+         Housing half-depth in y is 0.10, so the housing itself spans
+         y=-0.27..-0.07 -- it overhangs the table edge (y=-0.25) by 2 cm.
+         Accepted: real drawer fronts commonly overhang their cabinet's
+         edge by a similar margin, and it does not intersect any other
+         geometry (housing z spans ~0.23..0.33, stopping at the tabletop
+         underside 0.33..0.35; arm bases mount ON TOP at z=0.35). Fully
+         open (drawer_slide=0.15), the drawer body centre reaches y=-0.32
+         and its face y=-0.40, protruding 15 cm past the table edge --
+         legible from drawer_view (see DRAWER_CAM_TARGET above), which is
+         the whole point: the drawer must be visibly and physically
+         reachable from outside the table footprint. -->
+    <body name="drawer_housing" pos="0 -0.17 0.28">
       <geom name="drawer_housing_bottom" type="box" size="0.12 0.10 0.005" pos="0 0 -0.045" material="drawer_material"/>
       <geom name="drawer_housing_back" type="box" size="0.12 0.005 0.05" pos="0 0.095 0" material="drawer_material"/>
       <geom name="drawer_housing_left" type="box" size="0.005 0.10 0.05" pos="-0.115 0 0" material="drawer_material"/>
