@@ -24,9 +24,23 @@ layer on top: initial joint-angle jitter, domain randomization (M07), etc.
 `reset(seed=...)` therefore does two things: (1) seeds a `numpy.random.Generator`
 owned by this env so that any future randomized reset logic draws from a
 reproducible stream, and (2) resets MuJoCo's internal data (qpos, qvel, time,
-contacts, ...) back to the model's compiled defaults via `mj_resetData`. Two
-`reset(seed=0)` calls in fresh processes therefore produce byte-identical
-observations, which is the reproducibility property ADR-012 depends on later.
+contacts, ...) via `mj_resetData`, then -- if the compiled model defines a
+keyframe named "home" -- overlays that keyframe's qpos/qvel/ctrl via
+`mj_resetDataKeyframe` (ADR-026). Two `reset(seed=0)` calls in fresh
+processes therefore produce byte-identical observations, which is the
+reproducibility property ADR-012 depends on later.
+
+ADR-026 note: the scene's compiled default (qpos0, all arm joints at 0 rad,
+unmodified per ADR-016) is NOT the pose this env resets to. It was measured
+to put both arms 34 contacts deep into each other (29 armA<->armB, deepest
+-0.0597 m) because both arms' zero-angle configuration extends fully
+forward into the shared handoff band. `scripts/gen_dual_scene.py` bakes an
+additional named "home" keyframe (arms folded back) into the generated
+scene, and `reset()` applies it explicitly -- `qpos0` itself is left alone
+so the upstream asset stays byte-for-byte unmodified (ADR-016). A
+`scene_path=` that has no "home" key (e.g. a bare single-arm scene) falls
+back to the plain `mj_resetData` pose rather than raising, so this class
+stays usable outside the packaged dual-arm scene.
 
 Camera rendering is opt-in (M02 refactor). `reset()`/`step()` return camera
 pixels in `obs` ONLY for the camera names explicitly requested -- either the
@@ -181,8 +195,9 @@ class TableSettingEnv:
             seed: Seeds `self.np_random` reproducibly. Two `reset(seed=0)`
                 calls in independent processes produce byte-identical
                 `qpos`/`qvel`/camera images because MuJoCo's own state reset
-                (`mj_resetData`) is itself deterministic; the seed governs
-                only this env's own RNG stream for future randomized use.
+                (`mj_resetData` plus the "home" keyframe overlay, see below)
+                is itself deterministic; the seed governs only this env's
+                own RNG stream for future randomized use.
             cameras: If not `None`, overrides the instance's default camera
                 list (set in `__init__`) FOR THIS CALL ONLY -- the instance
                 default itself is never mutated by this argument. If `None`
@@ -198,6 +213,16 @@ class TableSettingEnv:
         self.np_random = np.random.default_rng(seed)
 
         mujoco.mj_resetData(self.model, self.data)
+        # ADR-026: apply the "home" keyframe (arms folded back) if the
+        # compiled model defines one, instead of leaving qpos at qpos0
+        # (both arms fully extended -- measured to interpenetrate, see
+        # module docstring). `mj_name2id` returns -1 for a missing name
+        # rather than raising, so a scene without a "home" key (not the
+        # packaged dual-arm scene) silently keeps the plain mj_resetData
+        # pose instead of erroring.
+        home_key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "home")
+        if home_key_id != -1:
+            mujoco.mj_resetDataKeyframe(self.model, self.data, home_key_id)
         mujoco.mj_forward(self.model, self.data)
 
         effective_cameras = self._resolve_cameras(cameras)

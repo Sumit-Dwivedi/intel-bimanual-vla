@@ -84,9 +84,26 @@ FRONT_CAM_FOVY = 55
 # table_top slab with no approach path. See DRAWER_CAM_TARGET below, which
 # tracks this same move.
 #
+# ADR-026 correction (Sept 12, 2026): ADR-025's y=-0.17 placement put the
+# closed drawer face at y=-0.25 -- OUTSIDE both arms' measured reachable
+# envelope (re-measured from the corrected "home" rest pose: neither arm's
+# IK solve converges anywhere near y=-0.25 at the drawer's z=0.28,
+# residuals 0.32 m / 0.18 m, see docs/hardware/m06-reachability-probe.md's
+# "RE-MEASURED (ADR-026)" section). ADR-025's fix moved the WRONG axis: the
+# constraint was height (a shallow drawer's z, not how far out along the
+# table's y-axis it sits). `drawer_housing` moves again, this time to
+# y=DRAWER_HOUSING_Y (see the constant below) -- back toward the table
+# centre and the arms' shared reach band, at the SAME z=0.28 that was
+# already measured to fit between the reachable floor and the tabletop
+# underside (0.33). See DRAWER_CAM_TARGET below, which tracks this same
+# move.
+#
 # Fix: a camera BELOW tabletop height (table surface z=0.35), on the -y
-# side past where the open drawer protrudes, angled UP and toward +y so it
-# looks across the drawer's slide axis instead of along it.
+# side, angled UP and toward +y so it looks across the drawer's slide axis
+# instead of along it. NOTE: with the drawer now centred instead of at the
+# table's edge, the open drawer no longer protrudes past the table
+# footprint the way it did at the ADR-025 position -- see the ADR-026
+# comment above DRAWER_HOUSING_Y for why this trade was accepted.
 #
 # M02 defect fix (two bugs found on re-render, both confirmed by rendering
 # the scene open and closed, not assumed):
@@ -110,15 +127,31 @@ FRONT_CAM_FOVY = 55
 #    before/after pair was legible. Fixed in the template's <asset> block:
 #    the drawer box now gets its own `drawer_box_material` (blue),
 #    contrasting with the housing's brown `drawer_material`.
+# ---- ADR-026 drawer reposition -----------------------------------------
+# `drawer_housing`'s world position. Was y=-0.17 (ADR-025), which put the
+# CLOSED face at y=-0.25 (flush with the table edge) -- kinematically
+# reachable by neither arm once measured from the corrected "home" rest
+# pose (residuals 0.32 m / 0.18 m at the drawer's z=0.28, see
+# `docs/hardware/m06-reachability-probe.md`'s "RE-MEASURED (ADR-026)"
+# section). ADR-025's fix moved the wrong axis (further out in y, toward
+# the table edge); the actual constraint was height, and z=0.28 already
+# fits between the reachable floor and the tabletop underside (0.33) once
+# the housing is over a y where the arms' envelope reaches that low.
+# y=0.08 puts the CLOSED face at y=0.08-0.08=0.0 -- dead centre of the
+# table, inside the measured envelope for both arms at low z (both arms'
+# IK converges there, residual ~0.009 m; see the probe report for the
+# collision caveat this position still carries, which this module reports
+# rather than papers over). z is UNCHANGED from ADR-025 -- it already fit.
+DRAWER_HOUSING_Y = 0.08
+DRAWER_HOUSING_Z = 0.28
+
 DRAWER_CAM_POS = (0.0, -0.55, 0.15)
 # Drawer body world position at drawer_slide=0 (closed): the `drawer`
 # body sits at local pos (0,0,0) inside `drawer_housing`, which is placed
-# at world (0,-0.17,0.28) -- see the template's <body name="drawer_housing">
-# below (ADR-025: moved from -0.05 to -0.17). Aiming here (rather than at
-# the housing's own origin, which is the same point) is what keeps the
-# background fixed while the drawer slides toward -y and toward the
-# camera as it opens.
-DRAWER_CAM_TARGET = (0.0, -0.17, 0.28)
+# at world (0, DRAWER_HOUSING_Y, DRAWER_HOUSING_Z). Aiming here (rather
+# than at the housing's own origin, which is the same point) is what keeps
+# the background fixed while the drawer slides toward -y as it opens.
+DRAWER_CAM_TARGET = (0.0, DRAWER_HOUSING_Y, DRAWER_HOUSING_Z)
 DRAWER_CAM_FOVY = 50
 
 
@@ -169,6 +202,112 @@ ARM_GAP_Y = 0.25     # each arm base offset from y=0 (table centreline, m)
 # each other across the table's short (width) axis. A base gap of 2*0.25=0.50 m
 # leaves an approximately 0.10 m wide overlap band (y in [-0.05, 0.05]) reachable
 # by both arms -- this is where props are placed.
+
+# ---- ADR-026 "home" keyframe -------------------------------------------
+# Root-cause fix for the cross-arm interpenetration measured at
+# reset(seed=0) BEFORE this fix: 34 total contacts, 29 of them armA<->armB,
+# deepest penetration -0.0597 m (armA_wrist vs armB_wrist). Cause: every
+# arm hinge joint's compiled default (qpos0, unmodified per ADR-016) is
+# 0 rad, and at 0 rad both arms' kinematic chains extend fully forward
+# into the shared handoff band -- the two arms' own rest posture, not
+# props or the drawer, was the collision. Fix: a named `<key name="home">`
+# keyframe (below) that folds each arm's shoulder/elbow back, applied by
+# `TableSettingEnv.reset()` (src/bimanual/sim/env.py) via
+# `mj_resetDataKeyframe` instead of leaving qpos at qpos0. `ref` on the
+# upstream joints is deliberately NOT touched -- ADR-016 keeps the asset's
+# own kinematics/defaults unmodified; this is an ADDITIONAL named key, not
+# an edit to the shipped default.
+#
+# Values were measured, not guessed: an exploration script tried every
+# sign combination of (shoulder_lift, elbow_flex) applied identically vs.
+# mirrored across the two arms (mirrored because armB's base carries a
+# 180-degree-rotated quat -- ADR-021), rendered each to a PNG, and counted
+# MuJoCo contacts after mj_forward. Applying the SAME signs to both arms
+# (not mirrored) produced a visually symmetric fold in both directions
+# tried; applying opposite signs per arm produced a visibly lopsided pose
+# (one arm folded low, the other raised) and is wrong. Of the two symmetric
+# candidates, (shoulder_lift=-1.2, elbow_flex=-1.6) measured ZERO
+# self-collision (self_a=0, self_b=0) and ZERO cross-arm contacts,
+# vs. (+1.2, +1.6) which measured 13 self-collisions per arm plus the arm
+# penetrating table_top by -0.0189 m. -1.2 / -1.6 is therefore the fold
+# direction, applied identically to armA and armB.
+HOME_SHOULDER_PAN = 0.0
+HOME_SHOULDER_LIFT = -1.2
+# elbow_flex's compiled range is -1.69..1.69 rad (read from the upstream
+# asset below and asserted against at generation time). The originally
+# suggested fold of -1.8 rad is OUTSIDE that range; -1.6 is the clamped,
+# in-range fold used instead.
+HOME_ELBOW_FLEX = -1.6
+HOME_WRIST_FLEX = 0.0
+HOME_WRIST_ROLL = 0.0
+# Gripper "open" end of its own range is resolved from the upstream asset
+# (not guessed): see `_gripper_open_value` below, which reads the joint's
+# own `range` attribute and returns its high end -- the same convention
+# `src/bimanual/control/skills_scripted.py`'s GRIPPER_OPEN_FRACTION=1.0
+# already documents (measured against the jaw's actual travel, not
+# assumed against mesh geometry).
+
+# Initial world positions of the five manipulable props, read once here so
+# the SAME numbers populate both the hand-authored <body pos=...> template
+# below and the "home" keyframe's qpos vector -- one source of truth
+# instead of two literals that could drift apart. Order matches the
+# worldbody document order in TEMPLATE (plate, mug, fork, spoon,
+# water_bottle), which is also the order MuJoCo assigns qpos slots in.
+PLATE_POS = (-0.15, 0.00, 0.356)
+MUG_POS = (0.05, -0.03, 0.39)
+FORK_POS = (-0.05, 0.05, 0.356)
+SPOON_POS = (0.00, 0.08, 0.356)
+BOTTLE_POS = (0.22, 0.00, 0.44)
+
+# drawer_slide qpos in the home keyframe: 0.0 (closed) -- the "home" pose
+# is a rest pose, not an opened-drawer demonstration state.
+DRAWER_SLIDE_HOME = 0.0
+
+
+def _fmt_pos(pos):
+    return "%.4f %.4f %.4f" % pos
+
+
+def find_joint_range(elem, joint_name):
+    """Read a <joint name=... range="lo hi"/> from anywhere in `elem`'s
+    subtree, BEFORE any armX_ renaming, so callers see the upstream joint
+    name (e.g. "gripper", not "armA_gripper"). Used to derive the gripper
+    "open" value and to sanity-check HOME_* against the asset's own limits
+    at generation time, rather than hardcoding limits that could drift if
+    the upstream asset ever changes.
+    """
+    for e in elem.iter("joint"):
+        if e.get("name") == joint_name:
+            lo, hi = (float(x) for x in e.get("range").split())
+            return lo, hi
+    raise ValueError(f"joint {joint_name!r} not found while deriving the home keyframe")
+
+
+def build_home_qpos(gripper_open_value):
+    """Full nq-length qpos vector for the "home" keyframe, in MuJoCo's own
+    qpos assignment order: bodies are walked in worldbody document order,
+    and each joint contributes its qpos slots in the order encountered.
+
+    Order here mirrors TEMPLATE's <worldbody> exactly: table (no joint),
+    drawer (1 slide dof), plate/mug/fork/spoon/water_bottle (7 free-joint
+    dofs each: x y z qw qx qy qz), arm_a (6 hinge dofs), arm_b (6 hinge
+    dofs). Cameras contribute no dofs.
+    """
+    q = [DRAWER_SLIDE_HOME]
+    for pos in (PLATE_POS, MUG_POS, FORK_POS, SPOON_POS, BOTTLE_POS):
+        q.extend(pos)
+        q.extend((1.0, 0.0, 0.0, 0.0))  # identity quaternion (w, x, y, z) -- no <body quat=...> override in TEMPLATE
+    arm_home = [
+        HOME_SHOULDER_PAN,
+        HOME_SHOULDER_LIFT,
+        HOME_ELBOW_FLEX,
+        HOME_WRIST_FLEX,
+        HOME_WRIST_ROLL,
+        gripper_open_value,
+    ]
+    q.extend(arm_home)  # arm A
+    q.extend(arm_home)  # arm B -- SAME values, not mirrored (see rationale above)
+    return q
 
 
 def rename_recursive(elem, prefix):
@@ -268,6 +407,22 @@ def main():
         ET.tostring(m, encoding="unicode").strip() for m in asset.findall("material")
     )
 
+    # ---- ADR-026 "home" keyframe: derive + sanity-check against the
+    # upstream asset's own joint limits before baking anything into the XML.
+    elbow_lo, elbow_hi = find_joint_range(base_body, "elbow_flex")
+    shoulder_lift_lo, shoulder_lift_hi = find_joint_range(base_body, "shoulder_lift")
+    gripper_lo, gripper_hi = find_joint_range(base_body, "gripper")
+    assert elbow_lo <= HOME_ELBOW_FLEX <= elbow_hi, (
+        f"HOME_ELBOW_FLEX={HOME_ELBOW_FLEX} outside asset range [{elbow_lo}, {elbow_hi}]"
+    )
+    assert shoulder_lift_lo <= HOME_SHOULDER_LIFT <= shoulder_lift_hi, (
+        f"HOME_SHOULDER_LIFT={HOME_SHOULDER_LIFT} outside asset range "
+        f"[{shoulder_lift_lo}, {shoulder_lift_hi}]"
+    )
+    gripper_open_value = gripper_hi  # "open" = the high end of the range (see comment above)
+    home_qpos = build_home_qpos(gripper_open_value)
+    home_qpos_str = " ".join("%.6f" % v for v in home_qpos)
+
     out = TEMPLATE.format(
         arm_a=arm_a_xml,
         arm_b=arm_b_xml,
@@ -280,6 +435,14 @@ def main():
         drawer_cam_pos="%.4f %.4f %.4f" % DRAWER_CAM_POS,
         drawer_cam_xyaxes=DRAWER_CAM_XYAXES,
         drawer_cam_fovy=DRAWER_CAM_FOVY,
+        plate_pos=_fmt_pos(PLATE_POS),
+        mug_pos=_fmt_pos(MUG_POS),
+        fork_pos=_fmt_pos(FORK_POS),
+        spoon_pos=_fmt_pos(SPOON_POS),
+        bottle_pos=_fmt_pos(BOTTLE_POS),
+        home_qpos=home_qpos_str,
+        drawer_housing_y=DRAWER_HOUSING_Y,
+        drawer_housing_z=DRAWER_HOUSING_Z,
     )
     DEST.parent.mkdir(parents=True, exist_ok=True)
     DEST.write_text(out, newline="\n")
@@ -408,30 +571,42 @@ TEMPLATE = """<?xml version="1.0"?>
       <geom name="table_leg_br" type="cylinder" size="0.018 0.165" pos="0.35 0.20 0.165" material="table_material"/>
     </body>
 
-    <!-- Drawer (prismatic joint). A small cabinet tucked under the tabletop
-         near arm A's edge (y=-0.25). The drawer body slides out along -y
-         (towards arm A) on a slide joint; housing walls are static geoms
-         with no joint.
+    <!-- Drawer (prismatic joint). A small cabinet tucked under the
+         tabletop, near the table's y-centre (see ADR-026 below). The
+         drawer body slides out along -y on a slide joint; housing walls
+         are static geoms with no joint.
 
          ADR-025 (M06a reachability fix): housing moved from y=-0.05 to
-         y=-0.17 (12 cm outward). At y=-0.05 the CLOSED drawer face sat at
-         y=-0.13 -- 12 cm inboard of the table edge (y=-0.25), entirely
-         enclosed under the solid table_top slab with no approach path
-         from outside, which is why open_drawer failed in M06a (verified
-         by contact inspection, DECISIONS.md M06a entry). At y=-0.17, the
-         closed face is at y=-0.17-0.08=-0.25, flush with the table edge.
-         Housing half-depth in y is 0.10, so the housing itself spans
-         y=-0.27..-0.07 -- it overhangs the table edge (y=-0.25) by 2 cm.
-         Accepted: real drawer fronts commonly overhang their cabinet's
-         edge by a similar margin, and it does not intersect any other
-         geometry (housing z spans ~0.23..0.33, stopping at the tabletop
-         underside 0.33..0.35; arm bases mount ON TOP at z=0.35). Fully
-         open (drawer_slide=0.15), the drawer body centre reaches y=-0.32
-         and its face y=-0.40, protruding 15 cm past the table edge --
-         legible from drawer_view (see DRAWER_CAM_TARGET above), which is
-         the whole point: the drawer must be visibly and physically
-         reachable from outside the table footprint. -->
-    <body name="drawer_housing" pos="0 -0.17 0.28">
+         y=-0.17 (12 cm outward) so the closed face sat flush with the
+         table edge (y=-0.25) instead of tucked under the slab with no
+         approach path (verified by contact inspection, DECISIONS.md M06a
+         entry).
+
+         ADR-026 correction (Sept 12, 2026): y=-0.25 turned out to be
+         OUTSIDE both arms' reachable envelope once re-measured from the
+         corrected "home" rest pose (residuals 0.32 m / 0.18 m against a
+         0.01 m tolerance -- see docs/hardware/m06-reachability-probe.md's
+         "RE-MEASURED (ADR-026)" section). ADR-025 moved the wrong axis:
+         the real constraint was height, and z=0.28 (unchanged since
+         ADR-025) already fits between the reachable floor and the
+         tabletop underside (0.33) -- it just needed to sit over a y where
+         the arms' envelope actually reaches that low. Housing now sits at
+         y=DRAWER_HOUSING_Y=0.08, putting the CLOSED face at y=0.0 (table
+         centre), where both arms' IK converges (residual ~0.009 m each,
+         within the measured envelope). Housing z (0.28) and dimensions
+         are unchanged from ADR-025 -- only the y position moved.
+
+         Traded away by this move, reported rather than hidden: at
+         y=-0.17 the OPEN drawer protruded 15 cm past the table edge,
+         legible from drawer_view. At y=0.08 the open drawer (slide=0.15,
+         housing_y - 0.15 = -0.07, face -0.15) stays entirely under the
+         tabletop footprint (table spans y in [-0.25, 0.25]) -- the
+         open/closed states are still visually distinguishable via the
+         drawer_view camera (the box's colour and its distance from the
+         housing's back wall both change), but the "pops out past the
+         table" framing from ADR-025 no longer applies. See ARCHITECTURE.md
+         ADR-026 for the full reachability-vs-visibility trade-off. -->
+    <body name="drawer_housing" pos="0 {drawer_housing_y:.4f} {drawer_housing_z:.4f}">
       <geom name="drawer_housing_bottom" type="box" size="0.12 0.10 0.005" pos="0 0 -0.045" material="drawer_material"/>
       <geom name="drawer_housing_back" type="box" size="0.12 0.005 0.05" pos="0 0.095 0" material="drawer_material"/>
       <geom name="drawer_housing_left" type="box" size="0.005 0.10 0.05" pos="-0.115 0 0" material="drawer_material"/>
@@ -445,30 +620,30 @@ TEMPLATE = """<?xml version="1.0"?>
     <!-- Manipulable props (free joints). All placed within the arms'
          overlapping reach band, y in [-0.05, 0.08], resting on the table
          surface (z=0.35). -->
-    <body name="plate" pos="-0.15 0.00 0.356">
+    <body name="plate" pos="{plate_pos}">
       <freejoint name="plate_free"/>
       <geom name="plate_geom" type="cylinder" size="0.09 0.006" mass="0.15" material="plate_material" friction="0.9 0.005 0.0001"/>
     </body>
 
-    <body name="mug" pos="0.05 -0.03 0.39">
+    <body name="mug" pos="{mug_pos}">
       <freejoint name="mug_free"/>
       <geom name="mug_body" type="cylinder" size="0.035 0.04" mass="0.22" material="mug_material" friction="0.9 0.005 0.0001"/>
       <geom name="mug_handle" type="capsule" size="0.008" fromto="0.035 0 0.01 0.06 0 -0.01" mass="0.02" material="mug_handle_material" friction="0.9 0.005 0.0001"/>
     </body>
 
-    <body name="fork" pos="-0.05 0.05 0.356">
+    <body name="fork" pos="{fork_pos}">
       <freejoint name="fork_free"/>
       <geom name="fork_handle" type="capsule" size="0.004" fromto="-0.06 0 0 0.03 0 0" mass="0.02" material="fork_material" friction="0.5 0.003 0.0001"/>
       <geom name="fork_head" type="box" size="0.025 0.012 0.003" pos="0.055 0 0" mass="0.01" material="fork_material" friction="0.5 0.003 0.0001"/>
     </body>
 
-    <body name="spoon" pos="0.00 0.08 0.356">
+    <body name="spoon" pos="{spoon_pos}">
       <freejoint name="spoon_free"/>
       <geom name="spoon_handle" type="capsule" size="0.004" fromto="-0.06 0 0 0.035 0 0" mass="0.018" material="spoon_material" friction="0.5 0.003 0.0001"/>
       <geom name="spoon_bowl" type="ellipsoid" size="0.018 0.012 0.004" pos="0.05 0 0" mass="0.012" material="spoon_material" friction="0.5 0.003 0.0001"/>
     </body>
 
-    <body name="water_bottle" pos="0.22 0.00 0.44">
+    <body name="water_bottle" pos="{bottle_pos}">
       <freejoint name="water_bottle_free"/>
       <geom name="water_bottle_body" type="cylinder" size="0.03 0.09" mass="0.30" material="bottle_material" friction="0.7 0.004 0.0001"/>
       <geom name="water_bottle_cap" type="cylinder" size="0.012 0.01" pos="0 0 0.10" mass="0.01" material="bottle_material" friction="0.7 0.004 0.0001"/>
@@ -515,6 +690,20 @@ TEMPLATE = """<?xml version="1.0"?>
   <actuator>
     {actuators}
   </actuator>
+
+  <!-- "home" keyframe (ADR-026): both arms folded back (shoulder_lift=-1.2,
+       elbow_flex=-1.6 rad, identical sign on both arms -- NOT mirrored;
+       measured to be the symmetric, collision-free fold, see the HOME_*
+       comment block above), gripper open, drawer closed, props at their
+       initial rest positions. `TableSettingEnv.reset()` applies this key
+       via mj_resetDataKeyframe instead of leaving qpos at the upstream
+       default (all-zero joint angles), which measurably put both arms'
+       rest pose 34 total contacts deep into each other (29 armA<->armB,
+       deepest -0.0597 m) -- the two arms' own extended-forward default
+       posture, not any prop or the drawer, was the collision source. -->
+  <keyframe>
+    <key name="home" qpos="{home_qpos}"/>
+  </keyframe>
 
   <equality/>
 </mujoco>

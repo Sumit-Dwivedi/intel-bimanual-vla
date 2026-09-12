@@ -11,6 +11,82 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-026 — "Home" rest keyframe; envelope re-measured from a valid pose; drawer moved onto the correct axis
+
+**Recorded:** Sept 12, 2026 · **Supersedes:** ADR-025's drawer reposition ·
+**Corrects:** a load-bearing ADR-021 assumption never checked against the
+compiled rest pose · **New ADR, not an ADR-025 amendment**, because this
+replaces the pose the whole reachability story was measured from.
+
+**Root cause found.** ADR-025's own probe flagged, but did not fix, a
+"Baseline finding": at `reset(seed=0)`, *before any IK solve*, arm A and arm
+B's default rest pose (all arm joints at their compiled 0 rad, unmodified
+per ADR-016) already interpenetrates — **34 total contacts, 29 armA↔armB,
+deepest -0.0597 m** (`armA_wrist` vs `armB_wrist`). Both arms' zero-angle
+pose extends fully forward into the shared handoff band; the arms' own rest
+posture, not the drawer or any prop, was occupying the workspace.
+`docs/hardware/m02-physics-stability.md`'s existing caveat ("catches
+interpenetration only indirectly... never asserts on `data.contact.dist`
+directly") predicted exactly this — the scene passed that probe the whole
+time it also carried a 6 cm self-interpenetration.
+
+**Decision, four parts:**
+1. **Added a `<key name="home">` keyframe** (generated in
+   `scripts/gen_dual_scene.py`'s hand-authored region; upstream `qpos0` is
+   untouched, ADR-016 holds): both arms folded back identically —
+   `shoulder_pan=0, shoulder_lift=-1.2, elbow_flex=-1.6` (clamped in-range;
+   the originally-suggested -1.8 is outside the asset's -1.69..1.69 limit),
+   `wrist_flex=0, wrist_roll=0`, gripper open (range high end, +1.7453 rad).
+   Same signs on both arms (verified by rendering every sign combination,
+   not assumed, despite armB's 180°-rotated mount quat) — mirrored signs
+   produced a visibly lopsided pose. Measured: **zero self-collision, zero
+   cross-arm contacts** at the new `reset(seed=0)`. `TableSettingEnv.reset()`
+   now applies this key via `mj_resetDataKeyframe`, falling back to plain
+   `mj_resetData` if a scene has no "home" key.
+2. **Re-measured the reachable envelope** from the corrected pose, finer z
+   grid (0.02 m steps, 0.20–0.50 m). Previous envelope (sampled from the
+   invalid, interpenetrating pose) is superseded, not deleted — the probe
+   script now appends new sections instead of overwriting. New envelope:
+   Arm A 186 points, x∈[-0.30,0.30], y∈[-0.35,0.10], z∈[0.24,0.50]; Arm B
+   154 points, x∈[-0.30,0.30], y∈[-0.12,0.10], z∈[0.24,0.50]. **Shared
+   handoff band: y∈[-0.12,0.10] m** — ADR-021's "~0.10 m shared band" was
+   never checked against the compiled rest pose; it is now superseded by
+   this measured band.
+3. **Drawer moved a second time, onto the correct axis.** ADR-025's y=-0.25
+   closed-face position is unreachable by either arm against the corrected
+   envelope (residuals 0.32 m / 0.18 m) — ADR-025 moved the wrong axis; the
+   constraint was height, and z=0.28 already fit once y was corrected.
+   `drawer_housing` moves to y=0.08 (closed face y=0.0, inside both arms'
+   envelope, residual ≈0.009 m each). z unchanged (0.28). Docs images
+   re-rendered at 1280x720. Traded away, reported not hidden: the open
+   drawer no longer protrudes past the table edge (open/closed states
+   remain visually distinguishable, just not via edge protrusion anymore).
+4. **Step 4 surfaced a separate, deeper finding and this ADR stops rather
+   than chasing it:** every one of the four targets still fails the
+   probe's collision check, including `plate_at_rest`/`bottle_at_rest`
+   whose positions never moved. Traced to `bimanual.control.ik.solve_position_ik`
+   (position-only, no obstacle term, ADR-024) converging to configurations
+   that swing the arm through the tabletop for some targets — a
+   pre-existing defect that ADR-025's own collision check (a raw
+   contact-count delta against a ~29 baseline) was masking the whole time.
+   Per this task's explicit stop rule, no further drawer position was
+   tried — `plate_at_rest` fails identically without the drawer moving at
+   all, so this is an `ik.py` fix, out of scope here, deferred to a
+   follow-up.
+
+**Consequences.** `reset(seed=0)`'s qpos/observations change for every
+caller (flagged before the change, not discovered after).
+`scripts/probe_physics_stability.py` re-run: still **PASS**, unchanged
+numbers. `pytest tests/`: **4 tests in `tests/test_skills.py` now fail**
+(`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`, `test_handoff_mug_ends_held_by_arm_b`),
+timing out during IK approach from the new folded pose — these encode the
+OLD rest pose and are reported, not edited; re-tuning skills/IK for the new
+home pose is a separate follow-up. `git diff --stat -- scenes/so101/` stays
+empty throughout.
+
+---
+
 ## ADR-025 — Drawer housing repositioning and IK pinch-point retargeting
 
 **Recorded:** Sept 12, 2026 · **Follows:** M06a's failure diagnosis (ADR-024) ·

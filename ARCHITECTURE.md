@@ -1268,6 +1268,157 @@ that M02's original done-when criteria were met with reachability included.
 
 ---
 
+### ADR-026 — "Home" rest keyframe; envelope re-measured from a valid pose; drawer moved onto the correct axis
+
+**Recorded:** Sept 12, 2026 · **Supersedes:** ADR-025's drawer reposition
+(the axis it moved was wrong) · **Corrects (not amends) a load-bearing
+assumption in:** ADR-021 (the ~0.30 m reach / 0.50 m base-gap "0.10 m shared
+band" was never checked against the compiled rest pose) · **New ADR rather
+than an ADR-025 amendment** because this is a structural correction — it
+replaces the pose the whole reachability story was measured from, not a
+follow-on tweak to ADR-025's own decision.
+
+**Context.** ADR-025's own probe reported a "Baseline finding," flagged but
+explicitly not fixed: at `reset(seed=0)`, *before any IK solve runs*, arm A
+and arm B's default rest pose (every arm joint at its compiled default, 0
+rad, unmodified per ADR-016) already interpenetrates. Measured directly
+(not estimated) via MuJoCo's own contact list: **34 total contacts, 29 of
+them armA↔armB geom pairs**, with penetration depths up to **-0.0597 m**
+(`armA_wrist` vs. `armB_wrist`; also `armA_gripper` vs. `armB_lower_arm`
+-0.0574 m, `armA_lower_arm` vs. `armB_gripper` -0.0574 m, `armA_wrist` vs.
+`armB_lower_arm` -0.0379 m). Root cause: both arms' zero-angle configuration
+extends fully forward into the shared handoff band — the arms' own rest
+posture, independent of the drawer or any prop, was occupying the workspace
+this whole project's reachability story depends on. `docs/hardware/m02-physics-stability.md`
+already carried a caveat that predicted exactly this: its floor/NaN check
+"catches interpenetration only indirectly" and "never asserts on
+`data.contact.dist` directly" — this scene passed that probe for the entire
+time it also carried a 6 cm self-interpenetration, because the two checks
+measure different properties.
+
+**Decision, four parts.**
+
+1. **A named `<key name="home">` keyframe**, generated in the hand-authored
+   region of `scripts/gen_dual_scene.py` (not a hand-edit of the compiled
+   XML, and not a change to any upstream joint `ref` — ADR-016's "asset
+   kinematics unmodified" holds; this is an ADDITIONAL key, not an edit to
+   `qpos0`). Both arms fold back identically: `shoulder_pan=0`,
+   `shoulder_lift=-1.2`, `elbow_flex=-1.6`, `wrist_flex=0`, `wrist_roll=0`,
+   gripper at its range's high end (open, `+1.7453` rad — resolved from the
+   asset's own `gripper` joint range, not guessed, matching the convention
+   `control/skills_scripted.py`'s `GRIPPER_OPEN_FRACTION=1.0` already
+   documents). **The originally-suggested `elbow_flex=-1.8` is OUTSIDE the
+   asset's `-1.69..1.69` range; `-1.6` is the in-range fold used instead,
+   asserted against the upstream range at generation time so this cannot
+   silently drift out of bounds again.** Despite armB's mount carrying a
+   180°-rotated quaternion (ADR-021), applying the SAME signs to both arms
+   — not mirrored — was verified (not assumed) to be correct: an
+   exploration pass rendered every sign combination of
+   (`shoulder_lift`, `elbow_flex`) to PNG and counted contacts; identical
+   signs on both arms produced a visually symmetric fold in both directions
+   tried, mirrored signs produced a visibly lopsided pose (one arm folded
+   low, the other raised). Of the two symmetric candidates, `-1.2/-1.6`
+   measured **zero self-collision and zero cross-arm contacts**, vs.
+   `+1.2/+1.6`'s 13 self-collisions per arm plus a -0.0189 m table
+   penetration. `TableSettingEnv.reset()` (`src/bimanual/sim/env.py`,
+   authorized for this task) now applies this key via
+   `mj_resetDataKeyframe` when present, falling back to plain
+   `mj_resetData` if a `scene_path=` has no "home" key. **Measured result:
+   at `reset(seed=0)`, zero armA↔armB contacts (down from 29) — the
+   acceptance bar (no cross-arm contact with negative `dist`) is met, not
+   approximately but exactly (there are no cross-arm contacts to have a
+   sign at all).**
+
+2. **The reachable envelope was re-measured from this corrected pose**
+   (`scripts/probe_reachability.py`, re-run on bm-ptl), with a finer z grid
+   (0.02 m steps, 0.20–0.50 m, vs. the original 0.1 m steps that left the
+   true floor unresolved in (0.20, 0.30]). **The previous envelope
+   (`docs/hardware/m06-reachability-probe.md`'s first section) is
+   superseded, not deleted** — it was sampled from an invalid, interpenetrating
+   rest pose and is kept only as the historical record of why this
+   correction exists; the probe script now APPENDS new sections rather than
+   overwriting. New measured envelope: **Arm A** 186 reachable grid points,
+   x∈[-0.30,0.30], y∈[-0.35,0.10], z∈[0.24,0.50]; **Arm B** 154 points,
+   x∈[-0.30,0.30], y∈[-0.12,0.10], z∈[0.24,0.50]. **Shared handoff band
+   (y-range intersection): y∈[-0.12, 0.10] m.** **ADR-021's "~0.10 m shared
+   band" was a base-spacing-and-nominal-reach assumption, never checked
+   against the compiled rest pose; it is now superseded by this measured
+   band**, which happens to be close in width but was arrived at by
+   measurement, not by the original arithmetic.
+
+3. **The drawer was moved a second time, onto the correct axis.**
+   ADR-025 moved `drawer_housing` outward in y (further from the table
+   centre, to put the closed face flush with the table edge). Measured
+   against the corrected envelope, that position (closed face at y=-0.25)
+   is **unreachable by either arm** (residuals 0.32 m / 0.18 m against a
+   0.01 m tolerance) — ADR-025 moved the wrong axis. **The actual
+   constraint was height**: z=0.28 already fit between the reachable floor
+   and the tabletop underside (0.33); it simply needed to sit over a y
+   where the arms' envelope reaches that low. `drawer_housing` moves to
+   y=0.08 (closed face y=0.0, table centre, inside the measured envelope
+   for both arms — IK converges for both, residual ≈0.009 m each). z is
+   UNCHANGED from ADR-025 (0.28); no height reduction was needed once the y
+   position was corrected. Docs images (`m02-scene.png`,
+   `m02-drawer-view-closed.png`, `m02-drawer-view-open.png`) were
+   re-rendered at 1280×720. **Traded away, reported rather than hidden:**
+   at y=-0.17 the open drawer protruded 15 cm past the table edge,
+   legible from `drawer_view`; at y=0.08 the open drawer stays entirely
+   under the tabletop footprint. The open/closed states remain visually
+   distinguishable (box position and colour against the housing change
+   between the two rendered images) but the "pops out past the table"
+   framing is gone.
+
+4. **Step 4's own validation surfaced a fourth, separate finding, and this
+   ADR stops here rather than chasing it.** Re-running the full probe
+   against the repositioned drawer: `closed_drawer_face` and
+   `bottle_at_rest` now converge kinematically (residual <0.01 m) for BOTH
+   arms — the envelope fix worked — but **every one of the four targets
+   still fails the probe's collision check**, including `plate_at_rest` and
+   `bottle_at_rest`, whose target positions never moved during this whole
+   correction. Tracing the failing solves (e.g. `plate_at_rest`, arm A:
+   `shoulder_lift` solves to its `+1.7453` rad limit) shows
+   `bimanual.control.ik.solve_position_ik`'s Newton/DLS solve converging to
+   a configuration that swings the arm down and back **through** the
+   tabletop (confirmed directly: `table_top`/`drawer_housing_back` contacts
+   at up to -0.049 m penetration for a solve whose *position* residual is a
+   perfectly good 0.009 m) — the IK solver is position-only with no
+   obstacle term (ADR-024), and the "home" seed apparently lands its
+   Newton iteration in a worse local minimum for these targets than the old
+   fully-extended seed did. **This collision was never actually fixed by
+   ADR-025 either** — the old probe's collision check compared a raw
+   contact COUNT against a ~29-contact baseline, so any solve producing
+   fewer than 29 new contacts silently reported `collision=False`
+   regardless of what those contacts were; dropping the baseline to 0 (via
+   this ADR's keyframe) removed that masking and made the true, pre-existing
+   collision state visible for the first time. Per this task's explicit
+   stop rule ("if any target still fails, STOP and report — do not proceed
+   and do not guess at another position"), **no further drawer position was
+   tried**: `plate_at_rest`/`bottle_at_rest` fail identically without the
+   drawer having moved at all, so repositioning again would not address it.
+   Fixing it means changing `src/bimanual/control/ik.py` (multi-start
+   solving, an obstacle-aware cost term, or target-specific seeding instead
+   of always seeding from "home") — out of this task's scope by instruction,
+   and left for a follow-up module, not silently absorbed here.
+
+**Consequences.** `TableSettingEnv.reset(seed=0)` now returns different
+`qpos`/observations than every prior caller assumed — this was flagged
+before making the change, not discovered after. `scripts/probe_physics_stability.py`
+was re-run (still PASS, unchanged numbers; its own caveat, recorded before
+this ADR, predicted exactly why it could not have caught the original
+interpenetration) and `python -m pytest tests/` was re-run: **4 tests in
+`tests/test_skills.py` (`test_open_drawer_reaches_near_limit`,
+`test_pick_plate_lifts_above_table`, `test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b`) now fail, timing out during IK
+approach from the new folded starting pose.** These tests encode the OLD
+rest pose's behavior; per this task's instruction they are reported here,
+not silently edited — re-tuning the scripted skills/IK for the new home
+pose is explicitly out of this task's scope and is deferred to a follow-up
+invocation. `git diff --stat -- scenes/so101/` stays empty throughout (all
+changes are in `scripts/gen_dual_scene.py`'s hand-authored region, the
+generated `so101_dual_table.xml`, and `src/bimanual/sim/env.py`).
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

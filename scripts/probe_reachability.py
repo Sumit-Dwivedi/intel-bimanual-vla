@@ -1,4 +1,5 @@
-"""M06a reachability probe (ADR-025) -- run BEFORE any skill.
+"""M06a reachability probe (ADR-025), re-measured under ADR-026 -- run BEFORE
+any skill.
 
 M06a discovered two things the empty M02 done-when list never checked:
 whether the IK solver's target is where the jaws actually pinch (fixed by
@@ -7,6 +8,22 @@ geometry even lets an arm's solved joint configuration reach a target
 without colliding with the table it is bolted to. This script checks the
 SECOND question directly and numerically, instead of assuming a scene edit
 fixed it.
+
+**ADR-026 correction (Sept 12, 2026):** every envelope this script ever
+measured before today was sampled from an INVALID rest pose -- at
+`reset(seed=0)`, the two arms' own default (all-zero-joint) configuration
+put them 34 contacts deep into each other (29 armA<->armB, deepest
+-0.0597 m), independent of any IK target. `TableSettingEnv.reset()` now
+applies a "home" keyframe (arms folded back, see
+`scripts/gen_dual_scene.py` and ARCHITECTURE.md ADR-026) BEFORE this probe
+ever calls `ik.solve_position_ik`, so `data`'s starting qpos (which the IK
+solver seeds from) is now a collision-free, retracted pose instead of an
+interpenetrating, fully-extended one. Every table this script now produces
+is measured from that corrected pose. **The earlier tables in this file are
+NOT overwritten** -- they are the historical record of why ADR-026 exists,
+and this script's report writer now APPENDS a new, clearly dated section
+below them instead of replacing the file (see `main()`'s use of
+`REPORT_PATH.read_text()` before writing).
 
 For each of 4 targets (closed drawer face, plate/mug/bottle at rest) x each
 arm (A, B), it:
@@ -19,12 +36,14 @@ arm (A, B), it:
      check).
   4. PASS requires residual < 0.01 m AND no such contact.
 
-If the closed-drawer-face probe FAILS for either arm, this script does NOT
-guess a second scene change. Per instruction, it falls back to sampling the
-IK solver over a coarse grid of candidate world positions and reports each
-arm's actual reachable envelope (residual < 0.01 m, collision not checked
-for the sweep -- see the envelope section for why), so a drawer position
-can be chosen from measured data next time instead of guessed a third time.
+The reachable-envelope sweep (grid of candidate world positions, residual
+< tolerance only, collision not checked -- see the envelope section for
+why) now always runs, not only on primary-probe failure: ADR-026's Step 2
+explicitly asks for the envelope to be re-measured from the corrected pose
+regardless of whether the four primary targets pass, and Step 3 needs that
+envelope to choose a drawer position. The z grid is finer than the original
+0.1 m steps (which left the true minimum reachable height unresolved
+between 0.20 and 0.30 m): now 0.02 m steps from 0.20 to 0.50 m.
 
 Runs only on bm-ptl (ADR-020): imports `bimanual.sim.env`, which imports
 `mujoco`.
@@ -50,11 +69,15 @@ REPORT_PATH = (
     pathlib.Path(__file__).resolve().parent.parent / "docs" / "hardware" / "m06-reachability-probe.md"
 )
 
-# Coarse grid for the fallback reachable-envelope sweep (only run if a
-# primary target fails). "Coarse steps are fine" per instruction.
+# Grid for the reachable-envelope sweep. x/y unchanged from the first pass
+# (coarse steps were fine there -- neither axis's boundary was ambiguous).
+# z is now FINER (0.02 m vs. the original 0.1 m): the first pass's z steps
+# (0.2, 0.3, 0.4, 0.5) left the true minimum reachable height unresolved
+# anywhere in (0.20, 0.30] -- see ADR-026. Sampling every 0.02 m from 0.20
+# to 0.50 resolves that boundary to within one grid step.
 GRID_X = np.array([-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3])
 GRID_Y = np.array([-0.35, -0.275, -0.2, -0.125, -0.05, 0.025, 0.1])
-GRID_Z = np.array([0.2, 0.3, 0.4, 0.5])
+GRID_Z = np.round(np.arange(0.20, 0.50 + 1e-9, 0.02), 2)
 
 
 def _body_id(model, name: str) -> int:
@@ -230,25 +253,52 @@ def _summarize_envelope(points: list[tuple[float, float, float]]) -> str:
     )
 
 
+def _shared_band(envelope: dict) -> tuple[float, float] | None:
+    """Intersection of the two arms' reachable y-ranges (from the envelope
+    sweep), i.e. the y-band a handoff could physically happen in. Returns
+    None if the two arms' y-ranges do not overlap at all.
+    """
+    if not envelope["A"] or not envelope["B"]:
+        return None
+    y_a = [p[1] for p in envelope["A"]]
+    y_b = [p[1] for p in envelope["B"]]
+    lo = max(min(y_a), min(y_b))
+    hi = min(max(y_a), max(y_b))
+    if lo > hi:
+        return None
+    return (lo, hi)
+
+
 def main() -> int:
     env = TableSettingEnv(cameras=None)
-    env.reset(seed=SEED)
+    env.reset(seed=SEED)  # ADR-026: this now applies the "home" keyframe, not qpos0.
 
     rows, baseline_contacts = run_primary_probes(env)
     all_passed = all(r["pass"] for r in rows)
-    drawer_failed = any(r["target"] == "closed_drawer_face" and not r["pass"] for r in rows)
 
     lines = []
-    lines.append("# M06 reachability probe (ADR-025)")
     lines.append("")
-    lines.append(f"Seed: {SEED}. PASS requires residual < {ik.IK_POSITION_TOLERANCE_M} m and no NEW collision")
+    lines.append("---")
+    lines.append("")
+    lines.append("# M06 reachability probe, RE-MEASURED (ADR-026)")
+    lines.append("")
+    lines.append(
+        f"Seed: {SEED}, reset via `TableSettingEnv.reset()`, which now applies the \"home\" "
+        "keyframe (arms folded back) instead of leaving qpos at the upstream all-zero "
+        "default. **Every number below supersedes the corresponding number above**, which "
+        "was measured from a rest pose in which the two arms interpenetrated by up to "
+        "6 cm before any IK solve ran. The section above is retained as the historical "
+        "record of why this re-measurement exists, not as a currently-valid envelope."
+    )
+    lines.append("")
+    lines.append(f"PASS requires residual < {ik.IK_POSITION_TOLERANCE_M} m and no NEW collision")
     lines.append(
         "(a contact count above this arm's measured RESET-pose baseline -- see 'Baseline finding' below)."
     )
     lines.append("")
     lines.append(
         f"Measured baseline (contacts involving each arm's geoms at reset(seed={SEED}), "
-        "before any IK solve): "
+        "before any IK solve, now AT THE HOME POSE): "
         + ", ".join(f"arm {arm}={n}" for arm, n in baseline_contacts.items())
     )
     lines.append("")
@@ -270,57 +320,65 @@ def main() -> int:
     lines.append("")
     lines.append(f"**Overall: {'ALL PASS' if all_passed else 'AT LEAST ONE FAILURE'}**")
     lines.append("")
-    lines.append("## Baseline finding (separate from this probe's pass/fail; not fixed here)")
+    lines.append("## Baseline finding, now fixed (was 'not fixed here' in the section above)")
     lines.append("")
     lines.append(
-        "At `reset(seed=0)`, BEFORE any IK solve runs, arm A and arm B's default rest "
-        "poses already substantially interpenetrate -- e.g. `armA_lower_arm` vs. "
-        "`armB_wrist` at up to ~6 cm penetration depth (measured via a one-off contact "
-        "dump, not committed). This is independent of both fixes in this module (the "
-        "drawer position and the IK pinch-point retarget) and independent of the target "
-        "requested: it is a property of the compiled model's default qpos alone. This "
-        "probe's collision check is defined as a DELTA against this measured baseline "
-        "(see `_baseline_arm_contacts`) specifically so that this pre-existing, "
-        "out-of-scope condition does not make every single target look like a "
-        "solve-caused collision. Flagged here for the planner/compliance-reviewer as a "
-        "genuine, separate finding -- ADR-021's ~0.30 m reach / 0.50 m base-gap layout "
-        "assumption was never checked against the actual compiled rest pose, and this is "
-        "that check, arriving late."
+        "At `reset(seed=0)`, BEFORE any IK solve runs, the OLD default rest pose (all "
+        "arm joints at 0 rad) put arm A and arm B up to ~6 cm deep into each other "
+        "(29 of 34 total contacts were armA<->armB, deepest -0.0597 m, "
+        "`armA_wrist` vs. `armB_wrist`). This was independent of the drawer position and "
+        "the IK pinch-point retarget: it was a property of the compiled model's default "
+        "qpos alone. **This is now fixed** by the \"home\" keyframe (ARCHITECTURE.md "
+        "ADR-026): the measured baseline above, taken at the new reset pose, shows "
+        + ", ".join(f"arm {arm}={n}" for arm, n in baseline_contacts.items())
+        + " cross/self contacts. ADR-021's ~0.30 m reach / 0.50 m base-gap layout "
+        "assumption was never checked against the actual compiled rest pose; this probe "
+        "is that check, and the envelope below is the first one measured from a valid pose."
     )
     lines.append("")
 
-    envelope = None
-    if drawer_failed:
+    lines.append(
+        "## Reachable envelope, re-measured from the home pose (always run this pass, "
+        "per ADR-026 Step 2 -- not gated on primary-probe failure)"
+    )
+    lines.append("")
+    envelope = run_envelope_sweep(env)
+    lines.append(
+        f"Grid: x in {GRID_X.tolist()}, y in {GRID_Y.tolist()}, "
+        f"z in {[float(v) for v in GRID_Z]} m steps=0.02 "
+        "(residual < tolerance only; collision not checked for the sweep -- see script docstring)."
+    )
+    lines.append("")
+    for arm in ARMS:
+        lines.append(f"- **Arm {arm}**: {_summarize_envelope(envelope[arm])}")
+    lines.append("")
+
+    band = _shared_band(envelope)
+    if band is None:
         lines.append(
-            "## Closed-drawer-face probe FAILED for at least one arm -- per instruction, "
-            "no second scene guess. Reachable envelope measured instead."
+            "**No shared handoff band**: arm A's and arm B's reachable y-ranges do not "
+            "overlap at all in this sweep."
         )
-        lines.append("")
-        envelope = run_envelope_sweep(env)
-        lines.append(
-            f"Grid: x in {GRID_X.tolist()}, y in {GRID_Y.tolist()}, z in {GRID_Z.tolist()} "
-            "(residual < tolerance only; collision not checked for the sweep -- see script docstring)."
-        )
-        lines.append("")
-        for arm in ARMS:
-            lines.append(f"- **Arm {arm}**: {_summarize_envelope(envelope[arm])}")
-        lines.append("")
-        lines.append("| arm | x | y | z |")
-        lines.append("|---|---:|---:|---:|")
-        for arm in ARMS:
-            for x, y, z in envelope[arm]:
-                lines.append(f"| {arm} | {x:.2f} | {y:.2f} | {z:.2f} |")
-        lines.append("")
     else:
         lines.append(
-            "Closed-drawer-face probe passed for both arms; no envelope sweep was needed "
-            "(per instruction, only run on failure)."
+            f"**Shared handoff band (y-range intersection): y in [{band[0]:.2f}, {band[1]:.2f}] m.**"
         )
-        lines.append("")
+    lines.append("")
+
+    lines.append("| arm | x | y | z |")
+    lines.append("|---|---:|---:|---:|")
+    for arm in ARMS:
+        for x, y, z in envelope[arm]:
+            lines.append(f"| {arm} | {x:.2f} | {y:.2f} | {z:.2f} |")
+    lines.append("")
 
     report = "\n".join(lines) + "\n"
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(report, newline="\n")
+    # APPEND, do not overwrite (ADR-026 Step 2): the section(s) already in
+    # this file are the historical record of why this re-measurement
+    # exists and must survive this run.
+    existing = REPORT_PATH.read_text() if REPORT_PATH.exists() else ""
+    REPORT_PATH.write_text(existing + report, newline="\n")
 
     print(report)
     print(f"(report written to {REPORT_PATH})")

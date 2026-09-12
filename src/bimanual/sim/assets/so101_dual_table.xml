@@ -144,30 +144,42 @@
       <geom name="table_leg_br" type="cylinder" size="0.018 0.165" pos="0.35 0.20 0.165" material="table_material"/>
     </body>
 
-    <!-- Drawer (prismatic joint). A small cabinet tucked under the tabletop
-         near arm A's edge (y=-0.25). The drawer body slides out along -y
-         (towards arm A) on a slide joint; housing walls are static geoms
-         with no joint.
+    <!-- Drawer (prismatic joint). A small cabinet tucked under the
+         tabletop, near the table's y-centre (see ADR-026 below). The
+         drawer body slides out along -y on a slide joint; housing walls
+         are static geoms with no joint.
 
          ADR-025 (M06a reachability fix): housing moved from y=-0.05 to
-         y=-0.17 (12 cm outward). At y=-0.05 the CLOSED drawer face sat at
-         y=-0.13 -- 12 cm inboard of the table edge (y=-0.25), entirely
-         enclosed under the solid table_top slab with no approach path
-         from outside, which is why open_drawer failed in M06a (verified
-         by contact inspection, DECISIONS.md M06a entry). At y=-0.17, the
-         closed face is at y=-0.17-0.08=-0.25, flush with the table edge.
-         Housing half-depth in y is 0.10, so the housing itself spans
-         y=-0.27..-0.07 -- it overhangs the table edge (y=-0.25) by 2 cm.
-         Accepted: real drawer fronts commonly overhang their cabinet's
-         edge by a similar margin, and it does not intersect any other
-         geometry (housing z spans ~0.23..0.33, stopping at the tabletop
-         underside 0.33..0.35; arm bases mount ON TOP at z=0.35). Fully
-         open (drawer_slide=0.15), the drawer body centre reaches y=-0.32
-         and its face y=-0.40, protruding 15 cm past the table edge --
-         legible from drawer_view (see DRAWER_CAM_TARGET above), which is
-         the whole point: the drawer must be visibly and physically
-         reachable from outside the table footprint. -->
-    <body name="drawer_housing" pos="0 -0.17 0.28">
+         y=-0.17 (12 cm outward) so the closed face sat flush with the
+         table edge (y=-0.25) instead of tucked under the slab with no
+         approach path (verified by contact inspection, DECISIONS.md M06a
+         entry).
+
+         ADR-026 correction (Sept 12, 2026): y=-0.25 turned out to be
+         OUTSIDE both arms' reachable envelope once re-measured from the
+         corrected "home" rest pose (residuals 0.32 m / 0.18 m against a
+         0.01 m tolerance -- see docs/hardware/m06-reachability-probe.md's
+         "RE-MEASURED (ADR-026)" section). ADR-025 moved the wrong axis:
+         the real constraint was height, and z=0.28 (unchanged since
+         ADR-025) already fits between the reachable floor and the
+         tabletop underside (0.33) -- it just needed to sit over a y where
+         the arms' envelope actually reaches that low. Housing now sits at
+         y=DRAWER_HOUSING_Y=0.08, putting the CLOSED face at y=0.0 (table
+         centre), where both arms' IK converges (residual ~0.009 m each,
+         within the measured envelope). Housing z (0.28) and dimensions
+         are unchanged from ADR-025 -- only the y position moved.
+
+         Traded away by this move, reported rather than hidden: at
+         y=-0.17 the OPEN drawer protruded 15 cm past the table edge,
+         legible from drawer_view. At y=0.08 the open drawer (slide=0.15,
+         housing_y - 0.15 = -0.07, face -0.15) stays entirely under the
+         tabletop footprint (table spans y in [-0.25, 0.25]) -- the
+         open/closed states are still visually distinguishable via the
+         drawer_view camera (the box's colour and its distance from the
+         housing's back wall both change), but the "pops out past the
+         table" framing from ADR-025 no longer applies. See ARCHITECTURE.md
+         ADR-026 for the full reachability-vs-visibility trade-off. -->
+    <body name="drawer_housing" pos="0 0.0800 0.2800">
       <geom name="drawer_housing_bottom" type="box" size="0.12 0.10 0.005" pos="0 0 -0.045" material="drawer_material"/>
       <geom name="drawer_housing_back" type="box" size="0.12 0.005 0.05" pos="0 0.095 0" material="drawer_material"/>
       <geom name="drawer_housing_left" type="box" size="0.005 0.10 0.05" pos="-0.115 0 0" material="drawer_material"/>
@@ -181,30 +193,30 @@
     <!-- Manipulable props (free joints). All placed within the arms'
          overlapping reach band, y in [-0.05, 0.08], resting on the table
          surface (z=0.35). -->
-    <body name="plate" pos="-0.15 0.00 0.356">
+    <body name="plate" pos="-0.1500 0.0000 0.3560">
       <freejoint name="plate_free"/>
       <geom name="plate_geom" type="cylinder" size="0.09 0.006" mass="0.15" material="plate_material" friction="0.9 0.005 0.0001"/>
     </body>
 
-    <body name="mug" pos="0.05 -0.03 0.39">
+    <body name="mug" pos="0.0500 -0.0300 0.3900">
       <freejoint name="mug_free"/>
       <geom name="mug_body" type="cylinder" size="0.035 0.04" mass="0.22" material="mug_material" friction="0.9 0.005 0.0001"/>
       <geom name="mug_handle" type="capsule" size="0.008" fromto="0.035 0 0.01 0.06 0 -0.01" mass="0.02" material="mug_handle_material" friction="0.9 0.005 0.0001"/>
     </body>
 
-    <body name="fork" pos="-0.05 0.05 0.356">
+    <body name="fork" pos="-0.0500 0.0500 0.3560">
       <freejoint name="fork_free"/>
       <geom name="fork_handle" type="capsule" size="0.004" fromto="-0.06 0 0 0.03 0 0" mass="0.02" material="fork_material" friction="0.5 0.003 0.0001"/>
       <geom name="fork_head" type="box" size="0.025 0.012 0.003" pos="0.055 0 0" mass="0.01" material="fork_material" friction="0.5 0.003 0.0001"/>
     </body>
 
-    <body name="spoon" pos="0.00 0.08 0.356">
+    <body name="spoon" pos="0.0000 0.0800 0.3560">
       <freejoint name="spoon_free"/>
       <geom name="spoon_handle" type="capsule" size="0.004" fromto="-0.06 0 0 0.035 0 0" mass="0.018" material="spoon_material" friction="0.5 0.003 0.0001"/>
       <geom name="spoon_bowl" type="ellipsoid" size="0.018 0.012 0.004" pos="0.05 0 0" mass="0.012" material="spoon_material" friction="0.5 0.003 0.0001"/>
     </body>
 
-    <body name="water_bottle" pos="0.22 0.00 0.44">
+    <body name="water_bottle" pos="0.2200 0.0000 0.4400">
       <freejoint name="water_bottle_free"/>
       <geom name="water_bottle_body" type="cylinder" size="0.03 0.09" mass="0.30" material="bottle_material" friction="0.7 0.004 0.0001"/>
       <geom name="water_bottle_cap" type="cylinder" size="0.012 0.01" pos="0 0 0.10" mass="0.01" material="bottle_material" friction="0.7 0.004 0.0001"/>
@@ -365,7 +377,7 @@
          once at the drawer's CLOSED rest position (DRAWER_CAM_TARGET), so
          the background stays fixed and the drawer visibly slides toward
          the camera as drawer_slide goes from 0 to 0.15. -->
-    <camera name="drawer_view" pos="0.0000 -0.5500 0.1500" xyaxes="1.0000 0.0000 0.0000 0.0000 -0.3237 0.9462" fovy="50"/>
+    <camera name="drawer_view" pos="0.0000 -0.5500 0.1500" xyaxes="1.0000 0.0000 0.0000 0.0000 -0.2021 0.9794" fovy="50"/>
   </worldbody>
 
   <actuator>
@@ -382,6 +394,20 @@
     <position class="sts3215" name="armB_wrist_roll" joint="armB_wrist_roll" forcerange="-3.35 3.35" ctrlrange="-2.74385 2.84121" />
     <position class="sts3215" name="armB_gripper" joint="armB_gripper" forcerange="-3.35 3.35" ctrlrange="-0.17453 1.74533" />
   </actuator>
+
+  <!-- "home" keyframe (ADR-026): both arms folded back (shoulder_lift=-1.2,
+       elbow_flex=-1.6 rad, identical sign on both arms -- NOT mirrored;
+       measured to be the symmetric, collision-free fold, see the HOME_*
+       comment block above), gripper open, drawer closed, props at their
+       initial rest positions. `TableSettingEnv.reset()` applies this key
+       via mj_resetDataKeyframe instead of leaving qpos at the upstream
+       default (all-zero joint angles), which measurably put both arms'
+       rest pose 34 total contacts deep into each other (29 armA<->armB,
+       deepest -0.0597 m) -- the two arms' own extended-forward default
+       posture, not any prop or the drawer, was the collision source. -->
+  <keyframe>
+    <key name="home" qpos="0.000000 -0.150000 0.000000 0.356000 1.000000 0.000000 0.000000 0.000000 0.050000 -0.030000 0.390000 1.000000 0.000000 0.000000 0.000000 -0.050000 0.050000 0.356000 1.000000 0.000000 0.000000 0.000000 0.000000 0.080000 0.356000 1.000000 0.000000 0.000000 0.000000 0.220000 0.000000 0.440000 1.000000 0.000000 0.000000 0.000000 0.000000 -1.200000 -1.600000 0.000000 0.000000 1.745329 0.000000 -1.200000 -1.600000 0.000000 0.000000 1.745329"/>
+  </keyframe>
 
   <equality/>
 </mujoco>
