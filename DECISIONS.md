@@ -11,6 +11,47 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06a grasp fix C — max closure force / ctrlrange-exact ctrl target; INSUFFICIENT, and not actually exercised
+
+**Recorded:** Sept 12, 2026 · **Follows:** M06a grasp fix B (insufficient,
+physically unsound for a top-centre approach)
+
+**What changed.** Read-only per the task's instruction:
+`scenes/so101/so101_new_calib.xml:162`'s gripper actuator --
+`<position class="sts3215" name="gripper" joint="gripper"
+forcerange="-3.35 3.35" ctrlrange="-0.17453 1.74533"/>` -- was READ, not
+edited. `_gripper_ctrl()` in `src/bimanual/control/skills_scripted.py` now
+computes the closed/open ctrl targets from the compiled model's
+`actuator_ctrlrange` for the gripper actuator, instead of from the
+joint's `jnt_range` as before -- numerically almost identical
+(`jnt_range` -0.17453297762778586..1.7453291995659765 vs. `ctrlrange`
+the same value rounded to 5 decimals) but `ctrlrange` is the value MuJoCo
+actually clamps a commanded `ctrl` entry against (`autolimits="true"`
+makes this actuator ctrl-limited), so `GRIPPER_CLOSE_FRACTION=0.0` now
+drives ctrl to the actuator's own declared closure limit exactly, with no
+possible daylight. The position actuator's gain (`kp=998.22`, unmodified
+upstream `sts3215` default class, ADR-016) is already the model's only
+available gain and was not changed -- there is no separate "gain" input
+to raise beyond it without editing the default class, which was not part
+of this fix. `GRIP_HOLD_FRAMES` raised 30 -> 60 per the task's
+instruction.
+
+**Result, measured on bm-ptl: INSUFFICIENT, and reported honestly as NOT
+actually having exercised the mechanism this fix targets.**
+`pick(A, plate)`: `waypoint 1 (approach) failed [convergence (IK
+residual=0.0226 m >= 0.01 m)]`, `frames_used=500`, `plate z:
+initial=0.3560 final=0.3506 delta=-0.0054`, no MuJoCo warnings. This is
+the SAME failure fix B already produced -- the skill still never reaches
+the GRIP waypoint at all, because fix B's top-centre approach point does
+not kinematically converge for arm A. Fix C's actual content (closure
+force / hold duration) therefore never ran on this scene: there is no
+GRIP dwell for it to affect. `pytest tests/test_skills.py`: 4 failed / 4
+passed, identical to fixes A and B -- no regression, no tunneling.
+
+Per the task's fix ladder, proceeding to Fix D (fine collision geom).
+
+---
+
 ## M06a grasp fix B — plate grasp-point moved to the top-centre; INSUFFICIENT and physically unsound
 
 **Recorded:** Sept 12, 2026 · **Follows:** M06a grasp fix A (insufficient)

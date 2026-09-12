@@ -213,7 +213,15 @@ APPROACH_DESCENT_STEPS = 500
 #: with the jaw still partway through its commanded travel; grasp-quality
 #: tuning is ADR-024's open follow-up, out of this module's scope, and this
 #: value is the one the task instructions specify.
-GRIP_HOLD_FRAMES = 30
+#:
+#: **M06a grasp fix C: raised 30 -> 60** so more force/settling time is
+#: available before the dwell ends, per the task's fix ladder. (ADR-027's
+#: own diagnostic had already tried extending the dwell informally to 300
+#: steps with no effect -- see DECISIONS.md's fix A/B entries -- so this
+#: 60-step value is not expected alone to change the outcome; it is applied
+#: because the task specifies it as part of fix C, alongside driving ctrl
+#: to the actuator's own closure limit below.)
+GRIP_HOLD_FRAMES = 60
 
 #: ADR-027. How far, in metres, `open_drawer`'s PULL waypoint drags the
 #: drawer along `drawer_slide`'s axis (`(0, -1, 0)`) -- chosen to match the
@@ -345,10 +353,30 @@ def _site_id(model, name: str) -> int:
 
 
 def _gripper_ctrl(model, arm: str, fraction: float) -> float:
-    """Map a 0..1 fraction to an absolute ctrl value within `armX_gripper`'s
-    joint range (see `GRIPPER_OPEN_FRACTION`/`GRIPPER_CLOSE_FRACTION`)."""
-    jid = _joint_id(model, ik.gripper_joint_name(arm))
-    lo, hi = model.jnt_range[jid]
+    """Map a 0..1 fraction to an absolute ctrl value.
+
+    **M06a grasp fix C.** Reads the gripper ACTUATOR's own `ctrlrange` (the
+    compiled model's copy of `scenes/so101/so101_new_calib.xml:162`'s
+    `<position class="sts3215" name="gripper" ... ctrlrange="-0.17453
+    1.74533"/>` -- read-only, per the task's explicit instruction; that
+    file is never edited) rather than the joint's `jnt_range` this
+    function used before. The two are numerically almost identical
+    (`jnt_range` is -0.17453297762778586..1.7453291995659765, `ctrlrange`
+    is the same value rounded to 5 decimals in the upstream XML), but
+    `ctrlrange` is the value MuJoCo actually clamps a commanded `ctrl`
+    entry against (the scene's `<compiler autolimits="true">` makes this
+    position actuator ctrl-limited), so it is the literally correct source
+    for "drive ctrl to the closure limit": at `fraction=0.0`
+    (`GRIPPER_CLOSE_FRACTION`) this now returns the actuator's own low
+    `ctrlrange` bound exactly, with no possible daylight between the
+    commanded value and the actuator's declared closure limit. The
+    position actuator's gain (`kp=998.22`, from the unmodified upstream
+    `sts3215` default class, ADR-016) is already the model's only
+    available gain for this actuator -- "maximum available gain" per the
+    task's fix C -- and is not modified here.
+    """
+    aid = _actuator_id(model, ik.gripper_joint_name(arm))
+    lo, hi = model.actuator_ctrlrange[aid]
     return float(lo + fraction * (hi - lo))
 
 
