@@ -11,6 +11,71 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06a grasp fix D — fine collision geom on jaw tips; INSUFFICIENT, and not actually exercised; all four fixes now applied and none succeeded
+
+**Recorded:** Sept 12, 2026 · **Follows:** M06a grasp fix C (insufficient,
+not exercised) · **Deliberate deviation from:** ADR-021's byte-faithful
+upstream body-tree copy (same class of deviation as fix A, here in
+collision geometry rather than a friction constant)
+
+**What changed.** `scripts/gen_dual_scene.py` gained
+`apply_fine_jaw_collision()`, run in the generator over the copied
+`armA_`/`armB_` subtrees only -- never `scenes/so101/`
+(`git diff --stat -- scenes/so101/` empty, verified again before this
+commit). For each arm it: (1) disables the two bulky, full-MESH jaw
+COLLISION geoms identified in fix A (`wrist_roll_follower_so101_v1` on
+body `{prefix}gripper`, `moving_jaw_so101_v1` on body
+`{prefix}moving_jaw_so101_v1`) by setting `contype="0" conaffinity="0"`
+on them -- the SAME convention this scene already uses for
+`class="visual"` geoms, so they simply stop participating in contacts;
+their `class="visual"` counterparts (what actually renders) are
+untouched; (2) adds one new small sphere collision geom (radius 0.015 m,
+`FINE_JAW_TIP_RADIUS_M`) at each jaw body's own local origin -- the SAME
+point `ik.py`'s pinch-point solver targets (ADR-025: the midpoint of the
+fixed and moving jaw bodies' `xpos`) -- carrying forward fix A's
+`friction="1.5 0.1 0.001"`.
+
+**Why.** ADR-024 measured the jaw's collision MESH geoms at a
+bounding-sphere radius (`geom_rbound`) up to ~8.4 cm -- large relative to
+the plate (radius 0.09 m, 1.2 cm thick) -- a plausible reason the arm
+contacts/displaces the object well before a true pinch can form. A small
+sphere at the exact point the solver targets removes that size mismatch.
+
+**Result, measured on bm-ptl: INSUFFICIENT, and -- reported honestly, as
+with fix C -- this fix's own mechanism was NOT actually exercised.**
+`pick(A, plate)`: identical failure to fixes B and C --
+`waypoint 1 (approach) failed [convergence (IK residual=0.0226 m >=
+0.01 m)]`, `frames_used=500`, `plate z: initial=0.3560 final=0.3506
+delta=-0.0054`, no MuJoCo warnings. `pytest tests/test_skills.py`: 4
+failed / 4 passed, identical to fixes A-C -- no regression, no
+tunneling; the scene still compiles and runs cleanly with the new tip
+geoms in place.
+
+**Confound, flagged plainly rather than glossed over.** Because these
+four fixes were applied cumulatively, in the order the task specified,
+fix B's top-centre plate offset (itself already reported insufficient
+and physically unsound) is still in effect for fixes C and D, and it is
+THAT offset -- not fix C's closure force or fix D's collision geometry --
+that is causing the waypoint-1 convergence failure both share. Neither
+fix C's nor fix D's own hypothesis (closure force; collision-geometry
+size mismatch) was actually put to a fair test on this scene: both would
+require the arm to first reach the GRIP waypoint, which it never did
+after fix B. This is reported as a limitation of the fix ladder as
+executed, per the task's explicit instruction to iterate in this exact
+order and stop only at the first success or after all four -- not as a
+claim that fixes C or D are individually disproven. A follow-up that
+re-tests C and/or D against the ORIGINAL rim offset (fix A's baseline,
+before fix B) would isolate this properly, but is a fifth action beyond
+this task's four-fix ladder and is not attempted here without approval.
+
+**All four fixes applied, none succeeded `pick(A, plate)`.** Per the
+task's "IF ALL FOUR FAIL" instruction, `pick(A, mug)` and `pick(A,
+bottle)` are run next as a genuinely informative diagnostic (are taller,
+easier-to-pinch objects liftable at all with this same control stack?),
+then this task stops without a fifth fix, per instruction.
+
+---
+
 ## M06a grasp fix C — max closure force / ctrlrange-exact ctrl target; INSUFFICIENT, and not actually exercised
 
 **Recorded:** Sept 12, 2026 · **Follows:** M06a grasp fix B (insufficient,

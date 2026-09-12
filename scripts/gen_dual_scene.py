@@ -317,6 +317,83 @@ JAW_COLLISION_MESHES = {
     "moving_jaw_so101_v1",
 }
 
+# ---- M06a grasp fix D: fine collision geom on jaw tips (ADR-027 follow-up) --
+# **Deliberate, documented deviation from upstream, same class as fix A
+# above.** ADR-021 copies the upstream body tree byte-faithfully; this is
+# the second place (after fix A's friction change) the generated COPY is
+# allowed to differ from upstream in a physical property -- here, collision
+# GEOMETRY rather than a material constant. Still does not touch DoF or
+# kinematics (ADR-016 is unaffected: no joint is added, removed or
+# re-ranged), and still never touches `scenes/so101/` itself (verified:
+# `git diff --stat -- scenes/so101/` is empty after this change).
+#
+# Why: fixes A-C (jaw friction, plate grasp-point offset, closure
+# force/ctrl-limit) all left `pick(A, plate)` failing to lift the plate
+# (see DECISIONS.md). ADR-024 already measured why the jaw's collision
+# geometry itself is a plausible contributor: the jaw's own collision MESH
+# geoms have a bounding-sphere radius (`model.geom_rbound`) of up to
+# ~8.4 cm -- large relative to the plate (radius 0.09 m but only 1.2 cm
+# thick) -- so a `pick` descend was measured to make first contact well
+# before the jaws could close around a true pinch point, plausibly
+# displacing or only grazing the object rather than gripping it.
+#
+# Fix: replace the two bulky, full-MESH collision geoms with a small
+# sphere (radius FINE_JAW_TIP_RADIUS_M) at each jaw body's own origin --
+# the SAME point `ik.py`'s pinch-point solver targets (ADR-025: the
+# midpoint of the fixed and moving jaw bodies' `xpos`) -- so the arm's
+# collision volume near the object is no longer far larger than the
+# object itself. The bulky mesh COLLISION geoms are NOT deleted (so the
+# compiled model still documents what they physically are); their
+# `contype`/`conaffinity` are set to 0, the same convention this scene
+# already uses for `class="visual"` geoms, so they simply stop
+# participating in contacts. The `class="visual"` copies of the same
+# meshes -- what actually gets RENDERED -- are completely untouched.
+FINE_JAW_TIP_RADIUS_M = "0.015"
+
+
+def apply_fine_jaw_collision(arm_root, prefix: str) -> int:
+    """M06a grasp fix D. Disables the two bulky jaw MESH collision geoms
+    (see `JAW_COLLISION_MESHES` above) in this already-renamed arm subtree
+    and adds one small sphere collision geom at each jaw body's own local
+    origin instead (fixed jaw body `{prefix}gripper`, moving jaw body
+    `{prefix}moving_jaw_so101_v1` -- matching `ik.fixed_jaw_body_name`/
+    `ik.moving_jaw_body_name`). Returns the number of new tip geoms added
+    (expected 2); raises if either body cannot be found, so a naming
+    mismatch fails loudly instead of silently shipping a no-op fix.
+    """
+    disabled = 0
+    for geom in arm_root.iter("geom"):
+        if geom.get("class") == "collision" and geom.get("mesh") in JAW_COLLISION_MESHES:
+            geom.set("contype", "0")
+            geom.set("conaffinity", "0")
+            disabled += 1
+    if disabled != 2:
+        raise ValueError(
+            f"{prefix}: expected to disable exactly 2 bulky jaw collision geoms "
+            f"(fixed + moving), disabled {disabled} -- JAW_COLLISION_MESHES may no "
+            f"longer match the upstream asset's mesh names"
+        )
+
+    added = 0
+    for body_suffix in ("gripper", "moving_jaw_so101_v1"):
+        body_name = prefix + body_suffix
+        target_body = None
+        for body in arm_root.iter("body"):
+            if body.get("name") == body_name:
+                target_body = body
+                break
+        if target_body is None:
+            raise ValueError(f"body {body_name!r} not found while adding fine jaw collision geom")
+        tip = ET.SubElement(target_body, "geom")
+        tip.set("name", f"{body_name}_jaw_tip_collision")
+        tip.set("type", "sphere")
+        tip.set("size", FINE_JAW_TIP_RADIUS_M)
+        tip.set("pos", "0 0 0")
+        tip.set("class", "collision")
+        tip.set("friction", JAW_FRICTION)
+        added += 1
+    return added
+
 
 def _fmt_pos(pos):
     return "%.4f %.4f %.4f" % pos
@@ -460,6 +537,19 @@ def main():
             f"{prefix}: expected to raise friction on exactly 2 jaw collision geoms "
             f"(fixed + moving), found {n_changed} -- JAW_COLLISION_MESHES may no "
             f"longer match the upstream asset's mesh names"
+        )
+
+    # M06a grasp fix D: fine collision geom on jaw tips (see the
+    # FINE_JAW_TIP_RADIUS_M comment block above). Runs AFTER fix A so the
+    # new tip geoms inherit JAW_FRICTION directly; fix A's now-disabled
+    # bulky mesh collision geoms keep their (inert) friction attribute
+    # rather than having it stripped back out, which is harmless and
+    # keeps this diff additive rather than partially reverting fix A.
+    for arm_root, prefix in ((arm_a, "armA_"), (arm_b, "armB_")):
+        n_added = apply_fine_jaw_collision(arm_root, prefix)
+        assert n_added == 2, (
+            f"{prefix}: expected to add exactly 2 fine jaw tip collision geoms "
+            f"(fixed + moving), added {n_added}"
         )
 
     # Wrist camera: a bare <camera>, no mesh geometry. so101_new_calib_camera.xml
