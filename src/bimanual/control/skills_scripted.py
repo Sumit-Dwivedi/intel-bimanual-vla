@@ -418,6 +418,39 @@ def _write_arm_ctrl(ctrl: np.ndarray, model, arm: str, joint_angles, gripper_ctr
     ctrl[_actuator_id(model, ik.gripper_joint_name(arm))] = gripper_ctrl
 
 
+#: ADR-027 Step 5. How many CONSECUTIVE steps the same prop must register a
+#: violation (`_prop_collision_violations`) before `_drive_to_target`/
+#: `_dwell` treat it as a confirmed, reportable knock rather than a single
+#: transient contact-solver-scale graze. Found necessary empirically (see
+#: `_drive_to_target`'s docstring): 1 step (no debounce) caught the
+#: `pick(A, bottle)` knock correctly but ALSO tripped on `pick(A, plate)`'s
+#: ordinary approach, breaking a required regression test. 3 is short
+#: enough that a real, escalating knock is still caught within a handful of
+#: physics steps -- nowhere near enough for an object to travel any real
+#: distance -- while filtering a single-frame graze that does not recur.
+PROP_COLLISION_DEBOUNCE_STEPS = 3
+
+
+def _debounce_prop_violations(consecutive: dict[str, int], violations: dict[str, float]) -> dict[str, float]:
+    """Update `consecutive` (a per-prop running count, mutated in place) from
+    this step's `violations` and return only the subset that has now been
+    seen on `PROP_COLLISION_DEBOUNCE_STEPS` consecutive steps -- i.e. the
+    CONFIRMED violations this step should act on. A prop absent from
+    `violations` this step has its counter reset to 0 (the knock must be
+    consecutive, not merely cumulative over a whole waypoint).
+    """
+    confirmed: dict[str, float] = {}
+    seen = set(violations)
+    for prop_name in list(consecutive):
+        if prop_name not in seen:
+            consecutive[prop_name] = 0
+    for prop_name, depth in violations.items():
+        consecutive[prop_name] = consecutive.get(prop_name, 0) + 1
+        if consecutive[prop_name] >= PROP_COLLISION_DEBOUNCE_STEPS:
+            confirmed[prop_name] = depth
+    return confirmed
+
+
 def _drive_to_target(
     env,
     arm: str,
@@ -449,6 +482,21 @@ def _drive_to_target(
     while the geoms are still interpenetrating, and stops driving further
     steps immediately rather than continuing to push into (or having
     already flung away) the prop.
+
+    **Debounced over `PROP_COLLISION_DEBOUNCE_STEPS` consecutive steps,
+    found necessary empirically, not assumed.** A single-step version of
+    this check (no debounce) also tripped on `pick(A, plate)`'s ordinary
+    APPROACH -- a single-frame graze against Fix E's raised dish rim while
+    the arm was still in transit toward the hover point, well short of the
+    bottle's actual multi-step, escalating impact -- which broke the
+    required regression test `test_pick_plate_waypoints_progress_without_
+    collision` (DECISIONS.md records both measurements). Requiring the SAME
+    prop to register a violation on `PROP_COLLISION_DEBOUNCE_STEPS`
+    consecutive steps (not merely one) filters a single transient
+    contact-solver-scale graze while still catching a real, sustained or
+    worsening knock within a handful of steps -- far short of a waypoint's
+    full step budget and long before an object can be flung any real
+    distance.
     """
     if max_steps <= 0:
         return False, 0, {}
@@ -458,6 +506,7 @@ def _drive_to_target(
     gripper_ctrl = _gripper_ctrl(env.model, arm, gripper_fraction)
 
     steps = 0
+    consecutive: dict[str, int] = {}
     while steps < max_steps:
         solution = ik.solve_position_ik(env.model, env.data, arm, target)
         ctrl = _hold_ctrl(env)
@@ -466,8 +515,9 @@ def _drive_to_target(
         steps += 1
 
         prop_violations = _prop_collision_violations(env)
-        if prop_violations:
-            return False, steps, prop_violations
+        confirmed = _debounce_prop_violations(consecutive, prop_violations)
+        if confirmed:
+            return False, steps, confirmed
 
         actual = env.data.site_xpos[site_id]
         if np.linalg.norm(target - actual) < pos_tol:
@@ -499,6 +549,7 @@ def _dwell(
     """
     gripper_ctrl = _gripper_ctrl(env.model, arm, gripper_fraction)
     target = np.asarray(hold_pos, dtype=np.float64).reshape(3)
+    consecutive: dict[str, int] = {}
     for i in range(n_steps):
         solution = ik.solve_position_ik(env.model, env.data, arm, target)
         ctrl = _hold_ctrl(env)
@@ -512,12 +563,15 @@ def _dwell(
         # violent, unintended knock against a THIRD prop (or the target
         # itself well past a controlled pinch depth, if `target_object` is
         # not supplied) is still caught; the intended pinch itself is not
-        # penalised for the same contact it exists to make.
+        # penalised for the same contact it exists to make. Also debounced
+        # (see `PROP_COLLISION_DEBOUNCE_STEPS`), same rationale as
+        # `_drive_to_target`.
         violations = _prop_collision_violations(env)
         if target_object is not None:
             violations = {k: v for k, v in violations.items() if k != OBJECT_BODY_NAME.get(target_object)}
-        if violations:
-            return i + 1, violations
+        confirmed = _debounce_prop_violations(consecutive, violations)
+        if confirmed:
+            return i + 1, confirmed
     return n_steps, {}
 
 
