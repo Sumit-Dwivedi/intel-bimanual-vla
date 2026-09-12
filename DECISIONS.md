@@ -235,6 +235,12 @@ closed, as expected for a pinch point), the opposite of Fix D's
 identical-to-five-decimals failure. Both pad geoms genuinely move with
 their respective bodies.
 
+**Consequences.** Note: 6-132 mm is centre-to-centre distance between the
+2.5 mm cube pads. The surface-to-surface gap — what actually fits between
+the jaws — is smaller, measured at roughly 2.5 mm closed to 120 mm open via
+`mj_geomDistance`. Quote the surface figure in judge-facing material and
+say which quantity it is.
+
 **Step 4 — pick(A, ·) in force order, run on bm-ptl, reported exactly as
 measured, not softened.** `pytest tests/test_skills.py` first, to confirm no
 new regression from the generator change: **5 failed / 3 passed**,

@@ -1,3 +1,13 @@
+> **PRE-FIX baseline.** This is the GRIP trace BEFORE commit `279ca74` raised
+> the fork grasp offset by +4 mm and `GRIP_HOLD_FRAMES` from 60 to 300 — here
+> `grasp_point` z = 0.3560. The POST-FIX run is
+> `m06-grip-diagnostic-after-fix.md`, `grasp_point` z = 0.3600. Raising the
+> target 4 mm barely moved the lower pad (z ≈ 0.3510/0.3511/0.3512 here vs.
+> z ≈ 0.3509/0.3510/0.3511 there — essentially unchanged). Both runs report
+> `converged=False` at APPROACH, DESCEND and RETREAT (this waypoint summary,
+> below, and the post-fix file's own waypoint summary) — that is unchanged
+> by the fix, not introduced by it.
+
 # M06 GRIP-stage diagnostic: `pick(A, fork)`
 
 Diagnostic only -- no behaviour change. Produced by `scripts/probe_grip_stage.py`, which reproduces (does not instrument) `skills_scripted.run_pick`'s four waypoints for `pick(A, fork)` -- see that script's module docstring for exactly what is reproduced vs. imported, and the one documented way this could diverge from the real skill (no per-step collision early-exit in this probe's driving loop).

@@ -100,6 +100,31 @@ embedded in solid material on both sides and is forcibly ejected. This matches
 radius) is **~8.4 cm** (fixed side) and **~6.35 cm** (moving side) — large relative to
 every prop in this scene.
 
+**Reconciling this report's overlap numbers against `DECISIONS.md`'s ADR-028.** ADR-028
+also quotes a hull-overlap range for this same joint — **-0.03454 m closed to -0.02062 m
+at the least-overlapping angle** — which does not match the **-0.0139 m (least overlap,
+qpos ≈ +0.59 rad) to -0.0377 m (closed)** range measured directly above. Both numbers
+describe the same real, permanently-overlapping-hull phenomenon; they differ because they
+minimise `mj_geomDistance` over different geom-pair selections. This report's table (item
+5 above) explicitly uses **the one named pair** — the fixed jaw's collision geom
+(`wrist_roll_follower_so101_v1`) vs. the moving jaw's collision geom
+(`moving_jaw_so101_v1`) — swept across 11 angles, which is exactly the pair that forms the
+pinch a grasped object sits between. ADR-028's figure was instead produced by **minimising
+`mj_geomDistance` over all collidable jaw geom pairs** in the model — the specific method
+this report's own "Method" section (item 1, above) already flags as returning "the
+hinge-region overlap (the two jaw bodies' bounding volumes already overlap near the shared
+hinge), not the pinch gap." Because MuJoCo never generates contacts between directly
+connected parent/child bodies regardless of geometric overlap (item 4, above — the fixed
+jaw is the moving jaw's parent), that hinge-region overlap is not a location a grasped
+object could ever actually occupy, so a minimum taken over all pairs is not the
+mechanically meaningful number for describing why the pinch fails. **ADR-028's headline
+overlap figure is therefore superseded by this report's named-pair figure (-0.0139 m to
+-0.0377 m), because the named pair isolates the two geoms that actually bound the pinch,
+while the all-pairs minimum mixes in the (contact-inert) hinge region.** ADR-028's own
+numbers are left unchanged in `DECISIONS.md` — see that document for the fix (finger-pad
+primitives) this measurement motivated, cross-referenced here in full: `DECISIONS.md`,
+"ADR-028 — Finger-pad primitives (MuJoCo convex-hull fix)...".
+
 The dynamic sweep below uses the **least-overlap angle's nearest-point pair**
 (`mj_geomDistance`'s `fromto` output — actual nearest points on the two convex hulls, not
 a hinge-axis-locked or otherwise degenerate point) as its seed location. This is the best
