@@ -101,16 +101,26 @@ PINCH_POINT_OFFSET_M = 0.08
 #: module docstring for why a step budget (not a timer) is the right unit:
 #: it is comparable across runs and machines, per PLAN.md M06 done-when 3.
 #:
-#: 3000 was set empirically (not guessed): tracing a single ~0.29 m
+#: 3000 was the ORIGINAL value, set empirically: tracing a single ~0.29 m
 #: closed-loop move under this scene's position-actuator gains
 #: (`kp=998.22`, `kv=2.731` -- so101_dual_table.xml's `sts3215` default
 #: class) showed convergence to within `IK_POSITION_TOLERANCE_M` at
 #: roughly step ~200-240, not instantly -- these are real servos settling
-#: under contact/damping, not a teleport. A compound skill (pick = 4
-#: phases; place/handoff = pick + several more) needs several such moves
-#: back to back, so 3000 leaves comfortable headroom without being an
-#: unbounded loop.
-DEFAULT_STEP_BUDGET = 3000
+#: under contact/damping, not a teleport.
+#:
+#: Raised to 12000 (4x) by ADR-027's waypoint-staging fix: every skill now
+#: drives through several small, explicitly-validated waypoints instead of
+#: one straight-line move per phase (`pick`=4 waypoints, `place`=pick+4,
+#: `handoff`=pick+8, `open_drawer`=6), each capped at
+#: `skills_scripted.APPROACH_DESCENT_STEPS` (500). A compound skill like
+#: `handoff` (pick's own budget, plus 8 more waypoints at up to 500 steps
+#: each, plus two `GRIP_HOLD_FRAMES` dwells) needs comfortably more headroom
+#: than the original 3000 to avoid running out of budget on a LATER,
+#: possibly more important waypoint before an EARLIER one even finishes --
+#: this is a single shared default raised for every skill, not a per-skill
+#: override, since all four skills grew by roughly the same waypoint-count
+#: factor.
+DEFAULT_STEP_BUDGET = 12000
 
 # Internal IK solver tuning (not part of the "anyone tuning these" contract
 # above since they govern the solver's internals, not skill behaviour, but

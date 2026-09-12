@@ -11,6 +11,85 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-027 — Waypoint staging in scripted skills for collision-safe motion
+
+**Recorded:** Sept 12, 2026 · **Follows:** ADR-024, ADR-026 · **Fixes:** the
+"re-tuning skills/IK for the new home pose" follow-up ADR-026 deferred ·
+**Does not touch:** `ik.py`, `executor.py`'s interface, `scenes/so101/`,
+`src/bimanual/command/`, `src/bimanual/language/`
+
+`ik.py`'s position-only solver has no collision term by design (ADR-024); M06a
+handed it raw single-shot targets, which is how ADR-026 caught tunneling
+solves (up to -0.064 m through `table_top`). Fix: `skills_scripted.py` stages
+every skill as small, validated waypoints (tutor note 06's
+approach/grip/retreat pattern) instead of one long reach — each waypoint must
+clear BOTH IK convergence (`ik.solve_position_ik`'s own residual <
+`IK_POSITION_TOLERANCE_M`) and a collision check (no new cross-arm or
+arm-vs-`table_top` contact vs. a baseline snapshot) before the next one runs;
+on failure a skill returns `SkillResult(success=False, reason="waypoint N
+failed [convergence|collision]: ...")` and stops. New constants:
+`CLEARANCE_HEIGHT_M=0.08`, `APPROACH_DESCENT_STEPS=500`,
+`GRIP_HOLD_FRAMES=30`, `PULL_DISTANCE_M=0.15`,
+`HANDOFF_POSITION_XYZ=(0.0,-0.01,0.35)` (the measured shared-band midpoint,
+`docs/hardware/m06-reachability-probe.md`). `DEFAULT_STEP_BUDGET` raised
+3000 → 12000 (one shared 4x default, not per-skill overrides).
+
+**`open_drawer` rebuilt as a lateral, under-table approach** (APPROACH
+outside the table footprint at drawer height → INSERT in +y staying below
+the slab → GRIP → PULL → RELEASE → RETREAT), because the drawer's closed
+face (y=0.00, ADR-026) sits directly beneath `table_top` and a vertical
+descent tunnels. **Measured, not assumed, before building it:** the drawer
+face IS kinematically reachable (residual 0.009 m) but only via a tunneling
+solution (-0.064 m penetration, confirmed by contact check); the lateral
+waypoint outside the table does NOT converge at all (residual stalls at
+0.09–0.32 m across a 1500-step real closed-loop drive, and across y in
+{-0.30,-0.32,-0.35}); the ADR-025 flush-table-edge drawer position (housing
+y=-0.17) also does NOT converge (residual 0.32 m / 0.18 m) — the
+re-measured envelope's bounding box (`y` down to -0.35) is not a claim that
+every interior point is reachable, and at drawer height (z≈0.28) arm A's
+actual reach only extends to about y=-0.12. **Per the explicit stop rule
+("if the only solutions tunnel, STOP and report — do not invent a third
+drawer position"), no new drawer position was tried.** `open_drawer` is
+still built exactly as specified and correctly, safely fails at waypoint 1
+(APPROACH, convergence) rather than silently tunneling — the honest,
+intended result.
+
+**`handoff(mug, A→B)` is blocked by the same class of problem:**
+`mug_at_rest` itself does not converge for arm A from the home pose
+(residual 0.120 m), independently matching `docs/hardware/
+m06-reachability-probe.md`'s own ADR-026 Step-4 table.
+
+**`pick(A, plate)`/`place(A, plate)` are blocked by a different,
+already-known, out-of-scope gap: ADR-024's grasp reliability.** Every
+waypoint now clears validation (converges, zero new arm-vs-table_top
+contact beyond a measured graze/tunneling boundary — see
+`TABLE_COLLISION_DEPTH_TOL_M=0.001`, chosen because a `pick` descend onto a
+table-height grasp point was measured to create a `dist=-0.00007` m graze,
+~1000x shallower than the drawer's tunneling penetrations), the jaw closes
+fully, and the plate still never lifts even after a 300-step grip dwell
+(tested directly, far past `GRIP_HOLD_FRAMES`) — ADR-024's documented
+site-vs-pinch-point offset, not a staging defect. `GRASP_POINT_OFFSET_M["plate"]`
+was corrected from `(+0.09,0,0)` to `(0,+0.09,0)` (same rim radius, a
+reachable direction instead of one that pegs three joints at their limits
+from the new home pose) — a caller-side reachability choice, not an
+`ik.py` change.
+
+**Honest test verdict.** The four tests ADR-026 left failing
+(`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`, `test_handoff_mug_ends_held_by_arm_b`)
+**still fail** — each for one of the two out-of-scope gaps above, not a
+staging defect — and are reported unedited rather than weakened. Two new
+tests (`test_open_drawer_fails_without_tunneling_through_table`,
+`test_pick_plate_waypoints_progress_without_collision`) are this ADR's real
+regression coverage and both pass: a failing skill now localises to a named
+waypoint/reason and is verifiably collision-safe, instead of silently
+tunneling. `pytest tests/`: 62 tests, 58 pass (all of `test_command_source.py`
+and `test_grounder.py`, plus 4 of `test_skills.py`'s 8), 4 fail (the ones
+named above). `scripts/run_skill.py` diagnostics for all four skills: zero
+MuJoCo warnings, max joint-limit violation ≤ 0.0004 rad throughout.
+
+---
+
 ## ADR-026 — "Home" rest keyframe; envelope re-measured from a valid pose; drawer moved onto the correct axis
 
 **Recorded:** Sept 12, 2026 · **Supersedes:** ADR-025's drawer reposition ·

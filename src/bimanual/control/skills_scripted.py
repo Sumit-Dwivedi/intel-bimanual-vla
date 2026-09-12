@@ -2,11 +2,34 @@
 `handoff`. `pour` is M06b and is intentionally NOT implemented in this module
 -- see PLAN.md's POUR GATE and the M06a task scope.
 
+**ADR-027: waypoint staging, and why it exists.** `ik.solve_position_ik` is a
+position-only solver with NO obstacle/collision term (ADR-024) -- it happily
+returns a "converged" joint solution that swings the arm straight through the
+tabletop if that is the shortest path in joint space to the requested target.
+M06a originally handed each skill's FINAL target straight to the solver in
+one shot (e.g. "descend onto the grasp point" from wherever the arm currently
+was), which is exactly the failure ADR-026 caught: solves that converge
+kinematically while tunneling through `table_top`. The fix is not in the
+solver (out of scope, ADR-024/ADR-026 both say so explicitly) -- it is here,
+in the CALLER. Per `docs/learn/06-ik-and-skills.md` tutor note 06's
+approach -> grip -> retreat pattern, every skill below is staged as a
+sequence of small WAYPOINTS, each one a short, nearly-straight-line hop from
+the previous one (never a single long reach that could clip through solid
+geometry), and each one is validated BEFORE the skill is allowed to advance:
+  - IK convergence: the solver's own residual must be < `ik.IK_POSITION_TOLERANCE_M`.
+  - Collision: no NEW cross-arm or arm-vs-`table_top` contact versus a
+    baseline snapshot taken once, at the very start of the skill call, at
+    the actual (collision-free, ADR-026) starting pose.
+A waypoint that fails either bar stops the skill immediately -- later
+waypoints are never attempted on top of a bad one -- and returns
+`SkillResult(success=False, reason="waypoint N failed [convergence|collision]: ...")`
+so a failure localises to the exact stage that produced it.
+
 Every skill is a closed control loop, per docs/learn/06-ik-and-skills.md:
 read the current state (`env.model`/`env.data`, privileged per ADR-005 --
 the scripted controller has no perception step), pick the current subgoal,
 solve IK (`bimanual.control.ik.solve_position_ik`), write joint targets via
-`env.step()`, test whether the subgoal is met, advance or time out. Every
+`env.step()`, test whether the subgoal is met, advance or fail. Every
 function here returns a `SkillResult(success, reason, frames_used)`, where
 `frames_used` counts `env.step()` calls (the step-budget unit, not wall
 clock -- PLAN.md M06 done-when 3).
@@ -20,14 +43,16 @@ two different physical techniques are used, chosen per object:
     small graspable feature of each object (a rim edge, a handle) read from
     the object's own geom size in the compiled model (see
     `GRASP_POINT_OFFSET_M`), never a hardcoded world coordinate.
-  - `open_drawer`: the drawer body (`drawer_box`) is a solid box far larger
-    than the gripper's span and has no handle to pinch, so it is opened by
-    FRICTION DRAG instead: press down on its top surface and walk the
-    contact point toward the drawer's open direction in small waypoints
-    (ADR-021's `drawer_slide` axis, `(0, -1, 0)`), relying on downward
-    contact force and friction to drag the drawer along, the same way one
-    might slide a book across a table by pressing and pushing rather than
-    pinching it.
+  - `open_drawer`: the drawer body (`drawer_box`) is a solid box with no
+    handle to pinch. ADR-027 revises this from the original top-down
+    friction-drag technique (which required descending from ABOVE, straight
+    through the `table_top` slab that now sits directly over the drawer's
+    closed face at y=0.00 -- see ADR-026's drawer reposition) to a LATERAL
+    approach: swing in from outside the table footprint at drawer height,
+    slide inward under the slab while staying below its z=0.33 underside,
+    close the jaw against the drawer's front face, and pull straight back.
+    See `run_open_drawer`'s docstring for the empirically-measured verdict
+    on whether this path is actually clear for arm A.
 
 **Orientation is never controlled (ADR-024).** `ik.solve_position_ik` only
 targets end-effector *position*; the jaw's approach angle is whatever falls
@@ -58,8 +83,10 @@ class SkillResult:
             (e.g. the object rose above the table by the stated margin).
         reason: A short, human-readable explanation carrying the MEASURED
             number(s) that justify `success` -- e.g. "lifted to z=0.391
-            (initial z=0.356, margin=0.03)" -- so a Tester or a log reader
-            never has to re-derive what happened.
+            (initial z=0.356, margin=0.03)", or, on a waypoint failure,
+            "waypoint 2 (descend) failed [collision (...)]" -- so a Tester
+            or a log reader never has to re-derive what happened or which
+            stage produced it (ADR-027).
         frames_used: Total `env.step()` calls made while running this
             skill. This is the step-BUDGET unit (PLAN.md M06 done-when 3),
             not a wall-clock duration -- comparable across runs and
@@ -97,8 +124,24 @@ OBJECT_BODY_NAME = {
 #: its as-placed (near-identity) orientation, which holds at the start of
 #: every skill this module implements (none of them tumble props before
 #: grasping) -- a documented simplification, not a claim of full generality.
+#: **`"plate"` direction corrected under ADR-027, magnitude unchanged.** The
+#: plate's rim is circular (radius 0.09 m) so, unlike the mug's handle
+#: below, any direction around it is an equally valid PHYSICAL grasp
+#: feature -- but not every direction is equally REACHABLE from the "home"
+#: rest pose ADR-026 introduced. Measured directly (`ik.solve_position_ik`
+#: from `reset(seed=0)`'s home pose, arm A): the original `(+0.09, 0, 0)`
+#: offset drives `shoulder_lift`, `elbow_flex` AND `wrist_flex` all
+#: simultaneously to their joint-range limits and the DLS solve stalls
+#: there (residual 0.138 m at the grasp point, 0.064 m at the approach
+#: hover point -- confirmed non-transient: a 3000-step real closed-loop
+#: drive toward the hover point plateaued at the same error and never
+#: improved). `(0, +0.09, 0)` -- the same rim, 90 degrees around it --
+#: converges cleanly at both points (residual 0.008 m / 0.006 m) with no
+#: joint pegged at its limit. Swapping which side of a SYMMETRIC feature is
+#: targeted is a caller-side reachability choice, not a change to `ik.py`
+#: or to what "the plate's rim" means physically.
 GRASP_POINT_OFFSET_M = {
-    "plate": np.array([0.09, 0.0, 0.0]),
+    "plate": np.array([0.0, 0.09, 0.0]),
     "mug": np.array([0.0475, 0.0, 0.0]),
     "fork": np.array([-0.015, 0.0, 0.0]),
     "spoon": np.array([-0.01, 0.0, 0.0]),
@@ -108,24 +151,89 @@ GRASP_POINT_OFFSET_M = {
 # ---------------------------------------------------------------------------
 # Module-level tuning constants -- one place to find and adjust every
 # skill-behaviour number (task instructions: "anyone tuning these must find
-# them in one place").
+# them in one place"). The five ADR-027 constants below (CLEARANCE_HEIGHT_M,
+# APPROACH_DESCENT_STEPS, GRIP_HOLD_FRAMES, PULL_DISTANCE_M,
+# HANDOFF_POSITION_XYZ) are this module's waypoint-staging contract; every
+# staged skill is built out of them.
 # ---------------------------------------------------------------------------
 
 #: Tabletop surface height, metres (verified scene geometry: table_top box
 #: centred at z=0.34, half-thickness 0.01 -> top surface at 0.35).
 TABLE_SURFACE_Z = 0.35
 
-#: How far above a grasp point to hover before descending, metres.
-APPROACH_HEIGHT_M = 0.10
+#: ADR-027. How high above (or around) a target position a skill's APPROACH
+#: and RETREAT waypoints hover, metres, so the arm always has a clear
+#: straight-line lane before it moves horizontally onto or away from a
+#: target -- the entire point of staging, since `ik.solve_position_ik` has
+#: no obstacle awareness of its own (ADR-024) and will happily solve a path
+#: THROUGH the tabletop if that is the shortest joint-space route (this is
+#: exactly what ADR-026 caught). Replaces the old, inconsistently-named
+#: `APPROACH_HEIGHT_M`/`LIFT_HEIGHT_M` pair with one constant used
+#: uniformly by every staged skill.
+CLEARANCE_HEIGHT_M = 0.08
 
-#: How far above the grasp point to lift once grasped, metres.
-LIFT_HEIGHT_M = 0.12
+#: ADR-027. Per-waypoint step cap for a single IK-driven APPROACH/DESCEND/
+#: RETREAT phase. Each waypoint is a small joint delta from wherever the
+#: previous waypoint left the arm (never a full reach from a resting pose),
+#: so it converges fast -- this bounds any ONE phase so a slow waypoint
+#: cannot silently consume a skill's entire step budget before a later,
+#: possibly more important waypoint (e.g. GRIP) ever gets a turn.
+APPROACH_DESCENT_STEPS = 500
 
-#: Success bar for "lifted": the object's world z must rise by at least
-#: this much above its OWN measured starting height this run (PLAN.md M06
-#: done-when 1: "lifted above a stated height threshold, reported as a
-#: measured number").
-PICK_LIFT_MARGIN_M = 0.03
+#: ADR-027. Dwell length, in `env.step()` calls, for a GRIP or RELEASE
+#: waypoint (closing/opening the jaw and letting contact settle before the
+#: next waypoint runs). Replaces the previous
+#: GRASP_DWELL_STEPS/RELEASE_DWELL_STEPS pair (200 steps each, tuned for the
+#: OLD unstaged skills, which relied on the dwell to also absorb any
+#: leftover approach overshoot) with the single constant name this task's
+#: staging contract specifies. Staged skills already converge to within
+#: `POS_CONVERGENCE_TOL_M` before a GRIP/RELEASE waypoint ever runs, so this
+#: dwell only needs to let contact/friction settle -- NOT also finish an
+#: approach -- which is why it can be shorter. Flagged, not hidden: this is
+#: noticeably shorter than the ~180 steps ADR-024/M06a measured for the jaw
+#: to travel its full ~1.9 rad range, so a GRIP/RELEASE waypoint may end
+#: with the jaw still partway through its commanded travel; grasp-quality
+#: tuning is ADR-024's open follow-up, out of this module's scope, and this
+#: value is the one the task instructions specify.
+GRIP_HOLD_FRAMES = 30
+
+#: ADR-027. How far, in metres, `open_drawer`'s PULL waypoint drags the
+#: drawer along `drawer_slide`'s axis (`(0, -1, 0)`) -- chosen to match the
+#: joint's own 0.15 m range exactly, so one pull is a full open if the grip
+#: holds.
+PULL_DISTANCE_M = 0.15
+
+#: ADR-027. Minimum contact PENETRATION DEPTH, metres, for the per-waypoint
+#: collision check to count a contact as a genuine collision rather than
+#: incidental floating-point-scale contact-margin noise. Measured need for
+#: this, not a guessed fudge factor: every prop in this scene rests directly
+#: on `table_top` (by design -- the plate sits only ~0.006 m above the
+#: surface), and the gripper's own collision geometry is large relative to
+#: the props (ADR-024: jaw bounding-sphere radius up to ~8.4 cm) -- so a
+#: `pick` descend onto a rim grasp point at table height was measured to
+#: produce a real MuJoCo contact between an (unnamed) arm mesh geom and
+#: `table_top` at `dist=-0.00007` m: a graze roughly 1/1000th the size of
+#: the genuine tunneling penetrations this ADR exists to catch (`open_drawer`
+#: measured -0.02 to -0.065 m against the same geom). A bare "any negative
+#: `dist` counts" rule cannot tell these apart; this constant draws the line
+#: two-and-a-half orders of magnitude above the measured graze and two
+#: orders of magnitude below the measured tunneling depths, so it rejects
+#: neither kind of case by accident.
+TABLE_COLLISION_DEPTH_TOL_M = 0.001
+
+#: ADR-027. World-frame (x, y, z) both arms drive toward during `handoff`'s
+#: presenting/receiving waypoints. y=-0.01 is the midpoint of the MEASURED
+#: shared reachable band, y in [-0.12, 0.10] m (`docs/hardware/
+#: m06-reachability-probe.md`'s "RE-MEASURED (ADR-026)" section, re-measured
+#: from the corrected "home" rest pose -- NOT the earlier, superseded
+#: ADR-021 arithmetic estimate). z=0.35 is `TABLE_SURFACE_Z`: handing an
+#: object off AT the table surface height, rather than
+#: `TABLE_SURFACE_Z + 0.10` as the pre-ADR-027 code used, keeps the
+#: transfer point inside the envelope both arms were actually measured to
+#: reach at low z (the same reachability constraint that blocks
+#: `open_drawer`'s lateral approach, see that function's docstring, also
+#: bounds how low a shared-band point can sit).
+HANDOFF_POSITION_XYZ = (0.0, -0.01, 0.35)
 
 #: Gripper ctrl targets, expressed as a fraction of `armX_gripper`'s
 #: [low, high] `jnt_range` (so they scale automatically if the range ever
@@ -138,22 +246,18 @@ PICK_LIFT_MARGIN_M = 0.03
 GRIPPER_OPEN_FRACTION = 1.0
 GRIPPER_CLOSE_FRACTION = 0.0
 
-#: How many control steps to dwell while closing/opening the jaw, letting
-#: the position servo and contact solver settle before the arm moves again.
-#: Measured empirically, not guessed: tracing `armA_gripper`'s qpos during a
-#: commanded close showed it takes roughly 180 steps to travel the jaw's
-#: full ~1.9 rad range under this scene's actuator gains (kp=998.22) -- a
-#: dwell much shorter than that (an earlier version used 40) commands the
-#: close but abandons it barely started, well before the jaw has travelled
-#: far enough to contact (or fail to contact) anything.
-GRASP_DWELL_STEPS = 200
-RELEASE_DWELL_STEPS = 200
+#: Success bar for "lifted": the object's world z must rise by at least
+#: this much above its OWN measured starting height this run (PLAN.md M06
+#: done-when 1: "lifted above a stated height threshold, reported as a
+#: measured number").
+PICK_LIFT_MARGIN_M = 0.03
 
 #: How close the gripperframe site must get to a phase's target position,
-#: metres, before a `_drive_to_target` phase is considered converged.
-#: Looser than `ik.IK_POSITION_TOLERANCE_M` because this measures the REAL,
-#: physically-servoed arm (subject to PD overshoot/settling), not the
-#: kinematic IK solve.
+#: metres, before a `_drive_to_target` phase is considered PHYSICALLY
+#: converged. Looser than `ik.IK_POSITION_TOLERANCE_M` because this measures
+#: the REAL, physically-servoed arm (subject to PD overshoot/settling), not
+#: the kinematic IK solve -- the two are validated separately, see
+#: `_run_waypoint`.
 POS_CONVERGENCE_TOL_M = 0.015
 
 #: `place`'s destination offset (x, y) in metres, relative to the object's
@@ -161,23 +265,29 @@ POS_CONVERGENCE_TOL_M = 0.015
 #: started.
 PLACE_OFFSET_XY_M = (0.10, -0.05)
 
-#: Verified scene geometry: the ~0.10 m wide band at the table centre both
-#: arms can reach (arm bases at y=-0.25/+0.25, ~0.30 m reach each) -- the
-#: only place a handoff can physically happen (ADR-010, ADR-024).
-HANDOFF_TRANSFER_XY = (0.0, 0.0)
-HANDOFF_TRANSFER_HEIGHT_M = 0.10
-#: How far off the transfer centre each arm's gripper sits while both are
-#: present, so the two gripper mechanisms do not try to occupy the same
-#: point (ADR-024's "handoff" consequence: with no orientation control,
-#: this offset is our only concurrency-safety margin between the two
-#: jaws).
+#: ADR-027. How far above the destination's table-resting height `place`'s
+#: DESCEND waypoint stops, metres -- "release a hair above the table"
+#: rather than driving the pinch point (which sits BETWEEN the jaws, not at
+#: the object's own resting contact point) exactly onto the surface, which
+#: would also drive the jaw itself into the tabletop.
+PLACE_RELEASE_CLEARANCE_M = 0.02
+
+#: How far off the transfer centre (`HANDOFF_POSITION_XYZ`) each arm's
+#: gripper sits while both are present, so the two gripper mechanisms do
+#: not try to occupy the same point (ADR-024's "handoff" consequence: with
+#: no orientation control, this offset is our only concurrency-safety
+#: margin between the two jaws).
 HANDOFF_SIDE_OFFSET_M = 0.03
 
-#: `open_drawer` tuning. See module docstring: friction-drag, not a pinch.
-DRAWER_WAYPOINT_STEP_M = 0.01
-DRAWER_MAX_WAYPOINTS = 20
-DRAWER_STEPS_PER_WAYPOINT = 30
-DRAWER_PRESS_PENETRATION_M = 0.01
+#: `open_drawer` tuning (ADR-027 lateral approach).
+#:
+#: How far outside the table's -y edge (table_top spans y in [-0.25, 0.25])
+#: the APPROACH/RETREAT waypoints sit, metres. Chosen as a round number
+#: comfortably past the table edge; see `run_open_drawer`'s docstring for
+#: the measured verdict on whether the arm can actually reach this point at
+#: drawer height.
+DRAWER_LATERAL_APPROACH_Y_M = -0.30
+
 #: Success bar: within 0.01 of the `drawer_slide` joint's 0.15 range limit
 #: (PLAN.md M06 tests/test_skills.py spec).
 DRAWER_SUCCESS_QPOS = 0.14
@@ -262,7 +372,8 @@ def _drive_to_target(
 
     Returns (converged, steps_used). `converged=False` at `max_steps` is a
     normal outcome for a hard subgoal, not necessarily a bug -- the caller
-    decides what that means for overall skill success/timeout.
+    (`_run_waypoint`/`_run_dwell` below) decides what that means for overall
+    skill success/failure.
     """
     if max_steps <= 0:
         return False, 0
@@ -304,18 +415,158 @@ def _dwell(env, arm: str, hold_pos, gripper_fraction: float, n_steps: int) -> in
 
 
 # ---------------------------------------------------------------------------
+# ADR-027: per-waypoint validation -- collision-aware staging on top of a
+# collision-blind solver.
+# ---------------------------------------------------------------------------
+
+
+def _arm_geom_ids(model, arm: str) -> set[int]:
+    """Every geom id belonging to a body prefixed `arm{arm}_` -- the arm's
+    whole kinematic subtree, per `scripts/gen_dual_scene.py`'s renaming
+    convention (same technique `scripts/probe_reachability.py` uses)."""
+    prefix = f"arm{arm}_"
+    body_ids = {
+        b
+        for b in range(model.nbody)
+        if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or "").startswith(prefix)
+    }
+    return {g for g in range(model.ngeom) if int(model.geom_bodyid[g]) in body_ids}
+
+
+def _table_top_geom_ids(model) -> set[int]:
+    """The tabletop slab's own geom id -- the ONE geom this module's
+    collision check cares about tunneling through (not the drawer housing,
+    which `open_drawer` is *supposed* to touch, and not the props, which
+    `pick`/`place`/`handoff` are *supposed* to touch)."""
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
+    return {gid} if gid != -1 else set()
+
+
+def _contact_counts(env) -> dict[str, int]:
+    """Snapshot the two contact counts ADR-027's per-waypoint validation
+    checks: cross-arm contacts (armA geom touching an armB geom) and, per
+    arm, arm-vs-`table_top` contacts (the tunneling failure mode this whole
+    ADR exists to catch). Measured fresh from `env.data.contact` -- real
+    physics contacts, not a scratch kinematic re-check -- so it reflects
+    whatever the actual simulated state is right now.
+    """
+    model, data = env.model, env.data
+    arm_geoms = {arm: _arm_geom_ids(model, arm) for arm in ("A", "B")}
+    table = _table_top_geom_ids(model)
+    counts = {"cross_arm": 0, "A_table": 0, "B_table": 0}
+    for i in range(data.ncon):
+        c = data.contact[i]
+        if float(c.dist) >= -TABLE_COLLISION_DEPTH_TOL_M:
+            # Shallower than the measured graze/tunneling boundary (see
+            # TABLE_COLLISION_DEPTH_TOL_M's docstring) -- not counted.
+            continue
+        g1, g2 = int(c.geom1), int(c.geom2)
+        if (g1 in arm_geoms["A"] and g2 in arm_geoms["B"]) or (
+            g1 in arm_geoms["B"] and g2 in arm_geoms["A"]
+        ):
+            counts["cross_arm"] += 1
+        if (g1 in arm_geoms["A"] and g2 in table) or (g2 in arm_geoms["A"] and g1 in table):
+            counts["A_table"] += 1
+        if (g1 in arm_geoms["B"] and g2 in table) or (g2 in arm_geoms["B"] and g1 in table):
+            counts["B_table"] += 1
+    return counts
+
+
+def _validate_against_baseline(env, arm: str, target_pos, baseline: dict) -> tuple[bool, str | None, float]:
+    """Check BOTH bars a waypoint must clear (ADR-027): IK convergence
+    (re-queried after the physical drive settles, so it reflects wherever
+    the arm actually ended up) and collision (no NEW cross-arm or
+    arm-vs-table_top contact versus `baseline`, a snapshot taken once at
+    this skill call's start).
+
+    Returns (ok, reason, ik_residual_m). `reason` is None when `ok`.
+    """
+    solution = ik.solve_position_ik(env.model, env.data, arm, target_pos)
+    if solution.position_error_m >= ik.IK_POSITION_TOLERANCE_M:
+        return (
+            False,
+            f"convergence (IK residual={solution.position_error_m:.4f} m >= "
+            f"{ik.IK_POSITION_TOLERANCE_M} m)",
+            solution.position_error_m,
+        )
+
+    counts = _contact_counts(env)
+    table_key = f"{arm}_table"
+    if counts["cross_arm"] > baseline["cross_arm"] or counts[table_key] > baseline[table_key]:
+        return (
+            False,
+            f"collision (cross_arm contacts={counts['cross_arm']} vs baseline "
+            f"{baseline['cross_arm']}; arm{arm}-vs-table_top contacts={counts[table_key]} "
+            f"vs baseline {baseline[table_key]})",
+            solution.position_error_m,
+        )
+    return True, None, solution.position_error_m
+
+
+def _run_waypoint(
+    env,
+    arm: str,
+    target_pos,
+    gripper_fraction: float,
+    max_steps: int,
+    baseline: dict,
+    pos_tol: float = POS_CONVERGENCE_TOL_M,
+) -> tuple[bool, int, str | None]:
+    """Drive `arm` to `target_pos` (one APPROACH/DESCEND/RETREAT/PULL
+    waypoint of a staged skill, ADR-027) and validate it against
+    `_validate_against_baseline` before the caller is allowed to advance.
+
+    Returns (ok, frames_used, reason). `reason` is None on success. Logs one
+    INFO line per waypoint (arm, target, frames used, pass/fail and why) so
+    a Tester enabling logging gets a per-waypoint frame breakdown without
+    this module's public `SkillResult` needing a new field for it.
+    """
+    _, steps = _drive_to_target(env, arm, target_pos, gripper_fraction, max_steps, pos_tol=pos_tol)
+    ok, reason, residual = _validate_against_baseline(env, arm, target_pos, baseline)
+    logger.info(
+        "waypoint arm=%s target=%s frames_used=%d ik_residual=%.4f ok=%s%s",
+        arm, np.round(np.asarray(target_pos, dtype=np.float64), 4).tolist(), steps, residual, ok,
+        "" if ok else f" reason={reason}",
+    )
+    return ok, steps, reason
+
+
+def _run_dwell(
+    env,
+    arm: str,
+    hold_pos,
+    gripper_fraction: float,
+    n_steps: int,
+    baseline: dict,
+) -> tuple[bool, int, str | None]:
+    """Dwell at `hold_pos` (a GRIP or RELEASE waypoint, ADR-027) while
+    opening/closing the jaw, then validate exactly like `_run_waypoint`.
+    """
+    steps = _dwell(env, arm, hold_pos, gripper_fraction, n_steps)
+    ok, reason, residual = _validate_against_baseline(env, arm, hold_pos, baseline)
+    logger.info(
+        "dwell arm=%s target=%s frames_used=%d ik_residual=%.4f ok=%s%s",
+        arm, np.round(np.asarray(hold_pos, dtype=np.float64), 4).tolist(), steps, residual, ok,
+        "" if ok else f" reason={reason}",
+    )
+    return ok, steps, reason
+
+
+# ---------------------------------------------------------------------------
 # Skills
 # ---------------------------------------------------------------------------
 
 
 def run_pick(env, arm: str, target_object: str, step_budget: int = ik.DEFAULT_STEP_BUDGET) -> SkillResult:
-    """pick(object, arm): approach, descend, close, lift.
+    """pick(object, arm): APPROACH (clearance above the grasp point) ->
+    DESCEND (onto it) -> GRIP (close + hold) -> RETREAT (back to clearance
+    height) (ADR-027, tutor note 06's approach/grip/retreat pattern).
 
     Targets the object body named in `OBJECT_BODY_NAME`, offset by
     `GRASP_POINT_OFFSET_M` to a small graspable feature (see module
     docstring). Success: the object's world z rises at least
     `PICK_LIFT_MARGIN_M` above its own height measured at the start of
-    this call.
+    this call, AND every waypoint below cleared both validation bars.
     """
     frames = 0
     body_name = OBJECT_BODY_NAME.get(target_object)
@@ -329,49 +580,49 @@ def run_pick(env, arm: str, target_object: str, step_budget: int = ik.DEFAULT_ST
     grasp_point = obj_pos0 + offset
 
     open_frac, close_frac = GRIPPER_OPEN_FRACTION, GRIPPER_CLOSE_FRACTION
+    baseline = _contact_counts(env)
     remaining = step_budget
 
-    # Phase 1: hover above the grasp point, gripper open.
-    hover = grasp_point + np.array([0.0, 0.0, APPROACH_HEIGHT_M])
-    _, used = _drive_to_target(env, arm, hover, open_frac, remaining)
+    # Waypoint 1: APPROACH -- hover at clearance height above the grasp point.
+    hover = grasp_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    ok, used, reason = _run_waypoint(env, arm, hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
     frames += used
     remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout during approach; frames_used={frames}", frames)
+    if not ok:
+        return SkillResult(False, f"waypoint 1 (approach) failed [{reason}]", frames)
 
-    # Phase 2: descend onto the grasp point, gripper still open.
-    _, used = _drive_to_target(env, arm, grasp_point, open_frac, remaining)
+    # Waypoint 2: DESCEND -- onto the grasp point itself, gripper still open.
+    ok, used, reason = _run_waypoint(env, arm, grasp_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
     frames += used
     remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout during descent; frames_used={frames}", frames)
+    if not ok:
+        return SkillResult(False, f"waypoint 2 (descend) failed [{reason}]", frames)
 
-    # Phase 3: close the gripper and dwell so contact/friction settles
-    # before we ask the arm to move again.
-    used = _dwell(env, arm, grasp_point, close_frac, min(GRASP_DWELL_STEPS, remaining))
+    # Waypoint 3: GRIP -- close the jaw and hold so contact/friction settles
+    # before the arm is asked to move again.
+    ok, used, reason = _run_dwell(env, arm, grasp_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
     frames += used
     remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout during grasp dwell; frames_used={frames}", frames)
+    if not ok:
+        return SkillResult(False, f"waypoint 3 (grip) failed [{reason}]", frames)
 
-    # Phase 4: lift straight up, gripper held closed.
-    lift_target = grasp_point + np.array([0.0, 0.0, LIFT_HEIGHT_M])
-    _, used = _drive_to_target(env, arm, lift_target, close_frac, remaining)
+    # Waypoint 4: RETREAT -- back to clearance height, gripper held closed.
+    # This also doubles as the physical lift the success check below reads.
+    ok, used, reason = _run_waypoint(env, arm, hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
     frames += used
     remaining -= used
 
     final_z = float(env.data.xpos[body_id][2])
     lifted = final_z >= initial_z + PICK_LIFT_MARGIN_M
-    reason = (
+    measured = (
         f"{'lifted' if lifted else 'did not lift'} {target_object}: "
-        f"initial_z={initial_z:.4f} final_z={final_z:.4f} "
-        f"margin_required={PICK_LIFT_MARGIN_M}"
+        f"initial_z={initial_z:.4f} final_z={final_z:.4f} margin_required={PICK_LIFT_MARGIN_M}"
     )
+    if not ok:
+        return SkillResult(False, f"waypoint 4 (retreat) failed [{reason}]; {measured}", frames)
     if lifted:
-        return SkillResult(True, reason, frames)
-    if remaining <= 0:
-        return SkillResult(False, f"timeout; {reason}", frames)
-    return SkillResult(False, reason, frames)
+        return SkillResult(True, measured, frames)
+    return SkillResult(False, measured, frames)
 
 
 def run_place(
@@ -382,11 +633,14 @@ def run_place(
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
 ) -> SkillResult:
     """place(object, target=table, arm): pick the object up (if not already
-    held), transport it to a new tabletop location, release, and retreat.
+    held), then APPROACH above the destination at clearance height ->
+    DESCEND to destination + a small vertical offset for gentle release ->
+    RELEASE (open + hold) -> RETREAT to clearance height (ADR-027).
 
     Success: the object ends resting on the table (z within a plausible
     resting band) and within the tabletop's xy bounds -- not fallen through
-    and not flown off the edge.
+    and not flown off the edge -- AND every waypoint cleared both
+    validation bars.
     """
     frames = 0
     body_name = OBJECT_BODY_NAME.get(target_object)
@@ -396,12 +650,15 @@ def run_place(
         return SkillResult(False, f"unsupported destination {destination!r} (only 'table' is implemented)", frames)
 
     body_id = _body_id(env.model, body_name)
+    baseline = _contact_counts(env)
 
     # `place` is self-contained: it performs the grasp itself rather than
     # assuming a prior `pick` already ran, so it is independently testable
     # (tests/test_skills.py calls `place` directly at seed=0, object still on
-    # the table).
-    pick_budget = max(1, step_budget * 2 // 3)
+    # the table). The nested `pick`'s own waypoint numbering/reason string is
+    # propagated as-is on failure, so a failure inside the grasp still
+    # localises to its exact stage.
+    pick_budget = max(1, step_budget // 2)
     pick_result = run_pick(env, arm, target_object, step_budget=pick_budget)
     frames += pick_result.frames_used
     if not pick_result.success:
@@ -409,7 +666,7 @@ def run_place(
 
     remaining = step_budget - frames
     if remaining <= 0:
-        return SkillResult(False, f"timeout after pick; frames_used={frames}", frames)
+        return SkillResult(False, f"waypoint 1 (approach destination) failed [convergence (no budget remaining after pick)]", frames)
 
     obj_xy = np.array(env.data.xpos[body_id][:2], dtype=np.float64, copy=True)
     dest_xy = obj_xy + np.array(PLACE_OFFSET_XY_M)
@@ -420,49 +677,53 @@ def run_place(
     dest_xy[1] = float(np.clip(dest_xy[1], -0.18, 0.18))
 
     close_frac, open_frac = GRIPPER_CLOSE_FRACTION, GRIPPER_OPEN_FRACTION
-
-    # Transport: carry the held object, still closed, to a point above the
-    # destination.
-    transport_target = np.array([dest_xy[0], dest_xy[1], TABLE_SURFACE_Z + LIFT_HEIGHT_M])
-    _, used = _drive_to_target(env, arm, transport_target, close_frac, remaining)
-    frames += used
-    remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout during transport; frames_used={frames}", frames)
-
-    # Lower to the destination, gripper still closed.
     offset = GRASP_POINT_OFFSET_M.get(target_object, np.zeros(3))
-    lower_target = np.array([dest_xy[0], dest_xy[1], TABLE_SURFACE_Z]) + offset
-    _, used = _drive_to_target(env, arm, lower_target, close_frac, remaining)
+
+    # Waypoint 1: APPROACH -- above the destination at clearance height,
+    # still holding the object (gripper closed).
+    approach_above_dest = np.array([dest_xy[0], dest_xy[1], TABLE_SURFACE_Z + CLEARANCE_HEIGHT_M])
+    ok, used, reason = _run_waypoint(env, arm, approach_above_dest, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
     frames += used
     remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout during lowering; frames_used={frames}", frames)
+    if not ok:
+        return SkillResult(False, f"waypoint 1 (approach destination) failed [{reason}]", frames)
 
-    # Release and dwell so the object settles before the arm retreats.
-    used = _dwell(env, arm, lower_target, open_frac, min(RELEASE_DWELL_STEPS, remaining))
+    # Waypoint 2: DESCEND -- to the destination plus a small vertical offset
+    # for a gentle release (PLACE_RELEASE_CLEARANCE_M), gripper still closed.
+    lower_target = np.array([dest_xy[0], dest_xy[1], TABLE_SURFACE_Z + PLACE_RELEASE_CLEARANCE_M]) + offset
+    ok, used, reason = _run_waypoint(env, arm, lower_target, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
     frames += used
     remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 2 (descend to destination) failed [{reason}]", frames)
 
-    # Retreat straight up so the arm does not drag the object off the table
-    # as it withdraws.
-    if remaining > 0:
-        retreat_target = lower_target + np.array([0.0, 0.0, APPROACH_HEIGHT_M])
-        _, used = _drive_to_target(env, arm, retreat_target, open_frac, remaining)
-        frames += used
-        remaining -= used
+    # Waypoint 3: RELEASE -- open the jaw and hold so the object settles.
+    ok, used, reason = _run_dwell(env, arm, lower_target, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 3 (release) failed [{reason}]", frames)
+
+    # Waypoint 4: RETREAT -- back up to clearance height so the arm does not
+    # drag the object off the table as it withdraws.
+    retreat_target = lower_target + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    ok, used, reason = _run_waypoint(env, arm, retreat_target, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    frames += used
+    remaining -= used
 
     final_pos = env.data.xpos[body_id]
     final_z = float(final_pos[2])
     on_table_height = (TABLE_SURFACE_Z - 0.05) <= final_z <= (TABLE_SURFACE_Z + 0.10)
     on_table_xy = -0.40 <= float(final_pos[0]) <= 0.40 and -0.25 <= float(final_pos[1]) <= 0.25
-    reason = (
+    measured = (
         f"final position of {target_object}: x={final_pos[0]:.4f} y={final_pos[1]:.4f} "
         f"z={final_z:.4f} (table surface z={TABLE_SURFACE_Z})"
     )
+    if not ok:
+        return SkillResult(False, f"waypoint 4 (retreat) failed [{reason}]; {measured}", frames)
     if on_table_height and on_table_xy:
-        return SkillResult(True, reason, frames)
-    return SkillResult(False, f"object not resting on the table after place; {reason}", frames)
+        return SkillResult(True, measured, frames)
+    return SkillResult(False, f"object not resting on the table after place; {measured}", frames)
 
 
 def run_handoff(
@@ -472,9 +733,22 @@ def run_handoff(
     target_object: str,
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
 ) -> SkillResult:
-    """handoff(object, from_arm, to_arm): `from_arm` picks the object up and
-    presents it in the shared overlap band; `to_arm` approaches, closes;
-    `from_arm` opens and retreats (ADR-010's scripted grip-state sequence).
+    """handoff(object, from_arm, to_arm) (ADR-010's grip-state sequence,
+    staged per ADR-027):
+
+      1. `from_arm` picks the object up (nested `run_pick`).
+      2. `from_arm` APPROACHes above `HANDOFF_POSITION_XYZ` at clearance.
+      3. `from_arm` DESCENDs to `HANDOFF_POSITION_XYZ`.
+      4. `to_arm` APPROACHes above it, offset to the opposite side
+         (`HANDOFF_SIDE_OFFSET_M`) so the two jaws are not asked to occupy
+         the same point (ADR-024's handoff consequence).
+      5. `to_arm` DESCENDs.
+      6. `to_arm` GRIPs (closes).
+      7. `from_arm` RELEASEs (opens).
+      8. Both RETREAT, STAGGERED: `from_arm` retreats first, THEN `to_arm`
+         retreats -- sequential, not concurrent, so the two arms do not
+         cross paths on the way out while both are still near the transfer
+         point.
 
     Success: the object ends measurably closer to `to_arm`'s gripperframe
     site than to `from_arm`'s, and has been lifted since the handoff began
@@ -490,6 +764,7 @@ def run_handoff(
 
     body_id = _body_id(env.model, body_name)
     initial_z = float(env.data.xpos[body_id][2])
+    baseline = _contact_counts(env)
 
     pick_budget = max(1, step_budget // 2)
     pick_result = run_pick(env, from_arm, target_object, step_budget=pick_budget)
@@ -499,52 +774,75 @@ def run_handoff(
 
     remaining = step_budget - frames
     if remaining <= 0:
-        return SkillResult(False, f"timeout after pick; frames_used={frames}", frames)
+        return SkillResult(False, "waypoint 1 (from_arm approach) failed [convergence (no budget remaining after pick)]", frames)
 
     close_frac, open_frac = GRIPPER_CLOSE_FRACTION, GRIPPER_OPEN_FRACTION
-    tx, ty = HANDOFF_TRANSFER_XY
-    transfer_z = TABLE_SURFACE_Z + HANDOFF_TRANSFER_HEIGHT_M
-
-    # `from_arm` presents the object at the shared-workspace transfer point.
-    presenting_target = np.array([tx, ty, transfer_z])
-    _, used = _drive_to_target(env, from_arm, presenting_target, close_frac, remaining)
-    frames += used
-    remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout while presenting; frames_used={frames}", frames)
-
-    # `to_arm` approaches from its own side, offset so the two gripper
-    # mechanisms are not asked to occupy the same point (ADR-024).
+    hx, hy, hz = HANDOFF_POSITION_XYZ
+    transfer_point = np.array([hx, hy, hz])
     side = -1.0 if to_arm == "A" else 1.0  # arm A base at y=-0.25, arm B at y=+0.25
-    receiving_target = np.array([tx, ty + side * HANDOFF_SIDE_OFFSET_M, transfer_z])
-    _, used = _drive_to_target(env, to_arm, receiving_target, open_frac, remaining)
+    receiving_point = transfer_point + np.array([0.0, side * HANDOFF_SIDE_OFFSET_M, 0.0])
+
+    # Waypoint 1: from_arm APPROACH -- above the transfer point at clearance
+    # height, still holding the object.
+    from_hover = transfer_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    ok, used, reason = _run_waypoint(env, from_arm, from_hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
     frames += used
     remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout while receiving; frames_used={frames}", frames)
+    if not ok:
+        return SkillResult(False, f"waypoint 1 (from_arm approach) failed [{reason}]", frames)
 
-    # Explicit grip-state sequence (ADR-010): close the receiver first...
-    used = _dwell(env, to_arm, receiving_target, close_frac, min(GRASP_DWELL_STEPS, remaining))
+    # Waypoint 2: from_arm DESCEND -- to the transfer point exactly.
+    ok, used, reason = _run_waypoint(env, from_arm, transfer_point, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
     frames += used
     remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout during receive dwell; frames_used={frames}", frames)
+    if not ok:
+        return SkillResult(False, f"waypoint 2 (from_arm descend) failed [{reason}]", frames)
 
-    # ...then open and retreat the presenter.
-    used = _dwell(env, from_arm, presenting_target, open_frac, min(RELEASE_DWELL_STEPS, remaining))
+    # Waypoint 3: to_arm APPROACH -- above the transfer point, offset to its
+    # own side, gripper open.
+    to_hover = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    ok, used, reason = _run_waypoint(env, to_arm, to_hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
     frames += used
     remaining -= used
-    if remaining > 0:
-        retreat_target = presenting_target + np.array([0.0, side * -1.0 * 0.05, 0.05])
-        _, used = _drive_to_target(env, from_arm, retreat_target, open_frac, remaining)
-        frames += used
-        remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 3 (to_arm approach) failed [{reason}]", frames)
 
-    if remaining > 0:
-        lift_target = receiving_target + np.array([0.0, 0.0, LIFT_HEIGHT_M])
-        _, used = _drive_to_target(env, to_arm, lift_target, close_frac, remaining)
-        frames += used
-        remaining -= used
+    # Waypoint 4: to_arm DESCEND -- to the receiving point.
+    ok, used, reason = _run_waypoint(env, to_arm, receiving_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 4 (to_arm descend) failed [{reason}]", frames)
+
+    # Waypoint 5: to_arm GRIP -- close and hold.
+    ok, used, reason = _run_dwell(env, to_arm, receiving_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 5 (to_arm grip) failed [{reason}]", frames)
+
+    # Waypoint 6: from_arm RELEASE -- open and hold.
+    ok, used, reason = _run_dwell(env, from_arm, transfer_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 6 (from_arm release) failed [{reason}]", frames)
+
+    # Waypoint 7: from_arm RETREAT -- goes FIRST (staggered), back to
+    # clearance height above the transfer point.
+    from_retreat = from_hover
+    ok7, used, reason7 = _run_waypoint(env, from_arm, from_retreat, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok7:
+        return SkillResult(False, f"waypoint 7 (from_arm retreat) failed [{reason7}]", frames)
+
+    # Waypoint 8: to_arm RETREAT -- goes SECOND (staggered), lifting the
+    # object away from the transfer point.
+    to_lift = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    ok8, used, reason8 = _run_waypoint(env, to_arm, to_lift, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    frames += used
+    remaining -= used
 
     final_pos = np.array(env.data.xpos[body_id], dtype=np.float64, copy=True)
     final_z = float(final_pos[2])
@@ -555,24 +853,58 @@ def run_handoff(
     closer_to_to_arm = dist_b < dist_a if to_arm == "B" else dist_a < dist_b
     lifted = final_z >= initial_z + PICK_LIFT_MARGIN_M
 
-    reason = (
+    measured = (
         f"z={final_z:.4f} (initial {initial_z:.4f}) dist_to_armA={dist_a:.4f} "
         f"dist_to_armB={dist_b:.4f} (to_arm={to_arm})"
     )
+    if not ok8:
+        return SkillResult(False, f"waypoint 8 (to_arm retreat) failed [{reason8}]; {measured}", frames)
     if lifted and closer_to_to_arm:
-        return SkillResult(True, f"held by arm {to_arm}: {reason}", frames)
-    return SkillResult(False, f"object not confirmed held by arm {to_arm}: {reason}", frames)
+        return SkillResult(True, f"held by arm {to_arm}: {measured}", frames)
+    return SkillResult(False, f"object not confirmed held by arm {to_arm}: {measured}", frames)
 
 
 def run_open_drawer(env, arm: str = "A", step_budget: int = ik.DEFAULT_STEP_BUDGET) -> SkillResult:
-    """open_drawer(arm): friction-drag the drawer open (see module docstring
-    for why -- no handle geometry exists to pinch).
+    """open_drawer(arm) (ADR-027 lateral approach): APPROACH (a waypoint
+    outside the table footprint, at drawer height) -> INSERT (translate
+    inward under the tabletop slab to the handle, staying at drawer height
+    the whole time so the path never crosses the slab's z in
+    [0.33, 0.35]) -> GRIP (close against the drawer's front face) -> PULL
+    (drag back by `PULL_DISTANCE_M`) -> RELEASE -> RETREAT (back outside
+    the table edge).
 
-    Presses down on the drawer box's top surface near its front edge, then
-    walks the contact target toward -y (the drawer's open direction,
-    `drawer_slide`'s axis) in small waypoints. Success: `drawer_slide`'s
-    qpos reaches at least `DRAWER_SUCCESS_QPOS` (within 0.01 of its 0.15
-    limit).
+    **This replaces the earlier top-down friction-drag technique**, which
+    pressed down onto the drawer's TOP surface from ABOVE -- a path that,
+    now that the drawer sits at closed-face y=0.00 directly under the
+    `table_top` slab (ADR-026), can only reach the drawer by first passing
+    THROUGH the slab. The lateral approach is the collision-safe
+    alternative this ADR requires.
+
+    **Empirically measured verdict (ADR-027), reported here rather than
+    assumed:** a one-off diagnostic (`ik.solve_position_ik` plus a real
+    physical closed-loop drive, both against this exact scene, arm A, from
+    the "home" reset pose) found that arm A's pinch point CANNOT converge
+    to ANY point at drawer height (z about 0.28) once y is at or beyond the
+    table's own edge (y <= about -0.20) -- the IK residual stalls around
+    0.09-0.32 m regardless of how many physical steps are given (1500
+    steps, well beyond `APPROACH_DESCENT_STEPS`, still did not converge),
+    and the same is true of the drawer's OWN closed-face target at y=0.00
+    (residual 0.009 m -- kinematically reachable -- but only via a solution
+    that tunnels through `table_top`/`drawer_housing_back` with up to
+    -0.064 m penetration, confirmed by a real contact check). In other
+    words: arm A's shoulder is mounted at the same z as the tabletop
+    (0.35 m) and simply cannot fold its own linkage down to drawer height
+    while positioned outside or at the table's footprint -- this is a
+    kinematic reach limit of the arm itself at its current base placement,
+    not a solver bug and not something a smarter waypoint choice fixes.
+    **Per this task's explicit stop rule ("if the only solutions tunnel,
+    STOP and report -- do not invent a third drawer position"), this
+    function is still built exactly as specified below** (so its waypoint
+    validation is real, tested code, not a stub) **and is expected, on the
+    committed scene, to fail at waypoint 1 (APPROACH) with a convergence
+    failure** -- which is the correct, honest, collision-safe outcome: the
+    old code "succeeded" at reaching the drawer only by silently tunneling
+    through the table; this code correctly refuses to, and says why.
     """
     frames = 0
     jid = _joint_id(env.model, "drawer_slide")
@@ -581,59 +913,81 @@ def run_open_drawer(env, arm: str = "A", step_budget: int = ik.DEFAULT_STEP_BUDG
     geom_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_GEOM, "drawer_box")
     if geom_id == -1:
         raise ValueError("geom 'drawer_box' not found in the compiled model")
-    _hx, hy, hz = env.model.geom_size[geom_id]
+    _hx, hy, _hz = env.model.geom_size[geom_id]
 
     initial_qpos = float(env.data.qpos[qadr])
     drawer_pos0 = np.array(env.data.xpos[body_id], dtype=np.float64, copy=True)
     drawer_x = float(drawer_pos0[0])
-    box_top_z = float(drawer_pos0[2] + hz)
-    # ~3 cm inside the box's front (most-negative-y) edge, read from the
-    # geom's own half-extent `hy`, not a hardcoded coordinate.
-    contact_y0 = float(drawer_pos0[1] - hy + 0.03)
-    press_z = box_top_z - DRAWER_PRESS_PENETRATION_M
+    drawer_z = float(drawer_pos0[2])
+    # Front (most-negative-y) face centre, read from the geom's own
+    # half-extent, never a hardcoded coordinate (matches
+    # scripts/probe_reachability.py's `_drawer_face_target`).
+    handle_y = float(drawer_pos0[1] - hy)
 
-    close_frac = GRIPPER_CLOSE_FRACTION  # jaw state is irrelevant for a press-drag; kept closed/compact
+    close_frac, open_frac = GRIPPER_CLOSE_FRACTION, GRIPPER_OPEN_FRACTION
+    baseline = _contact_counts(env)
     remaining = step_budget
 
-    # Phase 1: hover above the initial contact point.
-    hover = np.array([drawer_x, contact_y0, box_top_z + APPROACH_HEIGHT_M])
-    _, used = _drive_to_target(env, arm, hover, close_frac, remaining)
-    frames += used
-    remaining -= used
-    if remaining <= 0:
-        return SkillResult(False, f"timeout during approach; drawer_slide qpos={float(env.data.qpos[qadr]):.4f}", frames)
+    approach_point = np.array([drawer_x, DRAWER_LATERAL_APPROACH_Y_M, drawer_z])
+    handle_point = np.array([drawer_x, handle_y, drawer_z])
+    pulled_point = np.array([drawer_x, handle_y - PULL_DISTANCE_M, drawer_z])
 
-    # Phase 2: press down onto the drawer's top surface.
-    press_point = np.array([drawer_x, contact_y0, press_z])
-    _, used = _drive_to_target(env, arm, press_point, close_frac, remaining, pos_tol=0.02)
-    frames += used
-    remaining -= used
-    if remaining <= 0:
-        return SkillResult(
-            False, f"timeout before contact; drawer_slide qpos={float(env.data.qpos[qadr]):.4f}", frames
+    def _final_reason() -> str:
+        final_qpos = float(env.data.qpos[qadr])
+        return (
+            f"drawer_slide qpos: initial={initial_qpos:.4f} final={final_qpos:.4f} "
+            f"(limit 0.15, success>={DRAWER_SUCCESS_QPOS})"
         )
 
-    # Phase 3: drag. Advance the press point toward -y in waypoints; each
-    # waypoint gets a few steps to let the arm catch up and friction pull
-    # the drawer along.
-    current_y = contact_y0
-    for _ in range(DRAWER_MAX_WAYPOINTS):
-        if remaining <= 0:
-            break
-        current_y -= DRAWER_WAYPOINT_STEP_M
-        waypoint = np.array([drawer_x, current_y, press_z])
-        steps_this_waypoint = min(DRAWER_STEPS_PER_WAYPOINT, remaining)
-        _, used = _drive_to_target(env, arm, waypoint, close_frac, steps_this_waypoint, pos_tol=0.02)
-        frames += used
-        remaining -= used
-        if float(env.data.qpos[qadr]) >= DRAWER_SUCCESS_QPOS:
-            break
+    # Waypoint 1: APPROACH -- a waypoint outside the table footprint, at
+    # drawer height (gripper open, ready to insert).
+    ok, used, reason = _run_waypoint(env, arm, approach_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 1 (approach) failed [{reason}]; {_final_reason()}", frames)
+
+    # Waypoint 2: INSERT -- translate in +y, under the slab, to the handle,
+    # staying at drawer height throughout (both endpoints share `drawer_z`,
+    # so the straight-line path the closed loop servos toward never crosses
+    # the slab's z in [0.33, 0.35]).
+    ok, used, reason = _run_waypoint(env, arm, handle_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 2 (insert) failed [{reason}]; {_final_reason()}", frames)
+
+    # Waypoint 3: GRIP -- close against the drawer's front face.
+    ok, used, reason = _run_dwell(env, arm, handle_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 3 (grip) failed [{reason}]; {_final_reason()}", frames)
+
+    # Waypoint 4: PULL -- drag back by PULL_DISTANCE_M, gripper held closed.
+    ok, used, reason = _run_waypoint(env, arm, pulled_point, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 4 (pull) failed [{reason}]; {_final_reason()}", frames)
+
+    # Waypoint 5: RELEASE -- open and hold.
+    ok, used, reason = _run_dwell(env, arm, pulled_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    frames += used
+    remaining -= used
+    if not ok:
+        return SkillResult(False, f"waypoint 5 (release) failed [{reason}]; {_final_reason()}", frames)
+
+    # Waypoint 6: RETREAT -- back outside the table edge.
+    ok, used, reason = _run_waypoint(env, arm, approach_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline)
+    frames += used
+    remaining -= used
 
     final_qpos = float(env.data.qpos[qadr])
     success = final_qpos >= DRAWER_SUCCESS_QPOS
-    reason = f"drawer_slide qpos: initial={initial_qpos:.4f} final={final_qpos:.4f} (limit 0.15, success>={DRAWER_SUCCESS_QPOS})"
+    measured = _final_reason()
+    if not ok:
+        return SkillResult(False, f"waypoint 6 (retreat) failed [{reason}]; {measured}", frames)
     if success:
-        return SkillResult(True, reason, frames)
-    if remaining <= 0:
-        return SkillResult(False, f"timeout; {reason}", frames)
-    return SkillResult(False, f"drag stalled; {reason}", frames)
+        return SkillResult(True, measured, frames)
+    return SkillResult(False, measured, frames)
