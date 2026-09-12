@@ -39,3 +39,6 @@ Thumbs.db
 # IDE
 .vscode/settings.json
 .idea/
+
+# Build artifacts (OpenVINO IR, reference tensors) -- regenerable, ~67MB
+artifacts/
