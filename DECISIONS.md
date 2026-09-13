@@ -11,6 +11,109 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-034 — `place(A, water_bottle, table)` verification: `run_place` never checked whether the object it was told to place was already held, causing a redundant internal re-pick to target an unreachable height; fixed by skipping the nested pick when already held. A second, unrelated waypoint-1 reachability failure remains and is reported, not patched.
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-033 (`pick(A, water_bottle)`'s
+per-prop hover fix, commit `d239a55`), which fixed `pick`'s own hover height
+but was never exercised against `place`'s path (`run_place`'s destination
+`approach_above_dest` uses the plain `TABLE_SURFACE_Z + CLEARANCE_HEIGHT_M`
+formula, no per-prop term, `skills_scripted.py`) · **Task:** verify
+`place(A, water_bottle, table)` by running `pick(A, water_bottle)` then
+`place(A, water_bottle, table)` in the same episode (the destination string
+`table_side` named in the brief is not implemented by `run_place` --
+`destination != "table"` is rejected outright -- so `"table"`, the value
+every other working `place` call in this repo already uses, was used
+instead).
+
+**Verification result: place did NOT succeed on first attempt.** Probe:
+`scripts/probe_place_bottle.py`, bm-ptl, `mujoco==3.2.7`, seed 0.
+
+**First failure, before any code change.** `pick(A, water_bottle)` succeeded
+(`weld_attach_frame=1155`, final pick z=0.6192, `is_holding('A')==
+'water_bottle'`). The immediately-following `place(A, water_bottle, table)`
+failed at `"waypoint 1 (approach) failed [convergence (IK residual=0.1639 m
+>= 0.01 m)]"` -- inside `run_place`'s own NESTED `run_pick` call, not `place`'s
+own destination waypoints. Root cause: `run_place` calls `run_pick`
+UNCONDITIONALLY every time, regardless of whether `arm` already holds
+`target_object` -- its own docstring already said "pick the object up (if
+not already held)" but the code never implemented that conditional. With the
+bottle already lifted and held at z=0.6192 (not resting on the table), the
+nested `run_pick` re-read the bottle's CURRENT (airborne) position as
+`obj_pos0` and, per ADR-033's `OBJECT_TOP_LOCAL_Z_M["bottle"]=0.11`,
+recomputed a hover roughly 0.17 m higher still -- a target the arm could not
+kinematically reach in the 500-step waypoint budget, so `place` failed
+before ever reaching its own destination logic, and the weld was never
+released (`is_holding('A')` stayed `'water_bottle'`).
+
+**This is NOT the ADR-033 failure mode, and ADR-033's `OBJECT_TOP_LOCAL_Z_M`
+pattern does not address it.** ADR-033 fixed a hover point sitting BELOW a
+STATIONARY object's own physical top during a fresh pick. Here the object
+was already held and airborne; the defect is that `place` re-picks an object
+it is already holding at all, not that any hover-height formula undershoots
+the object's top. Applying ADR-033's pattern here would have been the wrong
+fix -- confirmed by tracing the actual failing waypoint (the nested pick's
+APPROACH, not any of `place`'s own destination waypoints) before writing any
+code.
+
+**Fix applied (`skills_scripted.py`, `run_place` only).** Added a guard:
+`already_held = weld is not None and weld.is_holding(arm) == body_name`. If
+true, the nested `run_pick` call is skipped entirely and `place` proceeds
+straight to its own destination waypoints with the object already in hand;
+`weld_attach_frame` correctly reports `None` in this path (no new attach
+happened during this `place` call, per that field's own documented meaning).
+If `weld is None` or the object is not already held, behaviour is
+byte-for-byte unchanged (the nested `run_pick` call still runs exactly as
+before). No change to `grasp.py`, `ik.py`, `executor.py`,
+`scenes/so101/`, or `gen_dual_scene.py`.
+
+**Result after the fix: the first failure is gone, but `place` still does
+not succeed -- a second, different failure now surfaces, and it was NOT
+patched.** Re-running the same probe: the nested-pick failure disappears
+entirely (no more waypoint-1-inside-pick failure); `place` now fails at its
+OWN `"waypoint 1 (approach destination) failed [convergence (IK
+residual=0.0138 m >= 0.01 m)]"` -- a plain kinematic IK-solver residual that
+misses the 0.01 m tolerance by only 0.0038 m. Diagnosed before touching any
+code (`scripts/probe_place_waypoint1_diag.py`): driving toward the same
+target for a further 2000 steps (four times the normal 500-step waypoint
+budget) does not shrink this residual -- it plateaus, which rules out "just
+needs more steps" and is consistent with a genuine reachability-envelope
+edge, not a slow-convergence artifact. Independently, the destination x
+computed for this run landed exactly on `run_place`'s own safety clip bound
+(`dest_xy[0]` clipped to its `+0.30` limit), which is suggestive of the same
+kind of arm-specific reachability-envelope boundary this repo has already
+found and documented elsewhere (e.g. ADR-027's plate-rim direction fix,
+ADR-032's handoff-position sweep) -- but this was not independently
+re-measured across other start positions, so it is reported as a plausible
+explanation, not a proven one.
+
+**Why this was not also fixed here.** `PLACE_OFFSET_XY_M`/the destination
+clip bounds are shared by every prop's `place` call, not bottle-specific;
+changing them to dodge one measured edge case, without re-verifying every
+other prop's place path (none of which currently reach this waypoint at all
+-- `test_place_plate_returns_to_table_rest` fails earlier, at the nested
+pick's own grip, per ADR-024's already-documented grasp-reliability gap) is
+exactly the kind of speculative, unverified change the task instructions
+say not to make. This is reported, not patched.
+
+**Net honest status: `place(A, water_bottle, table)` still returns
+`SkillResult.success=False`; `is_holding('A')` still ends as
+`'water_bottle'`, not `None`; the bottle never reaches the table in this
+run.** `pytest tests/test_skills.py`: 4 failed / 4 passed before this change
+and 4 failed / 4 passed after (identical failure reasons/residuals for all
+four pre-existing failures, confirmed line-by-line) -- this fix changed no
+existing test's outcome, it only changes what a NEW bottle-place probe
+(not part of the pytest suite) reports.
+
+**Not done.** No change to `ARCHITECTURE.md` (out of scope for this task).
+No change to `ik.py`, `grasp.py`, `executor.py`, `gen_dual_scene.py`, or
+`scenes/so101/`. No change to ADR-031's GRIP freeze or ADR-033's pick hover.
+No speculative fix applied to the second (waypoint-1-destination)
+reachability failure -- it is left open and reported here for a follow-up
+diagnostic pass, same as ADR-032's handoff-position gap was left open
+rather than patched with an unverified guess.
+
+---
+
 ## ADR-033 — `pick(A, water_bottle)`: per-prop APPROACH/RETREAT hover height for tall props, fixing a hover point that sat BELOW the bottle's own physical top
 
 **Recorded:** Sept 13, 2026 · **Follows:** `docs/hardware/m06-water-bottle-diagnostic.md`

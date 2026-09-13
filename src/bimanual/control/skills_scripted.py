@@ -1410,19 +1410,62 @@ def run_place(
     baseline = _contact_counts(env)
 
     # `place` is self-contained: it performs the grasp itself rather than
-    # assuming a prior `pick` already ran, so it is independently testable
+    # ASSUMING a prior `pick` already ran, so it is independently testable
     # (tests/test_skills.py calls `place` directly at seed=0, object still on
     # the table). The nested `pick`'s own waypoint numbering/reason string is
     # propagated as-is on failure, so a failure inside the grasp still
     # localises to its exact stage.
-    pick_budget = max(1, step_budget // 2)
-    pick_result = run_pick(env, arm, target_object, step_budget=pick_budget, weld=weld)
-    frames += pick_result.frames_used
-    if not pick_result.success:
-        return SkillResult(
-            False, f"place aborted: pick failed ({pick_result.reason})", frames,
-            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=pick_result.weld_active_at_end,
-        )
+    #
+    # **Verification fix, Sept 13 2026 (M06 place-with-bottle verification
+    # probe): only call the nested `pick` if `arm` is NOT already holding
+    # `body_name`.** The docstring above already promised "pick the object
+    # up (if not already held)" -- this branch was the only place that
+    # promise was not actually implemented; previously this call ran
+    # UNCONDITIONALLY even when `weld.is_holding(arm) == body_name` already.
+    # Measured failure this fix addresses (`scripts/probe_place_bottle_
+    # verify.py`, bm-ptl, seed 0): running `pick(A, water_bottle)` then
+    # `place(A, water_bottle, table)` in the same episode -- i.e. exactly
+    # the sequence a `TaskPlan` produces, and exactly what this docstring's
+    # parenthetical anticipates -- had the nested `run_pick` recompute a
+    # fresh `hover` from the bottle's CURRENT (already-lifted, final
+    # pick z=0.6192) position using ADR-033's tall-prop top offset
+    # (`OBJECT_TOP_LOCAL_Z_M["bottle"]=0.11`), driving APPROACH toward
+    # roughly 0.17 m higher than where the arm already was holding the
+    # bottle -- a target the arm could not kinematically reach (IK
+    # residual=0.1639 m against `ik.IK_POSITION_TOLERANCE_M`=0.01 m after
+    # the full 500-step waypoint budget), so `place` failed at "waypoint 1
+    # (approach)" before ever reaching its OWN destination waypoints, and
+    # the weld was never released (`is_holding('A')` stayed `'water_bottle'`
+    # at the end). This is NOT the ADR-033 failure mode (a hover point
+    # sitting below a STATIONARY object's own top) and ADR-033's
+    # `OBJECT_TOP_LOCAL_Z_M` pattern does not apply here -- the bug is that
+    # `place` re-picks an object it is already holding at all, not that its
+    # hover height formula is wrong once it does. The fix is therefore a
+    # caller-side branch, not a new per-prop constant: skip the nested pick
+    # entirely when the weld already confirms this arm holds this object,
+    # go straight to the destination waypoints below with the object
+    # already in hand. When `weld is None` (no `WeldGrasp` supplied) or the
+    # object is not already held, this reproduces the exact prior
+    # behaviour -- the nested `run_pick` call is unchanged in that case.
+    already_held = weld is not None and weld.is_holding(arm) == body_name
+    if already_held:
+        pick_result = None
+    else:
+        pick_budget = max(1, step_budget // 2)
+        pick_result = run_pick(env, arm, target_object, step_budget=pick_budget, weld=weld)
+        frames += pick_result.frames_used
+        if not pick_result.success:
+            return SkillResult(
+                False, f"place aborted: pick failed ({pick_result.reason})", frames,
+                weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=pick_result.weld_active_at_end,
+            )
+
+    # `pick_result` is `None` when the object was already held (skipped the
+    # nested pick above) -- in that case no NEW attach happened during THIS
+    # `place` call, so `weld_attach_frame` reports `None` per its own
+    # docstring ("the instant `attempt_grasp` first returned True for THIS
+    # skill's own grasp"), not the earlier call's frame count.
+    pick_attach_frame = pick_result.weld_attach_frame if pick_result is not None else None
 
     remaining = step_budget - frames
     if remaining <= 0:
@@ -1478,7 +1521,7 @@ def run_place(
     if not ok:
         return SkillResult(
             False, f"waypoint 3 (release) failed [{reason}]", frames,
-            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=weld_holding,
+            weld_attach_frame=pick_attach_frame, weld_active_at_end=weld_holding,
         )
 
     # Waypoint 4: RETREAT -- back up to clearance height so the arm does not
@@ -1502,16 +1545,16 @@ def run_place(
     if not ok:
         return SkillResult(
             False, f"waypoint 4 (retreat) failed [{reason}]; {measured}", frames,
-            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=weld_holding,
+            weld_attach_frame=pick_attach_frame, weld_active_at_end=weld_holding,
         )
     if on_table_height and on_table_xy:
         return SkillResult(
             True, measured, frames,
-            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=weld_holding,
+            weld_attach_frame=pick_attach_frame, weld_active_at_end=weld_holding,
         )
     return SkillResult(
         False, f"object not resting on the table after place; {measured}", frames,
-        weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=weld_holding,
+        weld_attach_frame=pick_attach_frame, weld_active_at_end=weld_holding,
     )
 
 
