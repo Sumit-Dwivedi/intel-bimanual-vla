@@ -1923,6 +1923,11 @@ def run_handoff(
     full measurement trail, including the staging-geometry alternatives
     that were tried and NOT adopted).
 
+    API NOTE: run_handoff(env, to_arm, from_arm, obj, weld=...) -- receiver-first
+    argument order. An A->B handoff (arm A gives to arm B) is
+    run_handoff(env, "B", "A", "fork", weld=weld). Easy trap for demo scripts
+    and task planners.
+
     **Phase 1** -- `from_arm` picks the object up (nested `run_pick`, `weld`
     threaded through so `from_arm`'s own initial grasp attaches exactly like
     a standalone `pick`). `to_arm` is held stationary at HOME for this

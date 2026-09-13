@@ -19,9 +19,12 @@
 numpy==2.4.6
 PyYAML==6.0.3
 torch==2.14.0
-# LeRobot provides the ACT policy implementation and dataset format (brief p2
-# objective 4, PLAN.md M09/M11). Version below is PyPI's current release,
-# unverified against this project's dataset code.
-lerobot==0.4.4
+# lerobot==0.4.4 pin REMOVED (M06 completion pass, Sept 14 2026): ADR-023 cut
+# the learned-policy branch (M09b/M11, ACT training) from the critical path
+# on schedule evidence -- the shipped policy is the scripted controller, not
+# a learned one. Repo-wide grep confirms no `.py` file imports `lerobot`;
+# it appeared only in this file's own comments and in docs describing the
+# cut work (PLAN.md, ARCHITECTURE.md, DECISIONS.md, SUBMISSION.md). Nothing
+# in the shipped pipeline needs this dependency.
 opencv-python==4.14.0.94
 tqdm==4.70.0

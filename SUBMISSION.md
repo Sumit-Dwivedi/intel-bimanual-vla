@@ -4,7 +4,7 @@ Track every deliverable required by the hackathon platform. Docs-writer
 updates status marks as artifacts land. Nothing here is written on Day 5
 that wasn't planned from Day 1.
 
-## Status snapshot (updated Sept 12, 2026)
+## Status snapshot (updated Sept 14, 2026)
 
 Complete and evidenced: M01 (repo scaffold, pinned envs, `scripts/verify_env.py`),
 M02 (dual-arm MuJoCo scene, `TableSettingEnv`, opt-in rendering — ADR-022), M03
@@ -12,28 +12,61 @@ M02 (dual-arm MuJoCo scene, `TableSettingEnv`, opt-in rendering — ADR-022), M0
 M04 (`CommandSource` abstraction, text + voice stub, 11 tests), M05 (rule grounder,
 43 tests, `docs/command-grammar.md`).
 
-**M06a (scripted manipulation skills) is INCOMPLETE — pending weld-vs-reposition
-decision, Day 4 AM.** No skill currently executes end-to-end: `pick` reaches every
-waypoint but never achieves a lift (finger pads land below/beside the target rather
-than forming a sustained pinch); `open_drawer` is structurally blocked because the
-arm bases are mounted at tabletop height and cannot reach beneath the slab; `place`
-and `handoff` both depend on `pick` and are therefore also unproven. Do not describe
-any skill as working in judge-facing copy until this changes.
+**M06 (scripted manipulation skills) is COMPLETE for four of the eight skill/arm/
+object combinations exercised to date, verified by direct measurement on bm-ptl,
+not assumed (ADR-029 through ADR-038).** Grasping is implemented as a MuJoCo weld
+equality constraint, toggled on proximity plus jaw closure — an explicit
+abstraction of contact-based grasping, not friction-based finger contact (ADR-029),
+disclosed as such per ADR-015. The remaining four combinations fail for
+already-diagnosed, documented reasons (below), not silently.
+
+**Working, verified end-to-end (seed 0, bm-ptl, `mujoco==3.2.7`):**
+- `pick(A, fork)`
+- `place(A, fork, table)`
+- `pick(A, water_bottle)`
+- `handoff(A→B, fork)`
+
+**Not working, documented not silently dropped:**
+- `place(water_bottle, table)` — IK residual 0.0138 m against the 0.01 m
+  tolerance at the destination-approach waypoint, unimproved at 4x the step
+  budget, with the destination x landing on the place path's own `+0.30`
+  safety-clip bound (ADR-034).
+- `pick(A, mug)` — waypoint 1 (approach) convergence failure, IK residual
+  0.0532 m against the 0.01 m tolerance: arm A cannot reach the mug's
+  grasp-point hover position from its current base placement (already-
+  documented reach limit, same class of failure ADR-027 first reported).
+- `open_drawer` — structurally blocked: the arm bases are mounted at tabletop
+  height and cannot reach beneath the slab.
+- `handoff(B→A, fork)` — fails at phase 1: `pick(B, fork)`'s own APPROACH does
+  not converge (IK residual 0.0954 m against the 0.01 m tolerance). This is a
+  pre-existing kinematic reach limit of **arm B's** own base placement and
+  approach angle to this fork position — arm B has never been shown able to
+  pick this fork — not arm A's, and unrelated to the ADR-037 choreography
+  change. Re-measured directly for this update via
+  `scripts/run_skill.py --skill handoff --object fork --arm A --from-arm B
+  --seed 0` on bm-ptl (HEAD `4d69c30`): identical result
+  (`reason: phase 1 (from_arm pick) failed (waypoint 1 (approach) failed
+  [convergence (IK residual=0.0954 m >= 0.01 m)])`), matching ADR-037's own
+  recorded measurement.
+
+`pytest tests/test_skills.py`: 4 passed / 4 failed (same four tests failing
+throughout ADR-034 through ADR-038, no regression).
 
 **Cut from scope:** ACT/policy training (ADR-023, user-ratified Sept 12) — no
 learned policy exists; the scripted controller is the shipped policy, and brief p2
 objective 4 (train/fine-tune with LeRobot) is unmet. `pour` was dropped at the
 pre-committed cut-ladder gate — consequence: **the brief's own verbatim example
 command, which ends "pour water into the mug," can no longer run end-to-end**, even
-once M06a is unblocked, because `pour` itself does not exist. `docs/command-grammar.md`
-and M05's grounder still parse that exact command correctly to a 5-skill plan; only
-execution of the last skill is out of scope.
+now that M06's four working skills are proven, because `pour` itself does not exist.
+`docs/command-grammar.md` and M05's grounder still parse that exact command correctly
+to a 5-skill plan; only execution of the last skill is out of scope.
 
-**At risk because of the above:** the 10-seed robustness recording, any end-to-end
-task-completion claim, and the demo video's content all depend on at least one skill
-completing successfully. As of this update none does, so none of these can be
-produced yet. This is stated plainly here rather than left implied by an unchecked
-box.
+**Updated Sept 14, 2026:** four skill/arm/object combinations (`pick(A, fork)`,
+`place(A, fork, table)`, `pick(A, water_bottle)`, `handoff(A→B, fork)`) now complete
+end-to-end and are available for the 10-seed robustness recording and demo video
+content — see the Working list above. The four listed as not working are the ones
+still at risk; a full brief-example command (which ends in `pour`, out of scope) is
+still not reachable end-to-end.
 
 ## Basic Information
 - [ ] Project title: [DRAFT: Bimanual VLA on Intel Core Ultra — a voice-driven table-setting demo]
@@ -55,10 +88,10 @@ box.
 ## Cover Image & Presentation
 - [ ] Cover image (1200x630 recommended): TODO — not produced. Candidate source material
   exists (`docs/images/m02-scene.png`, `docs/images/m02-drawer-view-open.png`,
-  `docs/images/m02-drawer-view-closed.png`, `docs/images/m06-grip-diagnostic-frame30.png`)
-  but none of these shows "both arms mid-task" completing a skill, since no skill
-  currently completes. Brief needs a decision on whether the cover image shows the scene
-  (accurate) or implies a completed manipulation (not yet true).
+  `docs/images/m02-drawer-view-closed.png`, `docs/images/m06-grip-diagnostic-frame30.png`,
+  and now `docs/images/m06-handoff-complete.png`, which does show a completed
+  `handoff(A→B, fork)` — see the Working list above). Brief still needs a decision on
+  final crop/framing for the 1200x630 cover slot; not resolved by this update.
 - [ ] Video presentation (demo + narration): TODO — see `docs/video-script.md` (not yet
   written). **At risk**: a script cannot honestly narrate an end-to-end pick/place/pour
   sequence today; see status snapshot above.
@@ -71,10 +104,31 @@ box.
 
 ## Rubric Alignment (Intel + platform)
 Intel-specific (100 pts):
-- [ ] End-to-end task completion & bimanual (30) — **NOT MET.** M06a is incomplete
-  (pending weld-vs-reposition decision, Day 4 AM); no skill executes end-to-end today.
-  `pour` is additionally dropped from scope, so even after M06a resolves, the full
-  brief-example command cannot complete without a further scope decision.
+- [x] End-to-end task completion & bimanual (30) — **MET.** `handoff(A→B, fork)`
+  executes end-to-end, verified by direct measurement on bm-ptl (sequential
+  choreography where one arm moves at a time while the other is held frozen,
+  ADR-037; render legibility fixes, ADR-038): arm A picks the fork, transfers it
+  to the handoff point, and retreats clear of the shared workspace, while arm B
+  approaches, grips, and ends holding it (`weld.is_holding('B')=='fork'`,
+  `weld.is_holding('A') is None`, `from_arm_clear=True`) — genuine two-arm
+  coordination, not two independent single-arm scripts. This follows the
+  sequential single-arm-at-a-time choreography described in Wan, Ramos, Yang,
+  Garrett 2025 (NVIDIA), "Learning to Plan & Schedule with Reinforcement-Learned
+  Bimanual Robot Skills", https://arxiv.org/html/2510.25634v1, and is consistent
+  with the collision-free bimanual trajectory planning approach in "Trajectory
+  planning system for bimanual robots: Achieving efficient collision-free
+  manipulation" (2025),
+  https://www.sciencedirect.com/science/article/pii/S0921889025002155 (title and
+  URL cited; no author name for this paper has been verified, so none is given).
+  Three further single-arm skills also complete end-to-end: `pick(A, fork)`,
+  `place(A, fork, table)`, `pick(A, water_bottle)`. Grasping itself is an
+  explicit weld-constraint abstraction, not friction-based contact (ADR-029,
+  disclosed per ADR-015) — see README's "Grasping Abstraction and Documented
+  Limitations". This is not a claim that the full brief-example command
+  completes: four other skill/arm/object combinations do not yet work (see the
+  Working/Not working lists above), and `pour` remains out of scope (ADR-023).
+  The 30-point criterion is read here as "bimanual, end-to-end task completion,"
+  which the measured `handoff` satisfies.
 - [ ] VLA / multi-modal reasoning (20) — text command → grounded skill plan works
   (M04 CommandSource, M05 rule grounder, 43 tests, `docs/command-grammar.md`), but this
   is a rule-based grounder, not a learned VLA model — ACT/policy training is cut
