@@ -59,6 +59,84 @@ targets end-effector *position*; the jaw's approach angle is whatever falls
 out of the redundant 5-joint solve. This is why every grasp point below is
 chosen to be forgiving of approach angle (a small, roughly axisymmetric
 feature) rather than requiring a precise pinch orientation.
+
+**Ctrl hold pattern per `docs/hardware/m06-phase2-prerequisites.md` Q2 --
+`TableSettingEnv.step()` overwrites all 12 actuator targets unconditionally
+(`env.py:260`), and the `home` keyframe declares qpos only, so an unheld idle
+arm drifts toward qpos=0, the pre-ADR-026 cross-arm interpenetration pose.**
+`env.step()` does no holding of its own -- it is a bare, unconditional
+12-vector overwrite with no merge against the previous `data.ctrl` and no
+reference to `qpos`. Holding the idle arm is entirely the CALLER's
+responsibility, and every `env.step()` call in this module already
+discharges it via `_hold_ctrl` (below), called immediately before
+`_write_arm_ctrl` overwrites the actively-driven arm's own slice
+(`_drive_to_target`/`_dwell`, ADR-010's "hold the idle arm at a safe pose").
+
+**M06 Phase 2 Commit 1 decision: keep `_hold_ctrl` as the ONE ctrl-hold
+mechanism; do not add a second, competing one.** The alternative considered
+was pinning idle joints to a `skill_start_ctrl` snapshot taken once at
+`ScriptedSkillExecutor.execute()`'s entry and holding it as a fixed setpoint
+for the whole skill call, versus `_hold_ctrl`'s existing behaviour of
+re-anchoring to wherever the idle joints CURRENTLY sit, fresh, every step.
+Two reasons, both checked directly rather than assumed:
+  1. **`skill_start_ctrl` pinning is semantically WRONG for `run_handoff`,
+     not merely harder to wire.** `handoff`'s own staging
+     (`run_handoff`'s docstring, steps 2-7) has `from_arm` drive to
+     `HANDOFF_POSITION_XYZ` and then sit there HOLDING THE OBJECT while
+     `to_arm` approaches, descends, and grips -- i.e. partway through a
+     single `handoff` call, `from_arm` is "idle" (not the arm
+     `_run_waypoint`/`_run_dwell` is actively driving) at a pose far from
+     where it started the skill. Pinning idle joints to a snapshot taken at
+     `execute()`'s entry would command `from_arm` back toward its FOLDED
+     HOME pose while it is still holding the object at the transfer point --
+     fighting the very coordination `handoff` depends on, not protecting it.
+     `_hold_ctrl`'s "wherever it currently is" is the only one of the two
+     designs that is correct for a skill whose active/idle role swaps
+     mid-call.
+  2. Relatedly, `ScriptedSkillExecutor.execute()` (`executor.py`) never
+     calls `env.step()` itself -- every step happens deep inside this
+     module's own nested call chain (`run_pick`/`run_place`/`run_handoff`/
+     `run_open_drawer` -> `_run_waypoint`/`_run_dwell` -> `_drive_to_target`/
+     `_dwell` -> `env.step()`), so implementing (1)'s wrong design would
+     also require threading a snapshot through every one of those layers --
+     a wide, invasive change with a wrong answer at the end of it.
+
+**Measured limitation of the kept mechanism, found by
+`scripts/probe_ctrl_hold.py` and NOT to be understated: `_hold_ctrl` does
+not actually hold the idle arm still over a long dwell.** Because it
+re-reads CURRENT qpos every step and commands exactly that (zero position
+error at the instant of the read), it supplies no restoring force against
+gravity between reads -- each step's small gravity-induced sag becomes the
+next step's new "hold" target, so the arm's true reference ratchets away
+from its original pose monotonically. Measured directly (100-2000
+`env.step()` calls, only arm A driven, arm B held only by `_hold_ctrl`):
+arm B's `shoulder_lift` drifted 0.0402 rad by step 100 (already over this
+task's 0.01 rad bar), 0.461 rad by step 1000, and saturated at 0.546 rad by
+roughly step 1500 -- which lands within noise of arm B's OWN
+`shoulder_lift` joint's lower `jnt_range` bound (home -1.2, range floor
+-1.7453; -1.2 - 0.546 = -1.746), i.e. the idle arm sags under gravity until
+a hard mechanical stop catches it, not until any controller-side limit
+does. This is a real, previously-unmeasured gap -- the Q2 audit was
+explicitly read-only ("No probes run") and only established that
+`_hold_ctrl` prevents the ADR-026 zero-pose case, not that it holds the arm
+motionless. It is reported here rather than fixed: a correct fix (cache
+the idle arm's own LAST ACTIVELY-COMMANDED ctrl and hold that fixed value,
+refreshed only when that arm is next driven -- neither of this task's two
+offered designs, since "current qpos" sags and "skill-start" is wrong per
+point 1 above) is a different, larger change than either option on the
+table for this scaffolding commit, and is flagged here as a Phase 2
+follow-up rather than attempted under this commit's time-box.
+
+The real gap the audit identified is orthogonal to which idle-hold POLICY is
+used: it is that the protection lives HERE, in `skills_scripted.py`'s own
+`_hold_ctrl`, not inside `env.py` or `executor.py`, so any FUTURE code path
+that calls `env.step()` directly (e.g. Phase 2 Commit 2's `WeldGrasp` wiring)
+must route through `_hold_ctrl` or reproduce its exact pattern, or it will
+silently reintroduce the ADR-026 34-contact interpenetration the first time
+it drives one arm while leaving the other's ctrl slice at 0.
+`scripts/probe_ctrl_hold.py` exercises exactly this reproduce-the-pattern
+case directly against `env.step()` (not through this module's own skill
+loops) and reports the measured idle-arm drift.
 """
 
 from __future__ import annotations
@@ -214,6 +292,32 @@ TABLE_SURFACE_Z = 0.35
 #: exactly what ADR-026 caught). Replaces the old, inconsistently-named
 #: `APPROACH_HEIGHT_M`/`LIFT_HEIGHT_M` pair with one constant used
 #: uniformly by every staged skill.
+#:
+#: **M06 Phase 2 Commit 1: 0.08 -> 0.05 tried and REVERTED; left at 0.08.**
+#: NOT justified by `m06-ik-lift-diagnostic.md`'s 68%-at-10cm/61%-at-15cm
+#: single-shot-IK figures in any case -- per `m06-phase2-prerequisites.md`
+#: Q1, every waypoint in this module uses the INCREMENTAL regime
+#: (`_drive_to_target`/`_dwell` re-solve `ik.solve_position_ik` fresh
+#: against `env.data`'s current state on every `env.step()`), never the
+#: single-shot solve-once-and-hold regime those figures describe, so citing
+#: them here would describe a control loop the skills never run. The
+#: candidate reasons for 0.05 (smaller vertical excursion -> less workspace
+#: swept per waypoint, smaller shared-band sweep during `handoff`, fewer
+#: incremental per-step IK re-solves to converge) are geometrically
+#: plausible, but checked empirically here rather than assumed, and the
+#: check failed: at 0.05, `pick(A, plate)`'s APPROACH waypoint hovers close
+#: enough over the plate's own raised rim (`GRASP_POINT_OFFSET_M["plate"]`)
+#: that the jaw's collision geometry now grazes it during the approach --
+#: `pytest tests/test_skills.py::test_pick_plate_waypoints_progress_
+#: without_collision` (an ADR-027 regression test, previously passing)
+#: newly fails with `waypoint 1 (approach) failed [collision (arm-vs-prop:
+#: plate (dist=-0.0301 m); threshold=-0.005 m)]` -- an order of magnitude
+#: past `TABLE_COLLISION_DEPTH_TOL_M`'s graze/tunnel boundary, not a
+#: transient debounce artefact. Per this task's own instruction ("if you
+#: find neither reason holds up, leave the constant at 0.08 rather than
+#: making an unjustified change"), this is left at 0.08: the shorter
+#: excursion's theoretical benefits do not outweigh a real, newly-introduced
+#: collision against a prop this module already has to clear at 0.08.
 CLEARANCE_HEIGHT_M = 0.08
 
 #: ADR-027. Per-waypoint step cap for a single IK-driven APPROACH/DESCEND/
@@ -421,6 +525,22 @@ def _hold_ctrl(env) -> np.ndarray:
     CURRENT joint position -- the safe default for whichever arm is not
     being actively driven this step (ADR-010: "the idle arm [is held] at a
     safe pose" while the other arm works the shared workspace).
+
+    Kept over a `skill_start`-pinned alternative as of M06 Phase 2 Commit 1
+    (module docstring above has the full comparison): re-anchoring to
+    CURRENT qpos, not a fixed skill-start snapshot, is the only one of the
+    two designs that stays correct across `run_handoff`, where the "idle"
+    arm mid-call is holding the object at the transfer point, not sitting
+    at its pose from the top of the skill.
+
+    **Known limitation, measured by `scripts/probe_ctrl_hold.py`, not
+    fixed here:** because this re-reads qpos fresh every step and commands
+    zero position error at that instant, it supplies no restoring force
+    against gravity between reads -- the idle arm can sag monotonically
+    over a long dwell (measured: 0.04 rad by 100 steps, saturating at
+    0.546 rad -- a joint hard-limit stop, not a controller limit -- by
+    roughly 1500 steps). It reliably prevents the ADR-026 zero-pose
+    interpenetration case; it does not keep the idle arm motionless.
     """
     ctrl = np.zeros(env.model.nu, dtype=np.float64)
     for aid in range(env.model.nu):

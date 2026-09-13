@@ -11,6 +11,81 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06 Phase 2 Commit 1 — safety scaffolding: `_hold_ctrl` kept (not replaced), APPROACH clearance reduction tried and reverted (follows ADR-010, ADR-027; per `docs/hardware/m06-phase2-prerequisites.md`)
+
+**Recorded:** Sept 13, 2026. **Scope:** scaffolding only, no weld wiring (Phase 2 Commit 2 is separate).
+
+**Ctrl-hold decision.** Two designs were compared for holding the idle arm across
+`env.step()` calls: the existing `_hold_ctrl` (`skills_scripted.py`, re-anchors idle
+joints to CURRENT qpos every step) versus a proposed `skill_start_ctrl` (pin to the
+pose at skill start, actively correcting drift). **Kept `_hold_ctrl`, did not add a
+second mechanism.** Decisive reason, checked directly rather than assumed:
+`run_handoff` has `from_arm` sit at the transfer point HOLDING THE OBJECT while
+`to_arm` is the one being actively driven -- pinning to skill-start would command
+`from_arm` back toward its folded home pose mid-handoff, fighting the object transfer.
+`_hold_ctrl`'s "wherever it currently is" is the only one of the two designs that
+stays correct when the active/idle role swaps mid-skill. Secondarily,
+`ScriptedSkillExecutor.execute()` never calls `env.step()` itself (every step is
+nested inside `skills_scripted.py`'s own `run_*` -> `_run_waypoint`/`_run_dwell` ->
+`_drive_to_target`/`_dwell` chain), so implementing the rejected design would also
+have required threading a snapshot through every layer for a wrong answer.
+
+**New finding, not previously measured (the Q2 audit was read-only, "no probes
+run"): `_hold_ctrl` does not keep the idle arm motionless.** `scripts/probe_ctrl_hold.py`
+drove only arm A for up to 2000 `env.step()` calls and measured arm B's drift from
+home under `_hold_ctrl` alone: 0.0402 rad by step 100 (over this task's 0.01 rad
+bar), 0.461 rad by step 1000, saturating at 0.546 rad by roughly step 1500 -- landing
+at arm B's own `shoulder_lift` joint's hard `jnt_range` floor (home -1.2, range floor
+-1.7453). Cause: re-reading current qpos each step supplies zero restoring force
+against gravity, so each step's sag becomes the next step's new "hold" reference,
+ratcheting the idle arm down until a mechanical joint limit -- not any controller
+limit -- stops it. This does not reproduce the ADR-026 zero-pose interpenetration
+(the catastrophic case `_hold_ctrl` was built to prevent, and still does), and it
+did not change any test outcome in this repo's current skills (same 4-pass/4-fail
+split before and after, see below), but it is a real, previously-undocumented gap.
+Flagged as a Phase 2 follow-up: the correct fix is a THIRD design neither offered
+here -- cache each arm's own LAST ACTIVELY-COMMANDED ctrl and hold that fixed value
+(refreshed only when that arm is next driven) -- not attempted in this commit
+(out of time-box, and not one of the two designs this commit was scoped to choose
+between).
+
+**APPROACH clearance (`CLEARANCE_HEIGHT_M`) tried at 0.05, reverted to 0.08.** The
+task's own given rationale for 0.08 (`m06-ik-lift-diagnostic.md`'s single-shot-IK
+68%/61% figures) does not apply here -- per `m06-phase2-prerequisites.md` Q1, every
+waypoint in this module uses the INCREMENTAL IK regime, never single-shot. The
+candidate alternative reasons for 0.05 (smaller swept workspace per waypoint, smaller
+handoff sweep, fewer incremental re-solves) were checked empirically rather than
+assumed and did not hold up: at 0.05, `pick(A, plate)`'s APPROACH waypoint newly
+collides with the plate's own raised rim (`test_pick_plate_waypoints_progress_
+without_collision`, previously passing, now fails: `dist=-0.0301 m` vs.
+`threshold=-0.005 m`, an order of magnitude past the graze/tunnel boundary, not a
+debounce artefact). Left at 0.08 per the task's own instruction ("if neither reason
+holds up, leave the constant... a smaller number with no rationale is not an
+improvement").
+
+**Verification (bm-ptl, `C:\Users\devcloud\project\ov_env\Scripts\python.exe`).**
+- `pytest tests/test_skills.py`: 4 passed / 4 failed before this commit's changes AND
+  after (identical failing tests, identical failure reasons/measured values) --
+  unchanged by either the docstring-only ctrl-hold decision or the clearance
+  revert.
+- `python scripts/run_skill.py --skill pick --object fork --arm A --seed 0`: identical
+  before/after -- `success=False, frames_used=1800`, `reason="did not lift fork:
+  initial_z=0.3560 final_z=0.3538 margin_required=0.03"`, `max_joint_limit_violation=
+  0.0003909627168092733`, no mj_warnings. Same failure mode as the pre-Phase-2
+  baseline (grasp still unwired) -- no new or different failure introduced.
+- `scripts/probe_ctrl_hold.py` (100 steps, tolerance 0.01 rad): **max arm B drift =
+  0.040207 rad** (`armB_shoulder_lift`, at the final step) -- over the stated bar;
+  reported plainly above rather than the constant retuned to make the probe pass,
+  since the actual property being measured is real physics, not a probe-tuning knob.
+
+**Deviation from the instructed exact commit message, disclosed rather than
+silently applied:** the given text ("...reduced APPROACH radius...") asserts the
+clearance constant was changed; it was tried and reverted (see above), so using
+that text verbatim would misstate what this commit contains. The commit message
+used instead describes the outcome truthfully.
+
+---
+
 ## ADR-029 — Weld-based grasping mechanism (Phase 1: mechanism verified, not yet wired into skills)
 
 **Recorded:** Sept 13, 2026 · **Follows:** `docs/hardware/grasp-envelope.md` (0 of 30
