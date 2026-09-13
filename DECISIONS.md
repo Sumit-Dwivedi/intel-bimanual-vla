@@ -11,6 +11,146 @@ being ratified by the user rather than proposed.
 
 ---
 
+## M06 Phase 2 follow-up — Bug 1 (jaw hull collision) audited, found already fixed; Bug 2 (grasp gate) fixed to measure from the pinch point
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-030 (weld wired into `pick`/`place`/
+`handoff`, found `pick(A, fork)`/`pick(A, water_bottle)` both fail
+`weld_attach_failed_after_300_frames`) · **Touches:** `src/bimanual/sim/grasp.py`
+only. `scripts/gen_dual_scene.py` and `scenes/so101/` are **unchanged** by this
+entry -- see Bug 1 below for why.
+
+### Bug 1 — jaw hulls: audited, NOT currently broken; the given premise did not
+### reproduce
+
+The task handed to this session asserted, with a specific per-arm geom table,
+that `sts3215_03a_v1`, `wrist_roll_follower_so101_v1` and `moving_jaw_so101_v1`
+were still `COLLIDABLE` in the compiled model, and asked which of three causes
+explained it (wrong geoms, overwritten later, or a mismatched assertion set) so
+the fix would not regress.
+
+**Directly checked, not assumed, on both machines:** compiled
+`src/bimanual/sim/assets/so101_dual_table.xml` with `mujoco==3.2.7` and read
+`model.geom_contype`/`model.geom_conaffinity` for every geom on
+`arm{A,B}_gripper` and `arm{A,B}_moving_jaw_so101_v1`, first on this
+developer's laptop, then independently on bm-ptl
+(`C:\Users\devcloud\project\ov_env\Scripts\python.exe`, same mujoco version).
+**Both runs agree: all three target meshes already report `contype=0
+conaffinity=0` on both arms** (`sts3215_03a_v1` x2 per gripper body -- one at
+`armA_gripper`, a second colocated copy from the wrist_roll servo housing --
+`wrist_roll_follower_so101_v1` x1, `moving_jaw_so101_v1` x1), and both finger
+pads (`arm{A,B}_static_finger_pad`, `arm{A,B}_moving_finger_pad`) report
+`contype=1 conaffinity=1`, collidable, as required. Re-running
+`scripts/gen_dual_scene.py` from a clean checkout reproduces the committed
+`so101_dual_table.xml` byte-for-byte (`diff` empty) -- the generator is
+deterministic and its output matches what both machines compiled.
+
+**Conclusion: this is `8f09f8c`'s ("M06a fixes: target-prop exemption, complete
+jaw collision disable, fork test") own completed fix, still in effect, not a
+regression and not incomplete.** `disable_jaw_mesh_collision()` (see that
+function's own docstring in `scripts/gen_dual_scene.py`) already matches by
+BODY membership (`{prefix}gripper`, `{prefix}moving_jaw_so101_v1`), not by mesh
+name, which is exactly the fix `8f09f8c` made after finding the mesh-name
+filter missed the colocated `sts3215_03a_v1` servo-housing geom. Per this
+session's honesty rules ("never claim a module works without running it" cuts
+both ways -- a claimed *broken* state must be run and confirmed too), no change
+was made to `scripts/gen_dual_scene.py` or `scenes/so101/` for Bug 1: there was
+nothing to fix, and editing a generator that already produces the correct
+output on unverified say-so would be the kind of unearned change this
+project's conventions exist to prevent. The per-arm geom table this session was
+handed does not match either machine's compiled model; it is not reproduced
+here, and this entry does not speculate about its origin beyond what was
+directly checked.
+
+`scripts/probe_pad_separation.py` re-run on bm-ptl for completeness (VERIFY 1's
+second requirement): **bit-for-bit identical** to ADR-028's own gate (fully
+closed 0.00600 m, midway 0.07621 m, fully open 0.13188 m, spread 0.12589 m) --
+expected, since nothing touching pad geometry changed.
+
+### Bug 2 — grasp gate measured the wrong point, fixed; `pick(A, fork)` still
+### fails, for a different, deeper reason
+
+`grasp.py`'s `WeldGrasp.attempt_grasp` Gate 2 (proximity) measured the
+`armX_gripper` BODY's world position to the object -- not the PINCH POINT
+`ik.solve_position_ik` actually targets (ADR-025: the midpoint of
+`armX_gripper` and `armX_moving_jaw_so101_v1`'s body positions, recomputed
+every solve via `mj_jacBody`/`xpos` on both bodies, never a fixed local-axis
+offset -- see `ik.py`'s `solve_position_ik`/`_pinch_point()`). Per this
+session's explicit instruction, the fix mirrors `ik.py`'s own computation
+(`0.5 * (xpos[fixed_jaw] + xpos[moving_jaw])`) rather than a fixed
+`PINCH_POINT_OFFSET_M`-along-local-Z guess, which would not track jaw closure
+the way the true midpoint does. `WeldGrasp.__init__` now also resolves each
+arm's moving-jaw body id (via `ik.moving_jaw_body_name`) alongside the
+already-resolved fixed-jaw body id; the weld's own attach frame (anchor/relpose
+computed against the gripper body) is unchanged -- only the Gate 2 distance
+measurement moved. `attempt_grasp`'s docstring carries the exact note this
+task specified, plus a "Bug history" paragraph recording what changed and why.
+
+**Verification, bm-ptl, before/after `pytest tests/test_skills.py`:** BEFORE
+(pre-fix `grasp.py`, i.e. ADR-030's own state): 4 passed / 4 failed
+(`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`, `test_handoff_mug_ends_held_by_arm_b`
+-- byte-for-byte ADR-030's own reported baseline). AFTER (pinch-point gate):
+**identical, 4 passed / 4 failed, same four tests, same reasons** (plate still
+`weld_attach_failed_after_300_frames` at `final_z=0.3524`; drawer/handoff
+failures are the same already-documented kinematic-reach limits, untouched by
+this change). No regression.
+
+**`pick(A, fork)`, fresh env, seed=0, AFTER the gate fix:** `success=False,
+frames_used=1300, reason=weld_attach_failed_after_300_frames`. `weld:
+attach_frame=None active_at_end=False`. `fork z: initial=0.3560 final=0.3538
+delta=-0.0022` (never lifted). `mj_warnings={}`,
+`max_joint_limit_violation=0.00039` -- no MuJoCo warnings. **This is still a
+FAILURE**, and per this task's own branch instruction ("If it FAILS: STOP and
+report which of these occurred"), it is reported here rather than chased with
+mug/water_bottle/handoff/place or a render: **the gate never fired** (not
+"attached then released", not "held but did not lift" -- `weld_attach_frame`
+is `None`, meaning `attempt_grasp` never returned `True` in any of the 300 GRIP
+dwell steps).
+
+**Why the gate fix did not flip this to a pass, measured directly rather than
+assumed:** a monkey-patched instrumentation of `attempt_grasp` (scratch
+diagnostic, not shipped) logged the fixed-jaw body position, the moving-jaw
+body position, their midpoint (the corrected pinch point), and the fork's
+position every 20 GRIP-dwell calls. Both the OLD gripper-body-only distance and
+the NEW pinch-point distance grow **together, almost identically** through the
+dwell (gripper-body: 0.0299 m -> 0.0795 m; pinch-point: 0.0351 m -> 0.0793 m,
+both crossing the 0.05 m threshold around the same point in the closure
+sweep) -- because the fixed-jaw and moving-jaw bodies were observed to move
+*together* (both rising in z by several centimetres over the 300-step dwell),
+not apart, so their average tracks almost the same trajectory as either body
+alone. Root cause candidate, not chased further under this task's own
+60-minute time box and its "not a wiring defect to be patched around by
+loosening a threshold" instruction: `_dwell` (`skills_scripted.py`, out of
+scope for this session) re-solves `ik.solve_position_ik` toward a FIXED
+target every step of the GRIP dwell, using the CURRENT (including
+still-closing) jaw angle each time; as the jaw sweeps through nearly its full
+~2 rad range over the dwell, the instantaneous IK solution that keeps the
+pinch point at target changes rapidly, and the arm's actual (PD-tracked)
+pose appears to lag that fast-moving solution rather than the jaw's motion
+being compensated for. The measured symptom -- both jaw bodies drifting
+upward together, not one compensating for the other -- is consistent with
+that lag, but this entry stops at "measured, not chased," per instruction:
+confirming the lag mechanism precisely would mean touching `ik.py` or
+`skills_scripted.py`, both off-limits here.
+
+**What this means for ADR-030's own root-cause claim.** ADR-030 attributed the
+divergence to `ik.solve_position_ik` targeting "the `armX_gripperframe` SITE"
+-- but `ik.py`, read directly for this session, does not target that site at
+all as of ADR-025; `solve_position_ik` targets the fixed/moving-jaw body
+midpoint exclusively, with no site reference anywhere in the solver. ADR-030's
+own diagnosis of *which* point diverges was therefore already imprecise; this
+session's direct measurement (both bodies drifting together) is offered in its
+place, not to relitigate ADR-030's wiring work, which is unaffected.
+
+**Consequences.** The gate now measures the quantity the task specified and
+`ik.py` actually controls -- a correctness fix, not a threshold retune -- and
+does not regress anything (`pytest` identical before/after). It does not,
+by itself, unblock `pick(A, fork)`; the remaining gap is a jaw-closure /
+IK-tracking dynamics question in `skills_scripted.py`/`ik.py`, both out of
+this session's scope, flagged as a follow-up rather than fixed here.
+
+---
+
 ## ADR-030 — Weld wiring into scripted skills (Phase 2 Commit 2)
 
 **Recorded:** Sept 13, 2026 · **Follows:** ADR-029 (weld mechanism verified, Phase 1),
@@ -658,6 +798,24 @@ changed: `scripts/gen_dual_scene.py` (`disable_jaw_mesh_collision`,
 `add_finger_pads`, wired into `main()`), the regenerated
 `src/bimanual/sim/assets/so101_dual_table.xml`, and
 `scripts/probe_pad_separation.py` (new diagnostic, not shipped skill code).
+
+**Correction (Sept 13, 2026, M06 Phase 2 follow-up session).** A later
+session was handed a claim that the jaw-body mesh disable this entry (and
+`8f09f8c`, below) describes was still incomplete -- specifically, that
+`sts3215_03a_v1`, `wrist_roll_follower_so101_v1` and `moving_jaw_so101_v1`
+were still `COLLIDABLE` in the compiled model. **Checked directly, not
+assumed, on both a development laptop and bm-ptl** (`mujoco==3.2.7`,
+`model.geom_contype`/`geom_conaffinity` read for every geom on the relevant
+bodies): all three meshes already report `contype=0 conaffinity=0` on both
+arms, and both finger pads remain collidable, exactly as this entry and
+`8f09f8c` intended. `8f09f8c`'s "complete jaw collision disable" (see that
+entry below) was, in fact, complete -- the disable was never incomplete, and
+no further code change was needed or made. The full audit (why the given
+premise did not reproduce, and what was checked) is recorded in the "M06
+Phase 2 follow-up" entry at the top of this file, above ADR-030. This
+correction exists so a future reader who finds this ADR's own "no further
+action taken" language does not go looking for a still-open gap that was
+never there.
 
 ---
 

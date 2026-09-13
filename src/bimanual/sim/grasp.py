@@ -223,6 +223,14 @@ class WeldGrasp:
         # see this module's docstring on the gripper naming trap.
         self._gripper_joint_qpos_adr: dict[str, int] = {}
         self._gripper_body_id: dict[str, int] = {}
+        # Bug 2 fix (this task): the moving-jaw BODY id is resolved here too,
+        # purely so Gate 2 (proximity) can compute the PINCH POINT -- the
+        # midpoint of this body and the fixed-jaw body -- exactly the same
+        # quantity `ik.solve_position_ik` targets (ADR-025, `ik.py`'s
+        # `_pinch_point()`). This does NOT change the weld attach frame: the
+        # weld still attaches to `self._gripper_body_id[arm]` (the fixed jaw),
+        # unchanged from ADR-029. Only the distance measurement below moves.
+        self._moving_jaw_body_id: dict[str, int] = {}
         for arm in ARMS:
             joint_name = ik.gripper_joint_name(arm)
             joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
@@ -235,6 +243,12 @@ class WeldGrasp:
             if body_id == -1:
                 raise ValueError(f"gripper body {body_name!r} not found in the compiled model")
             self._gripper_body_id[arm] = body_id
+
+            moving_jaw_name = ik.moving_jaw_body_name(arm)
+            moving_jaw_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, moving_jaw_name)
+            if moving_jaw_id == -1:
+                raise ValueError(f"moving jaw body {moving_jaw_name!r} not found in the compiled model")
+            self._moving_jaw_body_id[arm] = moving_jaw_id
 
         self._object_body_id: dict[str, int] = {}
         for object_name in GRASPABLE_OBJECTS:
@@ -265,11 +279,27 @@ class WeldGrasp:
         gripper_hi`), so "qpos below threshold" correctly reads as "jaws
         closing", matching the task's own convention.
 
-        Gate 2 -- proximity: the Euclidean distance from the `armX_gripper`
-        BODY's world position (the fixed jaw, the attach frame -- NOT the
-        `armX_gripper` JOINT's target, and NOT the moving jaw -- see this
-        module's docstring on the naming trap) to `object_name`'s body world
-        position must be below `distance_threshold_m`.
+        Gate 2 -- proximity: the Euclidean distance from the PINCH POINT to
+        `object_name`'s body world position must be below
+        `distance_threshold_m`. Distance is measured from the pinch point --
+        the midpoint of the fixed and moving jaw bodies, which is what
+        `ik.solve_position_ik` targets per ADR-025 -- not from the gripper
+        body. The weld still attaches to the gripper body; the pinch point is
+        where the arm is actually positioned, so it is the correct quantity to
+        gate on.
+
+        (Bug history, this task: an earlier version of this gate measured
+        from the `armX_gripper` BODY's world position alone -- the fixed jaw,
+        not the pinch point -- which diverges from the pinch point by a
+        growing margin as the jaw closes, because `ik.py`'s redundant 5-DOF
+        solve keeps the pinch point pinned at its target by rotating the
+        wrist, carrying the fixed-jaw body away from the object in the
+        process. That divergence (measured: 0.069 m at GRIP start, climbing
+        to 0.0795 m fully closed, against this gate's own 0.05 m default
+        threshold) meant the gate could never open. Fixed here by measuring
+        the same pinch point IK controls, mirroring `ik.py`'s own
+        `_pinch_point()` computation rather than a fixed local-axis offset,
+        which would not track jaw closure the way the true midpoint does.)
 
         Refusing when either gate fails (rather than always welding) is the
         entire point of this mechanism per ADR-029's Consequences: a
@@ -313,15 +343,28 @@ class WeldGrasp:
             return False
 
         # ---- Gate 2: proximity -------------------------------------------
+        # Measured from the PINCH POINT (the midpoint of the fixed and moving
+        # jaw bodies), not the gripper body alone -- see this method's
+        # docstring's "Bug history" note. This mirrors `ik.py`'s own
+        # `_pinch_point()` computation (`solve_position_ik`'s IK target)
+        # exactly: `0.5 * (xpos[fixed_jaw] + xpos[moving_jaw])`. Duplicated
+        # here (rather than imported) because `ik.py`'s `_pinch_point` is a
+        # local closure inside `solve_position_ik`, not a module-level
+        # function -- this comment is the pointer back to that source of
+        # truth (ik.py's `solve_position_ik`, `_pinch_point`) so the two
+        # never silently drift apart.
         gripper_body_id = self._gripper_body_id[arm]
+        moving_jaw_body_id = self._moving_jaw_body_id[arm]
         object_body_id = self._object_body_id[object_name]
         gripper_pos = self.data.xpos[gripper_body_id].copy()
+        moving_jaw_pos = self.data.xpos[moving_jaw_body_id].copy()
+        pinch_pos = 0.5 * (gripper_pos + moving_jaw_pos)
         object_pos = self.data.xpos[object_body_id].copy()
-        distance_m = float(np.linalg.norm(object_pos - gripper_pos))
+        distance_m = float(np.linalg.norm(object_pos - pinch_pos))
         if distance_m >= distance_threshold_m:
             logger.info(
-                "attempt_grasp refused: arm=%s object=%r too far (distance=%.4f m >= "
-                "distance_threshold_m=%.4f m)",
+                "attempt_grasp refused: arm=%s object=%r too far (pinch-point "
+                "distance=%.4f m >= distance_threshold_m=%.4f m)",
                 arm, object_name, distance_m, distance_threshold_m,
             )
             return False
