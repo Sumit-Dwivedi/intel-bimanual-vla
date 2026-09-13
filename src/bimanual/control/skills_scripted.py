@@ -519,6 +519,45 @@ PLACE_RELEASE_CLEARANCE_M = 0.02
 #: margin between the two jaws).
 HANDOFF_SIDE_OFFSET_M = 0.03
 
+#: **ADR-035 (target interpolation in the handoff traverse).**
+#: `docs/hardware/m06-handoff-warmstart-diagnostic.md` found that a single
+#: direct IK shot at `HANDOFF_POSITION_XYZ`'s z=0.35 plane fails for BOTH
+#: arms' home-seeded solves in the middle of the shared workspace (residual
+#: >14x tolerance), while a solve WARM-STARTED from a nearby already-
+#: converged pose, then walked 0.02 m at a time toward the target, converges
+#: at every single step, for both arms, across the full disjoint gap. This
+#: constant is that 0.02 m step, applied by `_run_interpolated_waypoint`
+#: below to the waypoint(s) that drive each arm from its APPROACH hover down
+#: to its transfer/receiving point, and by `_run_approach_with_staging` to
+#: an arm's very first move of a `handoff` call if that move does not
+#: converge directly.
+HANDOFF_INTERP_STEP_M = 0.02
+
+#: ADR-035. Per-arm home-seeded, joint-limit-and-residual-converged staging
+#: cell at hover height (`TABLE_SURFACE_Z + CLEARANCE_HEIGHT_M` = 0.43 m),
+#: MEASURED this session (not assumed from the diagnostic's z=0.35 table,
+#: which never checked hover height): a fresh sweep at z=0.43, home-seeded,
+#: found arm A's own reachable band starts at y=+0.06 (residual 0.00999;
+#: y=+0.04 fails at 0.04175) and arm B's mirror starts at y=-0.06 (residual
+#: 0.00999; y=-0.04 fails at 0.04175) -- the same disjoint-band shape the
+#: diagnostic found at z=0.35, just re-verified at the actual height
+#: `run_handoff`'s APPROACH waypoint uses. Used ONLY as a first-hop staging
+#: point when an arm's real APPROACH target does not converge in one shot
+#: from wherever that arm currently is (this only actually happens for
+#: whichever arm has not moved yet this `handoff` call, i.e. is still at
+#: HOME) -- never as a demanded handoff position, and never applied when the
+#: direct shot already succeeds.
+HANDOFF_STAGING_Y_M = {"A": 0.06, "B": -0.06}
+
+#: ADR-035. Minimum joint-limit margin (radians, despite the diagnostic
+#: script's "_M" suffix on the equivalent constant -- it bounds joint ANGLE,
+#: not position) an interpolation step's PHYSICALLY-REALIZED joint angles
+#: must keep from either `jnt_range` bound. Mirrors
+#: `scripts/probe_handoff_reachability_home.py`'s `JOINT_LIMIT_MARGIN_TOL_M`
+#: gate exactly, closing the caveat the warm-start diagnostic explicitly
+#: left open ("did not check joint-limit margins on the chained configs").
+HANDOFF_JOINT_LIMIT_MARGIN_TOL = 1e-4
+
 #: `open_drawer` tuning (ADR-027 lateral approach).
 #:
 #: How far outside the table's -y edge (table_top spans y in [-0.25, 0.25])
@@ -1558,6 +1597,167 @@ def run_place(
     )
 
 
+def _joint_limit_margin_now(env, arm: str) -> float:
+    """ADR-035. Joint-limit margin (radians) of `arm`'s 5 positioning
+    joints at their CURRENT, PHYSICALLY-REALIZED qpos (not a fresh
+    scratch IK solve) -- this checks the config the interpolation loop
+    actually left the real, simulated arm in, since a static IK chain
+    (what the diagnostic checked) is not the same thing as an executed
+    trajectory (the diagnostic's own explicitly-left-open caveat)."""
+    margin = float("inf")
+    for name in ik.arm_joint_names(arm):
+        jid = _joint_id(env.model, name)
+        qadr = int(env.model.jnt_qposadr[jid])
+        angle = float(env.data.qpos[qadr])
+        lo, hi = env.model.jnt_range[jid]
+        margin = min(margin, angle - float(lo), float(hi) - angle)
+    return margin
+
+
+def _run_interpolated_waypoint(
+    env,
+    arm: str,
+    start_pos,
+    end_pos,
+    gripper_fraction: float,
+    remaining_budget: int,
+    baseline: dict,
+    target_object: str | None = None,
+    step_size: float = HANDOFF_INTERP_STEP_M,
+) -> tuple[bool, int, str | None]:
+    """ADR-035: drive `arm` from `start_pos` to `end_pos` in `step_size`
+    increments, re-converging (IK residual + collision, via the existing
+    `_run_waypoint`) at EACH intermediate target before advancing to the
+    next, instead of handing the solver the full-distance target in one
+    shot.
+
+    **`start_pos` is captured ONCE by the caller, before this function is
+    entered, and never re-read from live state inside this loop.** This is
+    the Zeno-bug fix the corrected brief called out: if the "current
+    position" used to build each intermediate target were re-read from the
+    sim every iteration, the arm would cover only a shrinking fraction of
+    the remaining distance each step and asymptotically approach `end_pos`
+    without ever arriving. Fixing `start_pos` once and computing
+    `start_pos + (end_pos - start_pos) * (i / n_steps)` for a fixed `i`
+    guarantees step `n_steps` lands exactly on `end_pos`.
+
+    Per-step budget is `APPROACH_DESCENT_STEPS` (unchanged) at every
+    intermediate hop -- the TOTAL budget this call can spend scales with
+    `n_steps` (up to `n_steps * APPROACH_DESCENT_STEPS`, capped only by
+    `remaining_budget`), so adding waypoints does not starve the traverse
+    by dividing one fixed budget across more of them.
+
+    **Joint-limit margin is checked after every step converges**
+    (`HANDOFF_JOINT_LIMIT_MARGIN_TOL`), closing the diagnostic's own
+    explicitly-left-open caveat that its chain only ever checked IK
+    residual. A step that converges kinematically but leaves a joint
+    pegged at (or past) its `jnt_range` bound still fails this function,
+    with the specific step and joint-margin number reported.
+
+    Returns `(ok, frames_used, reason)`, `reason` naming the specific
+    intermediate step (and its target) that failed, so a caller-side
+    failure localises exactly like every other waypoint in this module.
+    """
+    start = np.asarray(start_pos, dtype=np.float64).reshape(3)
+    end = np.asarray(end_pos, dtype=np.float64).reshape(3)
+    distance = float(np.linalg.norm(end - start))
+    n_steps = max(1, int(np.ceil(distance / step_size)))
+
+    frames = 0
+    remaining = remaining_budget
+    for i in range(1, n_steps + 1):
+        target_i = start + (end - start) * (i / n_steps)
+        max_steps = min(APPROACH_DESCENT_STEPS, remaining)
+        if max_steps <= 0:
+            return False, frames, f"interpolation step {i}/{n_steps} failed [no budget remaining]"
+        ok, used, reason = _run_waypoint(
+            env, arm, target_i, gripper_fraction, max_steps, baseline, target_object=target_object,
+        )
+        frames += used
+        remaining -= used
+        if not ok:
+            return (
+                False, frames,
+                f"interpolation step {i}/{n_steps} (target={np.round(target_i, 4).tolist()}) failed [{reason}]",
+            )
+        margin = _joint_limit_margin_now(env, arm)
+        if margin <= HANDOFF_JOINT_LIMIT_MARGIN_TOL:
+            return (
+                False, frames,
+                f"interpolation step {i}/{n_steps} (target={np.round(target_i, 4).tolist()}) failed "
+                f"[joint_limit_margin={margin:.6f} rad <= {HANDOFF_JOINT_LIMIT_MARGIN_TOL} rad]",
+            )
+    return True, frames, None
+
+
+def _run_approach_with_staging(
+    env,
+    arm: str,
+    hover_target,
+    gripper_fraction: float,
+    remaining_budget: int,
+    baseline: dict,
+    target_object: str | None = None,
+) -> tuple[bool, int, str | None]:
+    """ADR-035 correction 2: an arm's very first move of a `handoff` call
+    (this arm has not been driven anywhere yet this call, so its live
+    qpos is still whatever it started the call at -- HOME, in the ordinary
+    case) can fail to converge in ONE SHOT if HOME sits on the wrong side
+    of the disjoint home-seeded reachable band this task's diagnostic
+    measured (`HANDOFF_STAGING_Y_M`'s docstring) -- and interpolating a
+    target that starts inside that bad basin cannot help, per the
+    corrected brief: "the traverse must START from a converged pose."
+
+    Tries the direct shot first (cheap, and the common case for whichever
+    arm's HOME already happens to sit on the correct side). Only if that
+    fails does it back up to `arm`'s own known-converged staging cell
+    (same y, x and z as `hover_target` except for `y`, which is replaced
+    by `HANDOFF_STAGING_Y_M[arm]`), confirm THAT converges, and then
+    interpolate onward from there to the real `hover_target` via
+    `_run_interpolated_waypoint` -- i.e. staging is a real, physically
+    driven waypoint of its own, not merely a re-seeded solve.
+
+    Returns `(ok, frames_used, reason)`.
+    """
+    hover = np.asarray(hover_target, dtype=np.float64).reshape(3)
+    max_steps = min(APPROACH_DESCENT_STEPS, remaining_budget)
+    ok, used, reason = _run_waypoint(
+        env, arm, hover, gripper_fraction, max_steps, baseline, target_object=target_object,
+    )
+    if ok:
+        return True, used, None
+
+    frames = used
+    remaining = remaining_budget - used
+    staging_y = HANDOFF_STAGING_Y_M.get(arm)
+    if staging_y is None or remaining <= 0:
+        return False, frames, f"direct approach failed [{reason}] and no staging cell available for arm {arm!r}"
+
+    staging_target = np.array([hover[0], staging_y, hover[2]])
+    max_steps = min(APPROACH_DESCENT_STEPS, remaining)
+    ok2, used2, reason2 = _run_waypoint(
+        env, arm, staging_target, gripper_fraction, max_steps, baseline, target_object=target_object,
+    )
+    frames += used2
+    remaining -= used2
+    if not ok2:
+        return (
+            False, frames,
+            f"direct approach failed [{reason}]; staging to y={staging_y} also failed [{reason2}]",
+        )
+
+    ok3, used3, reason3 = _run_interpolated_waypoint(
+        env, arm, staging_target, hover, gripper_fraction, remaining, baseline, target_object=target_object,
+    )
+    frames += used3
+    if not ok3:
+        return (
+            False, frames,
+            f"direct approach failed [{reason}]; staged at y={staging_y}, then interpolation to hover failed [{reason3}]",
+        )
+    return True, frames, None
+
+
 def run_handoff(
     env,
     to_arm: str,
@@ -1572,11 +1772,16 @@ def run_handoff(
       1. `from_arm` picks the object up (nested `run_pick`, `weld` threaded
          through so `from_arm`'s own initial grasp attaches exactly like a
          standalone `pick`).
-      2. `from_arm` APPROACHes above `HANDOFF_POSITION_XYZ` at clearance.
-      3. `from_arm` DESCENDs to `HANDOFF_POSITION_XYZ`.
+      2. `from_arm` APPROACHes above `HANDOFF_POSITION_XYZ` at clearance
+         (ADR-035: staged via `_run_approach_with_staging` if it does not
+         converge in one shot).
+      3. `from_arm` DESCENDs to `HANDOFF_POSITION_XYZ` (ADR-035: interpolated
+         in `HANDOFF_INTERP_STEP_M` hops via `_run_interpolated_waypoint`).
       4. `to_arm` APPROACHes above it, offset to the opposite side
          (`HANDOFF_SIDE_OFFSET_M`) so the two jaws are not asked to occupy
-         the same point (ADR-024's handoff consequence).
+         the same point (ADR-024's handoff consequence); ADR-035 staging
+         applies here too -- this is usually the arm actually needing it,
+         since it has not moved yet this call.
       5. `to_arm` DESCENDs.
       6. `to_arm` GRIPs -- closes and attempts weld attach every step
          (same mechanism as `run_pick`'s GRIP), until it attaches or
@@ -1638,20 +1843,26 @@ def run_handoff(
     receiving_point = transfer_point + np.array([0.0, side * HANDOFF_SIDE_OFFSET_M, 0.0])
 
     # Waypoint 1: from_arm APPROACH -- above the transfer point at clearance
-    # height, still holding the object.
+    # height, still holding the object. ADR-035: staged if from_arm's HOME
+    # (or wherever it currently is) does not converge to this in one shot.
     from_hover = transfer_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
-    ok, used, reason = _run_waypoint(
-        env, from_arm, from_hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
-        target_object=target_object,
+    ok, used, reason = _run_approach_with_staging(
+        env, from_arm, from_hover, close_frac, remaining, baseline, target_object=target_object,
     )
     frames += used
     remaining -= used
     if not ok:
         return SkillResult(False, f"waypoint 1 (from_arm approach) failed [{reason}]", frames)
 
-    # Waypoint 2: from_arm DESCEND -- to the transfer point exactly.
-    ok, used, reason = _run_waypoint(
-        env, from_arm, transfer_point, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+    # Waypoint 2: from_arm DESCEND -- to the transfer point exactly. ADR-035:
+    # interpolated in HANDOFF_INTERP_STEP_M hops from the live pose waypoint
+    # 1 just converged to (captured ONCE, here, before the loop -- not
+    # re-read inside it, which would be the Zeno bug the corrected brief
+    # flagged).
+    from_arm_site = _site_id(env.model, ik.gripperframe_site_name(from_arm))
+    descend_start = np.array(env.data.site_xpos[from_arm_site], dtype=np.float64, copy=True)
+    ok, used, reason = _run_interpolated_waypoint(
+        env, from_arm, descend_start, transfer_point, close_frac, remaining, baseline,
         target_object=target_object,
     )
     frames += used
@@ -1660,20 +1871,25 @@ def run_handoff(
         return SkillResult(False, f"waypoint 2 (from_arm descend) failed [{reason}]", frames)
 
     # Waypoint 3: to_arm APPROACH -- above the transfer point, offset to its
-    # own side, gripper open.
+    # own side, gripper open. ADR-035: staged exactly like waypoint 1 -- this
+    # is the arm that has not moved yet this call (usually still at HOME),
+    # and is the one the diagnostic found actually needs it.
     to_hover = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
-    ok, used, reason = _run_waypoint(
-        env, to_arm, to_hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
-        target_object=target_object,
+    ok, used, reason = _run_approach_with_staging(
+        env, to_arm, to_hover, open_frac, remaining, baseline, target_object=target_object,
     )
     frames += used
     remaining -= used
     if not ok:
         return SkillResult(False, f"waypoint 3 (to_arm approach) failed [{reason}]", frames)
 
-    # Waypoint 4: to_arm DESCEND -- to the receiving point.
-    ok, used, reason = _run_waypoint(
-        env, to_arm, receiving_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
+    # Waypoint 4: to_arm DESCEND -- to the receiving point. ADR-035:
+    # interpolated the same way as waypoint 2, start captured once from
+    # to_arm's live pose right after waypoint 3 converged.
+    to_arm_site = _site_id(env.model, ik.gripperframe_site_name(to_arm))
+    descend_start_to = np.array(env.data.site_xpos[to_arm_site], dtype=np.float64, copy=True)
+    ok, used, reason = _run_interpolated_waypoint(
+        env, to_arm, descend_start_to, receiving_point, open_frac, remaining, baseline,
         target_object=target_object,
     )
     frames += used
