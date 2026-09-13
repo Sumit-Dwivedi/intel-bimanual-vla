@@ -11,6 +11,93 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-033 — `pick(A, water_bottle)`: per-prop APPROACH/RETREAT hover height for tall props, fixing a hover point that sat BELOW the bottle's own physical top
+
+**Recorded:** Sept 13, 2026 · **Follows:** `docs/hardware/m06-water-bottle-diagnostic.md`
+(commit `635a902`), which found the bottle displaced ~0.157 m in x / -0.061 m
+in z from its reset position DURING (non-convergent) APPROACH/DESCEND,
+entirely before GRIP starts, with ADR-031's GRIP-dwell freeze itself
+confirmed working correctly (pinch point constant to 4 decimals across all
+300 dwell frames) · **Task:** apply the smallest fix that makes
+`pick(A, water_bottle)` succeed, choosing between (a) re-reading the
+object's position at GRIP start or (b) not knocking it during approach.
+
+**Branch chosen: (b), not (a) — and why (a) would not have worked at all,
+not merely worked poorly.** `grasp.WeldGrasp.attempt_grasp`'s Gate 2
+(proximity) already measures the pinch point against the object's OWN LIVE
+`data.xpos` every call (`grasp.py:356-363`), not against any fixed
+`grasp_point`/`hold_pos` value computed in `skills_scripted.py`. Re-reading
+the bottle's position and recomputing `grasp_point` at GRIP start (option
+a) would change ONLY the value logged/used for `_dwell`'s post-hoc IK
+residual report — it is never used to re-aim the arm during the dwell
+(ADR-031 freezes the arm's ctrl to wherever DESCEND already left it) and
+never used by Gate 2 (which already reads the bottle live). So (a) is not
+merely riskier here, as the task's framing anticipated — it is a no-op
+against the actual failure: the arm's frozen GRIP-dwell pose is wherever
+DESCEND converged to, and DESCEND converged near the bottle's ORIGINAL
+resting spot while the bottle had already been knocked ~0.16 m away by
+APPROACH's own motion, before GRIP or any re-read could matter.
+
+**Root cause, found by measuring the scene geometry `run_pick` was already
+targeting.** `scripts/gen_dual_scene.py`'s `water_bottle_cap` geom is
+`pos="0 0 0.10" size="0.012 0.01"` sitting on `water_bottle_body`'s
+`size="0.03 0.09"` cylinder — the cap's own top surface sits at local
+z = 0.10 + 0.01 = 0.11 m above the body origin (reset z=0.44), i.e. world
+z=0.55 m. The old `hover = grasp_point + CLEARANCE_HEIGHT_M` formula gave
+hover.z = 0.46 + 0.08 = 0.54 m — **0.01 m BELOW the bottle's own physical
+top**, not above it as "hover" is supposed to be. Every other pickable prop
+(plate/mug/fork/spoon) has its `GRASP_POINT_OFFSET_M` sitting at or near its
+own physical top already, so the same `CLEARANCE_HEIGHT_M` margin genuinely
+clears them; only the bottle's grasp point (intentionally lower, near its
+neck, partway down a ~0.20 m combined body+cap) leaves its own upper
+structure un-cleared by the existing formula. This is consistent with (does
+not contradict) the diagnostic's own finding that APPROACH/DESCEND both
+report `converged=False` at their full 500-step budgets — a "hover" target
+that is not actually clear of the object is exactly the kind of target that
+can produce sustained, escalating contact during a redundant 5-DOF
+incremental IK drive.
+
+**Fix applied.** Added `OBJECT_TOP_LOCAL_Z_M` (`skills_scripted.py`), a
+per-prop dict giving a prop's own physical top as a local z offset above its
+body origin, currently populated only for `"bottle": 0.11` (the measured cap
+top, from the scene geometry above). `run_pick`'s `hover` is now
+`max(grasp_point.z, obj_pos0.z + OBJECT_TOP_LOCAL_Z_M.get(target_object,
+offset.z)) + CLEARANCE_HEIGHT_M` instead of the old
+`grasp_point.z + CLEARANCE_HEIGHT_M`. For every prop except the bottle,
+`.get(..., offset.z)`'s fallback makes `obj_pos0.z + offset.z ==
+grasp_point.z` exactly, so `max(...)` is a no-op and their hover height is
+byte-for-byte unchanged — this is a per-prop, additive correction, not a
+change to the shared formula or to `CLEARANCE_HEIGHT_M` itself. No change to
+`grasp.py`, `ik.py`, `executor.py`, `scenes/so101/`, or `gen_dual_scene.py`
+(the bottle's mass/geometry are read, not modified).
+
+**Measured result (bm-ptl, `mujoco==3.2.7`, seed 0).** `pick(A,
+water_bottle)`: bottle position at reset `(0.2200, 0.0000, 0.4400)`; at GRIP
+start (post-DESCEND, reproduced via `run_pick`'s own `_run_waypoint`/
+`_run_dwell` helpers) `(0.2372, 0.0440, 0.4404)` — displacement now ~0.017 m
+in x / ~0.0004 m in z versus the old ~0.157 m / -0.061 m, a lateral nudge
+during the redundant IK solve's approach, not a knock; weld attaches at
+`attach_frame=1155` (whole-skill-call frame count via the real
+`ScriptedSkillExecutor.execute`), `is_holding('A')=='water_bottle'`, final
+z=0.6191 (initial 0.4400, success threshold 0.3700) — lifted 0.179 m.
+`SkillResult.success=True`. `pytest tests/test_skills.py`: 4 failed / 4
+passed before this change and 4 failed / 4 passed after (same four
+pre-existing failures — `test_open_drawer_reaches_near_limit`,
+`test_pick_plate_lifts_above_table`, `test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b` — all unrelated to the bottle and
+unaffected by this change, confirmed by identical failure reasons/residuals
+before and after).
+
+**Not done.** No ADR-031 correction is needed — its GRIP freeze was already
+confirmed working correctly by the referenced diagnostic and is untouched
+here. This entry is not mirrored into `ARCHITECTURE.md`'s section 4: ADR-028
+through ADR-032 (the preceding four M06 diagnostics/fixes) are likewise
+recorded only here, not in `ARCHITECTURE.md`, matching this file's own
+established recent practice; `ARCHITECTURE.md` itself is out of scope for
+this task.
+
+---
+
 ## ADR-032 (second pass) — Handoff-position sweep re-run with four seeding/collision corrections plus an extended-height grid; STILL no shared point, and the reach bands themselves do not overlap at x=0
 
 **Recorded:** Sept 13, 2026 · **Follows:** the ADR-032 entry directly below (first

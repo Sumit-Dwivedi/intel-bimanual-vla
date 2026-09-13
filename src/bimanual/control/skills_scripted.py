@@ -302,6 +302,48 @@ GRASP_POINT_OFFSET_M = {
     "bottle": np.array([0.0, 0.0, 0.02]),
 }
 
+#: **ADR-033 (per-prop APPROACH/RETREAT hover height for tall props).**
+#: `docs/hardware/m06-water-bottle-diagnostic.md` measured `pick(A,
+#: water_bottle)` displacing the bottle ~0.157 m in x / -0.061 m in z from
+#: its reset position DURING (non-convergent) APPROACH/DESCEND, before GRIP
+#: even starts -- i.e. the bottle is knocked, not merely reached for late.
+#: The geometry explains why: `hover`'s old formula (`grasp_point.z +
+#: CLEARANCE_HEIGHT_M` = 0.46 + 0.08 = 0.54 m) sits BELOW the bottle's own
+#: physical top. `scripts/gen_dual_scene.py`'s `water_bottle_cap` geom is
+#: `pos="0 0 0.10" size="0.012 0.01"` (a cylinder, half-length 0.01) on top
+#: of `water_bottle_body`'s `size="0.03 0.09"` cylinder -- so the cap's own
+#: top surface sits at local z = 0.10 + 0.01 = 0.11 m above the body's
+#: origin (BOTTLE_POS z=0.44 at reset), i.e. world z = 0.55 m -- 0.01 m
+#: ABOVE the old "clearance" hover point (0.54 m). Every OTHER pickable
+#: prop's `GRASP_POINT_OFFSET_M` already sits at or near its own physical
+#: top (the fork/spoon/plate/mug are all short relative to their grasp
+#: offset), so `CLEARANCE_HEIGHT_M` above the grasp point already clears
+#: the whole object for them; only the bottle's grasp point (near its neck,
+#: partway down a 0.20 m-tall body+cap) leaves its own upper structure
+#: uncleared. This is consistent with the diagnostic's other finding (the
+#: pinch point is frozen and stationary throughout GRIP, per ADR-031 -- the
+#: knock is not an arm-chasing-the-jaw artifact, it happens earlier, while
+#: the arm is swinging toward/through a "hover" point that was never
+#: actually above the object).
+#:
+#: `OBJECT_TOP_LOCAL_Z_M` gives, for props whose physical top exceeds their
+#: own grasp point (only the bottle, so far), that top height as a local z
+#: offset above the object's own body origin (`obj_pos0`, read fresh from
+#: `env.data.xpos` every `run_pick` call -- never hardcoded world Z). Used
+#: only to compute `hover`'s z (below): `hover.z = max(grasp_point.z,
+#: obj_pos0.z + OBJECT_TOP_LOCAL_Z_M.get(target_object, offset.z)) +
+#: CLEARANCE_HEIGHT_M`. For every prop NOT listed here, `.get(...,
+#: offset.z)` falls back to the SAME z used for `grasp_point`, making the
+#: `max(...)` a no-op -- this deliberately leaves every other prop's hover
+#: height, and therefore every existing passing/failing test for them,
+#: completely unchanged. `CLEARANCE_HEIGHT_M` (the existing, measured-safe
+#: margin every other prop already clears by) is still the margin ABOVE
+#: whichever of the two candidate heights is larger, not a new number of
+#: its own.
+OBJECT_TOP_LOCAL_Z_M = {
+    "bottle": 0.11,
+}
+
 # ---------------------------------------------------------------------------
 # Module-level tuning constants -- one place to find and adjust every
 # skill-behaviour number (task instructions: "anyone tuning these must find
@@ -1238,8 +1280,16 @@ def run_pick(
     baseline = _contact_counts(env)
     remaining = step_budget
 
-    # Waypoint 1: APPROACH -- hover at clearance height above the grasp point.
-    hover = grasp_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    # Waypoint 1: APPROACH -- hover at clearance height above the grasp
+    # point OR above the object's own physical top, whichever is higher
+    # (ADR-033). For every prop except the bottle, `OBJECT_TOP_LOCAL_Z_M`'s
+    # `.get(..., offset[2])` fallback makes this identical to the old
+    # `grasp_point + CLEARANCE_HEIGHT_M` formula -- see that constant's
+    # docstring for the measured reason the bottle alone needs the taller
+    # of the two.
+    top_local_z = OBJECT_TOP_LOCAL_Z_M.get(target_object, offset[2])
+    hover_z = max(float(grasp_point[2]), float(obj_pos0[2] + top_local_z)) + CLEARANCE_HEIGHT_M
+    hover = np.array([grasp_point[0], grasp_point[1], hover_z])
     ok, used, reason = _run_waypoint(
         env, arm, hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object
     )
