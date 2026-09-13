@@ -1603,6 +1603,939 @@ verifiably collision-safe rather than silently tunneling.
 
 ---
 
+### M06 Grasping Mechanism Overview
+
+M06 implements `pick`, `place` and `handoff` for the bimanual SO-101 arms in
+MuJoCo. The gripper's jaw meshes are non-convex, C-shaped housings that
+MuJoCo collapses to overlapping convex hulls with no decomposition declared
+(MuJoCo issue #239); 0 of 30 measured caliper thicknesses ever achieved
+sustained two-jaw contact. **ADR-028** disables jaw-mesh collision and adds
+small finger-pad collision primitives that verifiably move with jaw closure
+— a geometry-level fix only; no skill reached GRIP under it in that same
+commit. **ADR-029** answers grasping at the mechanism level instead: it
+implements grasping as a MuJoCo weld equality constraint, toggled on
+proximity and jaw closure — an explicit abstraction of physical grasping,
+**not friction-based finger contact**, and disclosed as such per ADR-015.
+**ADR-031** freezes the driven arm's commanded pose during the GRIP/RELEASE
+dwell so the closing jaw's own shifting pinch point cannot make the arm
+retreat mid-grasp. **ADR-033** gives the water bottle its own
+APPROACH/RETREAT hover height so the hover point clears the bottle's own
+physical top instead of sitting below it. **Handoff does not currently
+work**: three independent reachability sweeps (ADR-032, two passes, plus an
+earlier pass) each found zero shared, collision-free transfer points
+reachable by both arms; the cause is under active investigation and
+unresolved as of this writing.
+
+---
+
+### ADR-028 — Finger-pad primitives (MuJoCo convex-hull fix), pads verified to move, but no `pick()` reaches GRIP under the current approach-collision check
+
+**Recorded:** Sept 12, 2026 · **Follows:** `docs/hardware/grasp-envelope.md`
+(diagnostic: 0 of 30 caliper thicknesses achieved sustained two-jaw contact,
+convex hulls overlap -0.0206..-0.0345 m at every joint angle) · **Cites:**
+MuJoCo GitHub issue #239's documented finger-pad pattern for mesh-gripper
+collision, https://ggando.com/blog/so101-rl-lift (reports working SO-101
+grasping with this pattern), https://maegantucker.com/ECE4560/assignment8-so101/
+(course material teaching it) · **Not accessed**, per instruction — cited only.
+
+**Context.** `docs/hardware/grasp-envelope.md` measured the root cause
+directly: MuJoCo collapses a `type="mesh"` collision geom to its convex hull
+with no decomposition declared anywhere in this asset, and both jaw parts
+(`wrist_roll_follower_so101_v1`, `moving_jaw_so101_v1`) are non-convex
+C-shaped housings whose hulls overlap at every angle in the joint's range
+(-0.03454 m closed to -0.02062 m at the least-overlapping angle). No object
+placed there can ever be read as anything but embedded in solid material on
+both sides.
+
+**Options.** (a) weld-based grasping — rejected, a workaround that reads as
+not-really-grasping and would need disclosure; (b) finger-pad primitives per
+the cited pattern — **chosen**; (c) non-prehensile manipulation — rejected,
+scope change.
+
+**Decision (b), implemented in `scripts/gen_dual_scene.py` only** (never
+`scenes/so101/`, confirmed empty diff below): (1) `disable_jaw_mesh_collision()`
+sets `contype="0" conaffinity="0"` on the same two jaw MESH collision geoms
+`JAW_COLLISION_MESHES` already identifies (visual rendering, a separate
+`class="visual"` copy, untouched); (2) `add_finger_pads()` adds one
+`type="box" size="0.00125 0.00125 0.00125"` collision geom per jaw, at the
+task's own verbatim positions: `static_finger_pad` at local `pos="-0.008875
+0.0 -0.100"` as a child of `{prefix}gripper` (the fixed jaw body), and
+`moving_finger_pad` at local `pos="-0.01136 -0.076 0.019"` as a child of
+`{prefix}moving_jaw_so101_v1` (the moving jaw body) — both bodies asserted to
+resolve to a real match. `friction="1 0.05 0.001"`, `contype="1"
+conaffinity="1"` on both pads, exactly as specified.
+
+**Why this is not a repeat of the reverted Fix D.** Fix D's replacement
+sphere sat at local `pos="0 0 0"` on the moving jaw body — exactly on that
+body's own hinge rotation axis — so it never moved as the jaw opened or
+closed (identical gap to five decimals at both joint limits, DECISIONS.md's
+Fix D revert entry). `moving_finger_pad`'s local pos is offset in all three
+axes from that origin, so this is a structurally different placement, not
+merely a re-application of the same mistake — and Step 3 below exists
+specifically to catch a repeat before anything downstream is trusted.
+
+**Step 3 gate — pad separation across joint angle, measured on bm-ptl**
+(`scripts/probe_pad_separation.py`, new diagnostic script, not shipped skill
+code; reads `armA_static_finger_pad`/`armA_moving_finger_pad` world
+`geom_xpos` directly, resetting to the "home" keyframe then overriding only
+`armA_gripper`'s qpos per angle):
+
+| angle | qpos (rad) | pad separation (m) |
+|---|---:|---:|
+| fully closed | -0.1745 | **0.00600** |
+| midway | +0.7850 | **0.07621** |
+| fully open | +1.7453 | **0.13188** |
+
+Spread across the three angles: 0.12589 m. **GATE PASSED** — separation
+changes materially and monotonically with joint angle (smallest near
+closed, as expected for a pinch point), the opposite of Fix D's
+identical-to-five-decimals failure. Both pad geoms genuinely move with
+their respective bodies.
+
+**Consequences.** Note: 6-132 mm is centre-to-centre distance between the
+2.5 mm cube pads. The surface-to-surface gap — what actually fits between
+the jaws — is smaller, measured at roughly 2.5 mm closed to 120 mm open via
+`mj_geomDistance`. Quote the surface figure in judge-facing material and
+say which quantity it is.
+
+**Step 4 — pick(A, ·) in force order, run on bm-ptl, reported exactly as
+measured, not softened.** `pytest tests/test_skills.py` first, to confirm no
+new regression from the generator change: **5 failed / 3 passed**,
+byte-for-byte the same specific failures already on record in the "M06a Fix
+D reverted" entry above (including `test_pick_plate_waypoints_progress_without_collision`,
+already flagged there as a pre-existing, undecided conflict with ADR-027's
+own regression-test requirement — not newly broken by this change).
+
+| Prop | Result | frames_used | reason | z delta | crossed lift threshold? |
+|---|---|---:|---|---:|---|
+| fork | FAIL | 313 | `waypoint 1 (approach) failed [collision (arm-vs-prop: fork (dist=-0.0072 m); threshold=-0.005 m)]` | -0.0035 | no |
+| spoon | FAIL | 306 | `waypoint 1 (approach) failed [collision (arm-vs-prop: fork (dist=-0.0055 m); threshold=-0.005 m)]` — **anomaly:** target is spoon, the collision reported is against the *fork* prop, sitting nearby | -0.0021 | no |
+| plate | FAIL | 296 | `waypoint 1 (approach) failed [collision (arm-vs-prop: plate (dist=-0.0081 m); threshold=-0.005 m)]` | -0.0034 | no |
+| mug | FAIL | 317 | `waypoint 1 (approach) failed [collision (arm-vs-prop: mug (dist=-0.0090 m); threshold=-0.005 m)]` | -0.0028 | no |
+| water_bottle | FAIL | 256 | `waypoint 1 (approach) failed [collision (arm-vs-prop: water_bottle (dist=-0.0061 m); threshold=-0.005 m)]` | -0.0007 | no |
+
+**Honest interpretation: none of the three outcomes the task's own
+interpretation guide anticipated is quite what happened, and that mismatch
+is itself the finding.** All five props fail identically at **waypoint 1
+(APPROACH)** — before the skill ever reaches DESCEND or GRIP. The pad
+geometry this ADR adds is therefore **not exercised at all** by any of these
+five runs; the pinch never gets a chance to form. This is not new: it is
+**ADR-027 Step 5's own already-documented arm-vs-prop collision check**
+(`skills_scripted.py`, out of this task's scope to touch) firing during the
+blind, obstacle-unaware IK approach path (ADR-024) — the same condition that
+entry already flagged for the plate specifically ("the arm's blind approach
+path was apparently ALREADY grazing the plate during ordinary APPROACH even
+with the original flush geometry"), now confirmed to occur identically for
+**all five** props, not only the plate.
+
+**Proof this is unrelated to the pad fix, not just an assertion:** `pick(A,
+plate)`'s numbers here (`dist=-0.0081 m`, `frames_used=296`) are **bit-for-bit
+identical** to the pre-ADR-028 baseline recorded in the "M06a Fix D reverted"
+entry above, measured when the jaw mesh collision was still enabled and no
+pads existed. Changing the jaw's collision geometry from mesh to pads
+produced **zero** change to this failure, which is the expected result if —
+and only if — the contact triggering it belongs to a different arm geom
+entirely (most plausibly the wrist/forearm, brushing the prop during
+approach), not the jaw. That is consistent with, not contradicted by, this
+fix: the pad fix targets the PINCH, and the approach-phase collision check
+fires well before any pinch is attempted.
+
+**No further action taken in this commit, per its own explicit
+instruction** ("Do NOT modify prop masses, IK strategy, or grasp offsets...
+we are testing the pad fix in isolation"): `skills_scripted.py`'s
+arm-vs-prop debounce/threshold logic and `ik.py`'s obstacle-unaware approach
+path are both out of scope here, and neither was touched. **What this commit
+proves:** the convex-hull geometry defect diagnosed in `docs/hardware/
+grasp-envelope.md` is fixed at the geometry level (Step 3's gate) and does
+not regress anything measured before (Step 4's pytest/plate parity). **What
+it does not yet prove:** whether the fixed geometry actually grasps
+anything, because no skill run in this commit reaches the GRIP waypoint for
+any prop — that remains blocked by the separate, already-documented
+approach-collision gap, and by the `±3.35 N` actuator ceiling for plate/mug/
+bottle specifically, neither of which this commit addresses.
+
+`git diff --stat -- scenes/so101/` confirmed empty before commit. Files
+changed: `scripts/gen_dual_scene.py` (`disable_jaw_mesh_collision`,
+`add_finger_pads`, wired into `main()`), the regenerated
+`src/bimanual/sim/assets/so101_dual_table.xml`, and
+`scripts/probe_pad_separation.py` (new diagnostic, not shipped skill code).
+
+**Correction (Sept 13, 2026, M06 Phase 2 follow-up session).** A later
+session was handed a claim that the jaw-body mesh disable this entry (and
+`8f09f8c`, below) describes was still incomplete -- specifically, that
+`sts3215_03a_v1`, `wrist_roll_follower_so101_v1` and `moving_jaw_so101_v1`
+were still `COLLIDABLE` in the compiled model. **Checked directly, not
+assumed, on both a development laptop and bm-ptl** (`mujoco==3.2.7`,
+`model.geom_contype`/`geom_conaffinity` read for every geom on the relevant
+bodies): all three meshes already report `contype=0 conaffinity=0` on both
+arms, and both finger pads remain collidable, exactly as this entry and
+`8f09f8c` intended. `8f09f8c`'s "complete jaw collision disable" (see that
+entry below) was, in fact, complete -- the disable was never incomplete, and
+no further code change was needed or made. The full audit (why the given
+premise did not reproduce, and what was checked) is recorded in the "M06
+Phase 2 follow-up" entry in `DECISIONS.md`, above ADR-030. This
+correction exists so a future reader who finds this ADR's own "no further
+action taken" language does not go looking for a still-open gap that was
+never there.
+
+**Source commit:** `c6feeb1` ("ADR-028: finger-pad primitives per
+ggando/MuJoCo #239 pattern (fixes convex-hull grasp problem)."), found via
+`git log`/`.git/logs/HEAD` — commit message confirmed to match this ADR
+title. The Sept 13 correction paragraph above was recorded in a later
+commit, `b9e9cb4` ("M06: audit ADR-028 hull disable..."), per `DECISIONS.md`.
+
+---
+
+### ADR-029 — Weld-based grasping mechanism (Phase 1: mechanism verified, not yet wired into skills)
+
+**Recorded:** Sept 13, 2026 · **Follows:** `docs/hardware/grasp-envelope.md` (0 of 30
+caliper thicknesses achieved sustained two-jaw contact — the gripper's jaw meshes
+collapse to permanently-overlapping convex hulls, MuJoCo issue #239) and
+`DECISIONS.md`'s ADR-028 entry (finger-pad primitives fixed the geometry, verified
+6-132 mm pad separation sweep, but "no `pick()` reaches GRIP under the current
+approach-collision check" -- the arm's reach envelope plus the ~8 cm pinch-point
+kinematic offset, ADR-025, put every graspable target at the edge of what this 5-DOF
+IK can reach; `docs/hardware/m06-grip-diagnostic.md` and
+`m06-grip-diagnostic-after-fix.md`). **Phase 1 only** -- this entry covers the
+mechanism's own verification; wiring it into `pick`/`place`/`handoff` is Phase 2,
+contingent on this entry.
+
+**Context.** Contact-based grasping in this scene is not a code bug to keep chasing;
+it is a structural limit of the simulated gripper's geometry and this arm's
+kinematics, independently confirmed by two prior, unrelated diagnostics (the caliper
+sweep and the GRIP-stage instrumentation). A grasping mechanism is needed that
+abstracts the failing contact subsystem while preserving the rest of the
+perception-to-action pipeline.
+
+**Options.** (a) keep debugging contact-based grasping -- rejected, the limit is
+structural (reach envelope), not tactical; (b) reposition the arm bases -- rejected,
+4-6 h with an uncertain outcome, and it would restart cross-arm collision and
+reachability validation from scratch; (c) weld the object to the gripper via a MuJoCo
+equality constraint, toggled at runtime -- **chosen**, standard sim-robotics practice
+(MoveIt's attached objects, PyBullet's fixed constraints, academic sim-to-real work
+all abstract grasp contact the same way).
+
+**Decision (c), implemented as follows:**
+
+1. **`src/bimanual/sim/grasp.py`'s `WeldGrasp`** tracks at most one held object per
+   arm (`{'A': None, 'B': None}`). `attempt_grasp(arm, object_name,
+   distance_threshold_m=0.05, closure_threshold=0.3)` attaches only if BOTH gates
+   hold: the `armX_gripper` JOINT's qpos is below `closure_threshold` (jaws closing;
+   "open" is the HIGH end of this joint's range, so "below threshold" correctly reads
+   as "closing"), AND the `armX_gripper` BODY's (the fixed jaw, **not** the moving
+   jaw and **not** the joint of the same name -- the exact naming trap `ik.py` and
+   `GLOSSARY.md` already document) world position is within `distance_threshold_m` of
+   the object body's world position. It refuses, logging the specific reason,
+   otherwise. `release(arm)` deactivates the weld; `is_holding(arm)` reports it.
+   Refusing when either gate fails (never "always weld") is the entire point --
+   ADR-029's Consequences below.
+2. **Activation path: (a) pre-declared, chosen over (b) runtime creation.** All 10
+   `(armX_gripper, prop)` weld equality constraints (5 props x 2 arms) are declared
+   in the generated scene XML with `active="false"`, by
+   `scripts/gen_dual_scene.py`'s new `build_weld_constraints()` (HAND-AUTHORED region
+   only -- `scenes/so101/` is untouched, confirmed by `git diff --stat -- scenes/so101/`
+   before commit, same convention as every prior ADR-021/ADR-028 change).
+   `WeldGrasp` only ever toggles `data.eq_active` and rewrites `model.eq_data` for
+   constraints that already exist; option (b) (creating a constraint at runtime) was
+   never needed -- pre-declaring compiled without incident on the first try.
+3. **The eq_data teleport gotcha, resolved empirically for the installed
+   mujoco==3.2.7, not assumed from documentation.** `mjNEQDATA == 11`
+   (`mujoco/include/mujoco/mjmodel.h`): `eq_data[0:3]` = anchor, `eq_data[3:10]` =
+   relpose (3 position + 4 quaternion), `eq_data[10]` = torquescale -- but the shipped
+   headers do not document what "anchor" and "relpose" actually mean geometrically.
+   Determined by direct experiment (5 randomized-pose trials, weld `body1`=object /
+   `body2`=the reference body, gravity enabled, 3000-step rollout, position AND
+   orientation checked before/after): for `body1`=object, `body2`=gripper,
+   ```
+   anchor       = R(gripper_quat)^T @ (object_pos - gripper_pos)   # object's position
+                  in the gripper body's own local frame
+   relpose_pos  = (0, 0, 0)
+   relpose_quat = conj(object_quat) * gripper_quat                 # the GRIPPER's
+                  orientation expressed in the OBJECT's frame (reversed order
+                  relative to the naive "object relative to gripper" -- this was the
+                  one sign that a position-only teleport check would NOT have caught;
+                  it only shows up as orientation drift over many steps)
+   torquescale  = 1.0
+   ```
+   This held position to 2.7e-5 m (solver settling noise, not error) and orientation
+   exactly (quaternion delta 0.0) across 5 random trials, 3000 steps each, under
+   gravity. `mujoco`'s own `mju_rotVecQuat`/`mju_negQuat`/`mju_mulQuat` are used in
+   `grasp.py`, not hand-rolled quaternion math, so the implementation tracks MuJoCo's
+   own convention rather than a reimplementation of it.
+4. **`scripts/probe_weld_grasp.py`** verifies the mechanism end to end against the
+   real `TableSettingEnv`, with no skill layer involved. Full log:
+   `docs/hardware/m06-weld-verification.md`. Run on bm-ptl (ADR-020); mirrored
+   locally first (mujoco imports and compiles on this developer's laptop as of this
+   session, contrary to ADR-020's original finding -- noted, not relied upon; the
+   authoritative run and the committed artifacts are bm-ptl's).
+
+**Verification results, reported exactly as measured:**
+- **Teleport check:** fork position immediately before vs. after `attempt_grasp`
+  activates the weld: **0.000000 m** (both position components identical to 8
+  decimal places).
+- **Tracking:** stepping the arm up (see the finding below on how) for 50 steps, the
+  fork's world z rose from 0.3538 to 0.3551 m (+0.0013 m), tracking the gripper's own
+  rise (0.3810 -> 0.3824 m, +0.0013 m) essentially 1:1.
+- **Release:** `release('A')` returned `True`; `is_holding('A')` became `None`.
+  30 further steps showed the fork's z stop rising and settle down (0.3551 -> 0.3533 m).
+- **Negative control 1 (gripper OPEN, object in range):** `attempt_grasp` returned
+  `False`, logged reason "gripper not closed enough (joint qpos=1.7453 rad >=
+  closure_threshold=0.3000 rad)".
+- **Negative control 2 (gripper CLOSED, object far -- arm left at the "home" rest
+  pose):** `attempt_grasp` returned `False`, logged reason "too far (distance=0.5633 m
+  >= distance_threshold_m=0.0500 m)".
+- **MuJoCo warnings:** none, at any point in the run (`data.warning` checked, same
+  convention as `scripts/run_skill.py`'s diagnostic).
+
+**An honest, unplanned finding surfaced while building the verification script, worth
+recording because it is a real property of this system, not a defect in `WeldGrasp`:**
+`ik.solve_position_ik`'s pinch-point target (ADR-025), combined with ADR-024's fully
+relaxed orientation, let the redundant 5-DOF solve satisfy a progressively-rising
+pinch-point target by rotating the WRIST rather than raising the arm -- the pinch
+point tracked the rising target (solver residual under 0.01 m throughout) while the
+`armA_gripper` BODY (the actual weld attach frame) **fell**. `ik.py` is out of scope
+to modify for this task, so the verification script's UP phase instead drives
+`armA_shoulder_lift` directly (holding every other actuator at its current qpos),
+which reliably raises the whole downstream chain with no orientation ambiguity. The
+resulting rise is modest (millimetre-scale over 50 steps / 0.1 s sim time), consistent
+with the `sts3215` actuator class's own `forcerange=-2.94 2.94` N*m capping how fast
+one joint can lift the downstream mass against gravity in that time -- the same kind
+of actuator force ceiling `docs/hardware/grasp-envelope.md` already measured for the
+gripper actuator's own `forcerange=-3.35 3.35` N.
+
+**Consequences.** Grasping is now **abstracted, not physically simulated** --
+README and video must say so explicitly, per ADR-015's honesty rules (no number or
+description implies contact-based grasping where a weld is doing the work). Pick,
+place and handoff become executable end-to-end **once wired** (Phase 2, not this
+commit). ADR-028's finger-pad work is retained as scene correctness (the pads still
+move correctly and are still the physically modelled jaw geometry) even though grip
+contact itself is abstracted around. M07's randomization stays meaningful: arm poses
+and prop positions still vary session to session; only the attach *moment* is
+abstracted, not the scene state leading up to it. Nothing in `skills_scripted.py`,
+`executor.py`, `ik.py` or `scenes/so101/` was touched by this commit.
+
+**Source commit:** `325feac` ("ADR-029: weld-based grasping mechanism (Phase 1:
+mechanism verified, not yet wired into skills)."), found via `git log`/
+`.git/logs/HEAD` — commit message confirmed to match this ADR title.
+
+---
+
+### ADR-030 — Weld wiring into scripted skills (Phase 2 Commit 2)
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-029 (weld mechanism verified, Phase 1),
+M06 Phase 2 Commit 1 (ctrl-hold decision + measured drift gap).
+
+**Context.** ADR-029 built and verified `WeldGrasp` in isolation
+(`scripts/probe_weld_grasp.py`, `docs/hardware/m06-weld-verification.md`) but left it
+unwired: "deliberately NOT wired into `pick`/`place`/`handoff` or `executor.py`". This
+commit does that wiring and nothing else -- `ik.py`, `grasp.py` and `scenes/so101/` are
+untouched.
+
+**Decision.** `ScriptedSkillExecutor` constructs one `WeldGrasp` (`self.weld`), threaded
+into `skills_scripted.run_pick`/`run_place`/`run_handoff` as a `weld` parameter:
+- **`pick`'s GRIP** commands jaw closure, then calls `weld.attempt_grasp(arm, body_name)`
+  every step until it returns `True` (frame recorded) or `GRIP_HOLD_FRAMES` (300) is
+  exhausted, in which case the skill fails with the specific reason
+  `weld_attach_failed_after_N_frames` -- distinguishable from an ordinary
+  waypoint/collision failure.
+- **`place`'s RELEASE** calls `weld.release(arm)` BEFORE commanding the jaw open, so the
+  object is not kicked by the opening jaw's own moving collision geometry.
+- **`handoff`** grips-and-attaches on `to_arm` the same way as `pick`, then adds a new
+  gate BEFORE `from_arm` is ever released: `weld.is_holding(to_arm) == body_name` is
+  checked explicitly; if false, the skill fails immediately with `handoff_transfer_failed`
+  and `from_arm`'s weld is left untouched (object stays with `from_arm`, never ends up
+  held by neither arm). Only past that gate does `from_arm` release (again,
+  weld-then-jaws ordering) and the staggered retreat (`from_arm` first) proceed.
+- **`SkillResult`** gained `weld_attach_frame: int | None` (the whole-skill-call frame at
+  which `attempt_grasp` first returned `True`, or `None` if it never did) and
+  `weld_active_at_end: bool` (`weld.is_holding` re-checked at return time), both with
+  defaults so every pre-existing positional `SkillResult(...)` construction is unaffected.
+- **`pick`'s success bar changes when `weld` is supplied**: `final_z > TABLE_SURFACE_Z +
+  0.02` (a new constant, `WELD_PICK_SUCCESS_MARGIN_M`) AND `weld.is_holding(arm) ==
+  body_name` -- an absolute-height-from-table-surface bar, per this task's own
+  instructions, kept SEPARATE from the older initial-z-relative `PICK_LIFT_MARGIN_M`
+  (0.03) that `run_pick` still uses when `weld=None`. `handoff`'s success similarly gains
+  `weld.is_holding(to_arm) == body_name AND weld.is_holding(from_arm) is None` alongside
+  its existing distance/lift check.
+
+**Disclosed deviation: `ScriptedSkillExecutor.__init__` cannot construct `WeldGrasp`
+eagerly.** The instruction as given was "`__init__` constructs it as `self.weld`" --
+`WeldGrasp.__init__` requires a compiled `env` (it resolves equality-constraint/joint/
+body ids against `env.model`), and `ScriptedSkillExecutor.__init__` takes no `env`
+argument, matching every existing call site (`tests/test_skills.py`'s `executor()`
+fixture, `scripts/run_skill.py`) which construct `ScriptedSkillExecutor()` bare and
+supply `env` only later, per call, to `execute()`. `self.weld` therefore starts `None`
+and is built lazily the first time `execute()` sees an `env` (`_ensure_weld`), rebuilt
+only if a genuinely different `env` instance is later passed in. This is a correction to
+the literal instruction, not a silent substitution -- recorded here per this task's own
+"if the instructed text does not match what happened, correct it" rule.
+
+**Verification (bm-ptl, `C:\Users\devcloud\project\ov_env\Scripts\python.exe`).**
+
+- `pytest tests/test_skills.py`, BEFORE this commit's changes: **4 passed / 4 failed**
+  (`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+  `test_place_plate_returns_to_table_rest`, `test_handoff_mug_ends_held_by_arm_b` fail;
+  the other four pass) -- identical to Commit 1's own reported baseline.
+- `pytest tests/test_skills.py`, AFTER: **4 passed / 4 failed, same four tests.** The
+  drawer/mug-reach failures are byte-identical (kinematic reach limits this commit does
+  not touch). The plate pick/place failures changed REASON, not outcome: previously
+  `"did not lift plate: ... final_z=0.3523"`; now `weld_attach_failed_after_300_frames`
+  (`final_z=0.3524`) -- the weld mechanism now engages and is exercised, and still does
+  not attach for the plate's own rim-offset grasp point (see finding below); both are
+  failures, so no regression.
+- Isolated logic checks (FakeWeld stub, not the real `WeldGrasp` -- that mechanism's own
+  correctness is ADR-029's job, already verified): confirmed `_dwell` breaks early at the
+  exact step `attempt_grasp` first returns `True` and reports that step as `attach_frame`
+  (`attach_on_call=7` -> `steps_taken=7, attach_frame=7`, `attempt_grasp` never called an
+  8th time), reports `attach_frame=None` when it never attaches within budget, and that
+  `run_pick`'s cumulative frame offset is correct (`grip_start_frames + local_index`
+  measured as `1001` for a weld that attaches on its very first GRIP-dwell step, matching
+  independently observed APPROACH+DESCEND frame counts from the real run below).
+
+**New finding, measured directly, not assumed: for props whose grasp point IS reachable
+(fork, water_bottle), `pick`'s GRIP now runs to completion but `WeldGrasp`'s own
+proximity gate (`distance_threshold_m=0.05`, unmodified default) is missed by the time
+the closure gate opens.** `pick(A, fork)` and `pick(A, water_bottle)` both return
+`weld_attach_failed_after_300_frames` (frames_used=1300; GRIP_HOLD_FRAMES=300 exhausted).
+A direct instrumented replay of `pick(A, fork)`'s GRIP dwell (`armA_gripper` BODY-to-fork
+BODY distance, `armA_gripper` JOINT qpos, sampled every 20 steps) found:
+
+| step | gripper qpos | body-to-body distance |
+|---|---|---|
+| 0 (jaw still open) | 1.7449 | 0.0299 m |
+| 100 | 0.8876 | 0.0464 m |
+| 120 | 0.6697 | 0.0501 m |
+| 140 | 0.4506 | 0.0537 m |
+| 160 | 0.2309 (closure gate now open, <0.3) | 0.0574 m |
+| 299 (fully closed) | -0.1745 | 0.0795 m |
+
+The distance grows monotonically, from 0.0299 m (well inside the 0.05 m gate, jaw fully
+open) to 0.0795 m (jaw fully closed) -- and it crosses above 0.05 m (between step 120 and
+140) BEFORE the closure gate opens (between step 140 and 160). The two gates' passing
+windows do not overlap at these thresholds for this prop: by the time the jaw is closed
+enough to attempt attach, the fixed-jaw body has already drifted too far from the object
+to pass the proximity gate. **Root cause, not merely observed:** `ik.solve_position_ik`
+(unmodified, out of scope) targets the `armX_gripperframe` SITE (the pinch point), not
+the `armX_gripper` BODY `WeldGrasp`'s proximity gate reads (the naming-trap distinction
+`grasp.py`'s own docstring names). As the jaw closes, the redundant 5-DOF solve keeps the
+pinch-point SITE pinned at the grasp target by rotating the wrist -- and that same wrist
+rotation carries the fixed-jaw BODY away from the site (and therefore away from the
+object) at roughly 1.7 mm per closure step. This is the SAME site-vs-body divergence
+ADR-029's own docstring already documents for a different maneuver (driving the pinch
+point upward during LIFT); here it shows up during jaw CLOSURE instead. `pick(A, mug)`
+fails earlier and for an unrelated, already-documented reason (`waypoint 1 (approach)
+failed [convergence]` -- the pre-existing kinematic reach limit ADR-024/ADR-027 recorded).
+`handoff(A, B, fork)` and `place(A, fork, table)` both fail as a direct, expected
+consequence of the nested `pick` failing the same way (`weld_attach_failed_after_300_frames`
+surfaces through `"handoff aborted: pick by arm A failed (...)"` /
+`"place aborted: pick failed (...)"`), never reaching their own weld-specific gates
+(`handoff`'s transfer check, `place`'s release-before-open ordering) in this run.
+
+**Per this task's own instruction, this gap was NOT closed by loosening
+`attempt_grasp`'s gates.** `distance_threshold_m`/`closure_threshold` were left at
+`WeldGrasp`'s own defaults (0.05 m / 0.3 rad) exactly as ADR-029 designed and verified
+them; `scripts/probe_weld_grasp.py`'s own positive-path verification of the fork used a
+DIFFERENT technique (`_drive_gripper_body_to_target`, driving the gripper BODY directly)
+than `skills_scripted.py`'s site-targeting `ik.solve_position_ik` path -- the divergence
+between the mechanism's own verified test harness and the skill layer's actual IK-driving
+pattern is this commit's real finding, not a wiring defect to be patched around by
+loosening a threshold.
+
+**`_hold_ctrl` drift (Commit 1) remains an open, compounding risk specifically for
+`handoff`, not newly measured this session:** because no attach ever completed in this
+run, `handoff`'s from-arm-idle-while-to-arm-moves window (where the drift matters most,
+per Commit 1's own entry) was never actually reached with an object held. The risk stands
+exactly as Commit 1 recorded it -- not re-measured, not resolved.
+
+**Renders.** `docs/images/m06-phase2-fork-lifted.png` (after `pick(A, fork)`) and
+`docs/images/m06-phase2-handoff-complete.png` (after `handoff(A, B, fork)`), both front
+camera, 1280x720, both produced. **Neither shows what its filename claims, reported
+plainly rather than implied:** both renders are visually near-identical -- arm A hovering
+at clearance height above the STILL-RESTING fork (RETREAT ran after a failed GRIP, per
+`run_pick`'s structure), arm B still at its rest pose off to the side (`handoff` aborted
+inside the nested `from_arm` pick, before arm B's own APPROACH waypoint ever ran). At this
+camera's distance the fork itself is a few pixels and not reliably distinguishable from
+the tabletop by eye in either image -- this is stated here rather than left to imply a
+visual confirmation neither render actually provides.
+
+**Consequences.** Physical grasping stays abstracted (ADR-029) and, per ADR-015, the
+README must disclose it -- **not done in this commit**: `README.md` is currently a
+placeholder status doc owned by docs-writer per the agent assignment model
+(`PLAN.md` section 2), and updating it is out of Builder's role; flagged here so it is
+not silently dropped. `pick`/`place`/`handoff` are now wired end-to-end through the weld
+abstraction and will complete successfully for a prop whose grasp geometry keeps the two
+`WeldGrasp` gates' passing windows overlapping -- fork and water_bottle, as wired and
+measured this session, do not; whether any prop's grasp offset can be retargeted to
+produce an overlapping window (without touching `ik.py`/`grasp.py`) is an open follow-up,
+not attempted here (out of this commit's scope: wiring, not re-tuning grasp geometry).
+
+**Source commit:** `37b4e51` ("M06 Phase 2 Commit 2/2: weld wired into pick, place,
+handoff. ADR-030."), found via `git log`/`.git/logs/HEAD` — commit message confirmed
+to match this ADR title.
+
+---
+
+### ADR-031 — IK freeze during GRIP dwell to prevent shifting-pinch-point retreat
+
+**Recorded:** Sept 13, 2026 · **Follows:** the "M06 Phase 2 follow-up" entry in
+`DECISIONS.md` (Bug 2, pinch-point gate fix, which measured but did not chase the root
+cause) · **Touches:** `src/bimanual/control/skills_scripted.py`'s `_dwell` only. `ik.py`,
+`grasp.py`, `executor.py`, `scenes/so101/` are unchanged.
+
+**Context.** The prior entry's own instrumentation measured, during
+`pick(A, fork)`'s GRIP dwell, the pinch-point distance to the fork growing
+0.0351 -> 0.0793 m and the gripper-body distance growing 0.0299 -> 0.0795 m
+over the 300-step dwell -- both starting BELOW `WeldGrasp`'s 0.05 m proximity
+gate and ending ABOVE it. Root cause, confirmed by reading `ik.py` directly
+this session (not merely inferred): `ik.solve_position_ik` targets the PINCH
+POINT (ADR-025's midpoint of the fixed and moving jaw BODIES), recomputed
+fresh from the CURRENT qpos on every solve. As a GRIP dwell closes the jaw,
+the moving jaw body's own position shifts, so the midpoint shifts even though
+the dwell's target (`hold_pos`, a fixed point on the object) does not. The old
+`_dwell` loop re-solved IK every step to keep that SHIFTING midpoint pinned on
+the fixed target -- which means it kept commanding the ARM (not just the jaw)
+to move so the midpoint would track the jaw's own closing motion, i.e. the
+arm physically retreated as the jaws closed. Meanwhile the closure gate
+(`armX_gripper` qpos < 0.3) needs about 150 steps to close. The two gates
+therefore passed/failed on opposite ends of the dwell and never held true on
+the same frame, so `weld.attempt_grasp` never returned `True` and
+`weld_attach_frame` stayed `None`.
+
+**Decision.** `_dwell` now captures the driven arm's own 5 positioning-joint
+ctrl targets ONCE, before the dwell loop starts (reading `env.data.ctrl`,
+i.e. wherever the preceding APPROACH/DESCEND waypoint already converged and
+left the arm commanded), and reapplies that SAME frozen ctrl vector every
+step for the rest of the dwell -- no `ik.solve_position_ik` call at all
+inside the loop. Only the gripper joint's ctrl changes step to step, toward
+`gripper_fraction`. This applies to EVERY call of `_dwell` -- GRIP dwells
+(`run_pick`, `run_handoff`'s receiving-arm GRIP, `run_open_drawer`'s GRIP)
+and RELEASE dwells (`run_place`, `run_handoff`'s releasing-arm RELEASE,
+`run_open_drawer`'s RELEASE) alike, since all six route through the one
+shared `_dwell` implementation and the shifting-pinch-point problem is
+symmetric for an opening jaw. The idle-arm `_hold_ctrl` pattern (M06 Phase 2
+Commit 1) is unchanged and is a DIFFERENT mechanism (it governs the arm NOT
+being driven this call; ADR-031 freezes the arm that IS being driven, only
+during a GRIP/RELEASE dwell specifically).
+
+**Verification (bm-ptl), `pick(A, fork)`, seed=0, monkey-patched
+`WeldGrasp.attempt_grasp` instrumentation logging pinch-point distance and
+gripper qpos every 30 GRIP-dwell frames (scratch diagnostic, not shipped,
+same technique as the prior entry's own measurement):
+```
+GRIP frame 1:   pinch_point_distance=0.0351 m  gripper_qpos=1.7449 rad
+GRIP frame 30:  pinch_point_distance=0.0372 m  gripper_qpos=1.5992 rad
+GRIP frame 60:  pinch_point_distance=0.0374 m  gripper_qpos=1.3215 rad
+GRIP frame 90:  pinch_point_distance=0.0373 m  gripper_qpos=1.0065 rad
+GRIP frame 120: pinch_point_distance=0.0373 m  gripper_qpos=0.6807 rad
+GRIP frame 150: pinch_point_distance=0.0373 m  gripper_qpos=0.3519 rad
+```
+Distance now stays flat (~0.035-0.037 m, comfortably under the 0.05 m gate)
+instead of growing to 0.0793 m, while qpos falls steadily as the jaw closes
+-- direct evidence the freeze removed the retreat. Result:
+`success=True frames_used=1655 reason="lifted fork: initial_z=0.3560
+final_z=0.3989 ... weld_attach_frame=1155 weld_active_at_end=True"`,
+`is_holding('A')=='fork'`. `mj_warnings={}`,
+`max_joint_limit_violation=0.00039` (unchanged, negligible). This is the
+first `pick`/`place`/`handoff` call in this project to attach a weld and
+lift a prop past the WELD success threshold.
+
+**Also run (bm-ptl, seed=0), each its own genuinely different outcome, not
+chased further under this ADR's scope:**
+- `pick(A, mug)`: `success=False`, fails at waypoint 1 (approach),
+  `IK residual=0.0532 m` -- the pre-existing, already-documented arm-A
+  kinematic reach limit to `mug_at_rest` (ADR-027/`m06-reachability-probe.md`),
+  unrelated to GRIP dwell and unaffected by this fix (never reaches GRIP).
+- `pick(A, water_bottle)`: `success=False`,
+  `weld_attach_failed_after_300_frames`, `weld_attach_frame=None` -- reaches
+  GRIP but the gate still never fires for this object/offset combination;
+  bottle z fell 0.4400 -> 0.3684 during the dwell. A different, not-yet-
+  diagnosed proximity gap, flagged as a follow-up, not chased under this
+  session's scope (this ADR's job was the GRIP-freeze mechanism, verified
+  above on the fork).
+- `handoff(A->B, fork)`: `success=False`, fails at waypoint 3 (`to_arm`/arm B
+  APPROACH), `IK residual=0.0875 m` -- `from_arm` (A) had already picked the
+  fork successfully (its own nested `pick` succeeded, weld attached); the
+  failure is arm B's own reach limit to `receiving_point`, a different
+  kinematic gap from arm A's, surfaced only because arm A's GRIP now
+  actually completes.
+- `place(A, fork, destination=table)`: **`success=True`**,
+  `frames_used=3455`, `weld_attach_frame=1155`,
+  `weld_active_at_end=False` (released cleanly before jaw-open, per
+  ADR-030's ordering), final position `x=-0.0081 y=0.0203 z=0.3588`
+  (table-resting height, in-bounds).
+
+**Render.** `docs/images/m06-fork-lifted.png` (front camera, end-of-`pick`
+state, 1280x720). Reported honestly: at this camera's distance the fork is a
+small, thin white object near arm A's jaw and the frame does not, by itself,
+visually PROVE the lift the numeric z-delta already establishes -- it is
+included as a supporting artifact, not as independent confirmation.
+`docs/images/m06-handoff-complete.png` was NOT produced: `handoff` did not
+succeed (arm B's own reach limit above), and rendering a failed handoff would
+misrepresent it as the requested "complete" state.
+
+**`pytest tests/test_skills.py` (bm-ptl), before and after this change:
+identical, 4 passed / 4 failed, same four tests
+(`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`, `test_handoff_mug_ends_held_by_arm_b`),
+same reasons** (plate: `weld_attach_failed_after_300_frames` at
+`final_z=0.3524`, an ADR-024 grasp-reliability/offset gap specific to the
+plate, not the pinch-point-retreat mechanism this ADR fixes; drawer/mug: the
+same already-documented arm-A/arm-B kinematic reach limits). No shift in
+which tests pass, in either direction -- the four tests this suite already
+tracked as blocked by OTHER, separately-documented gaps remain blocked by
+those same gaps; this fix unblocks `fork` specifically (not covered by
+`test_skills.py`'s own four object choices) and is verified above via
+`scripts/run_skill.py`/a scratch instrumentation script instead.
+
+**Consequences.** `_dwell`'s per-step loop no longer calls
+`ik.solve_position_ik` at all -- a real behavioural narrowing (the arm
+cannot correct its OWN dwell-time drift by re-solving), justified because
+the thing it was "correcting" toward was itself the source of the retreat.
+The post-hoc `_validate_against_baseline` convergence check (run once, after
+the dwell, by `_run_dwell`) is unaffected -- it still re-solves IK once to
+report a residual for logging/validation purposes. This does not fix the
+plate's or water_bottle's own separate grasp-reliability gaps, or either
+arm's own kinematic reach limits -- those remain open, tracked by the ADRs
+that already found them (ADR-024, ADR-027 and the prior entry below).
+
+**Source commit:** `06c7917` (given).
+
+---
+
+### ADR-032 — Handoff-position re-measurement: NO collision-free shared point found in the specified sweep; NOT fixed, escalated instead of a constant change
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-031 (GRIP-dwell freeze, which made
+`pick(A, fork)` succeed) · **Task:** relocate `HANDOFF_POSITION_XYZ` into the
+measured shared reach envelope, per instruction to STOP and escalate rather than
+guess if no candidate passes.
+
+**Context.** `pick(A, fork)` succeeds; `handoff(A, B, fork)` gets through arm
+A's pick and fails at waypoint 3 (`to_arm` APPROACH) -- arm B cannot reach the
+current `HANDOFF_POSITION_XYZ = (0.0, -0.01, 0.35)`. The existing comment on
+that constant cites `m06-reachability-probe.md`'s "Shared handoff band: y in
+[-0.12, 0.10]" line as justification, but that band was measured by
+`probe_reachability.py`'s `run_envelope_sweep`, which (its own docstring says
+so explicitly) checks IK residual convergence ONLY -- "collision not checked
+for the sweep". A grid point can converge kinematically while the solved
+configuration drives an arm segment through the table or a prop. That
+caveat, not the band itself, is why this task re-measures instead of trusting
+the existing constant.
+
+**What was measured.** New script `scripts/probe_handoff_reachability.py`,
+run on bm-ptl (ADR-020) and cross-checked byte-identical on this developer's
+laptop (mujoco 3.2.7 both places): sweep x=0 (the constant's existing x),
+y from -0.12 to 0.10 in 0.02 m steps (12 values), z in {0.35, 0.38, 0.40}.
+For each of the 36 (y, z) points, IK is solved independently for arm A and
+arm B (from the home-keyframe reset pose, ADR-026), and each arm's solved
+joint configuration is applied to a scratch `MjData` and checked for any
+NEW contact beyond that arm's measured reset-pose baseline (0 for both
+arms) -- the exact same per-arm-independent residual+collision method
+`probe_reachability.py`'s own primary probes use for their PASS bar,
+copied (not imported) into the new script so it has no coupling to that
+script's grid constants. Full table:
+`docs/hardware/m06-handoff-reachability.md`.
+
+**Result: ALL 36 candidates FAIL for at least one arm. NO (y, z) point in
+the specified sweep passed for both arms.** This was not expected to be
+uniform -- z=0.35 (exactly `TABLE_SURFACE_Z`) was flagged in advance as the
+likeliest to fail, but z=0.38 and z=0.40 (3-5 cm clearance above the table)
+failed identically. Inspecting the actual MuJoCo contacts for representative
+FAIL rows (not merely trusting the boolean) confirms these are genuine,
+non-trivial collisions, not a script artifact: e.g. arm A solved toward
+(0.00, 0.06, 0.40) (residual 0.00926 m, well converged) produces
+`armA_lower_arm`/`armA_wrist` vs. `table_top` contacts at up to -0.0237 m
+penetration, plus contacts with the (stationary, unrelated) `mug` and
+`fork` bodies at up to -0.031 m -- the solved arm literally swings through
+the tabletop and through props resting nearby, not merely grazing. A
+control check confirmed the machinery itself is not universally broken:
+a known off-centerline target, (0.30, -0.05, 0.50), solved with residual
+0.00848 m and **zero** new contacts for arm A -- so the collision check
+correctly reports "no collision" when there genuinely is none; it is the
+x=0 centerline candidates specifically, at this z band, that tunnel.
+
+**Root cause, not fixed here (out of this task's permitted file list, and
+already flagged as an existing, out-of-scope finding).** This is the same
+`ik.py`/DLS-solver local-minimum behavior `m06-reachability-probe.md`'s own
+"Step 4" section already documented for `plate_at_rest`/`mug_at_rest`/
+`bottle_at_rest`: solving toward a point requires reaching centrally
+across/over the table from the folded "home" seed, and the redundant 5-DOF
+position-only solver (ADR-024) has no notion of the table's existence, so
+it happily converges to a position-accurate configuration that gets there
+by swinging the forearm through the table and through whatever sits on it,
+rather than up and over. `ik.py` is on this task's do-not-touch list, and
+fixing the solver (multi-start solving, an obstacle-aware cost term, or a
+different seed) is exactly the kind of code change this task was not
+scoped to make.
+
+**Decision: do NOT change `HANDOFF_POSITION_XYZ`.** Per this task's own
+explicit instruction ("If NO candidate passes for both arms, stop and
+report the table... That would mean the two arms have no collision-free
+shared workspace at any tested height... it would need an arm-placement
+decision, not a constant change"), `skills_scripted.py` is left untouched
+this commit. Picking any (y, z) from this sweep and writing it into the
+constant anyway would repeat exactly the mistake this task was assigned to
+fix: a plausible-looking constant that was never actually verified
+collision-free.
+
+**What this means for ADR-021.** ADR-021's original ~0.30 m reach / 0.50 m
+base-gap layout assumption, already shown too optimistic once by ADR-026's
+home-pose re-measurement and again by `probe_reachability.py`'s residual-only
+band, is now superseded a third time: even the residual-only band's claimed
+overlap does not survive a collision check at any of the three heights this
+task specifies. Whether a collision-free shared point exists at some OTHER
+(x, y, z) outside this specific sweep is not established either way by this
+result -- only that none exists in the region this task was scoped to check.
+Resolving this for real needs either (a) moving one or both arm bases
+(ADR-021's own placement assumption) so a shared reach point exists further
+from the table's central tunneling zone, or (b) an IK-solver fix (out of
+`skills_scripted.py`'s scope) that avoids the table-tunneling local minimum.
+Recommending, not deciding, per this task's own instruction that an
+arm-placement change is a decision for the user, not this commit.
+
+**Consequences.** `handoff(A, B, fork)` is NOT re-verified in this commit
+(the task's VERIFY step is conditioned on a chosen position existing).
+`docs/images/m06-handoff-complete.png` is not produced. `pytest
+tests/test_skills.py` is unchanged by this commit (no source file changed)
+-- the same 4 failed / 4 passed as before, `test_handoff_mug_ends_held_by_arm_b`
+still failing for its own pre-existing, unrelated reason (arm A's `pick`
+of the mug fails to converge, per that test's own captured output).
+
+**Source commit:** `92acc32` ("M06: handoff position re-measured with collision
+check; NO candidate passed for both arms in the specified sweep, escalated
+instead of guessing (ADR-032)."), per this session's git log.
+
+---
+
+### ADR-032 (second pass) — Handoff-position sweep re-run with four seeding/collision corrections plus an extended-height grid; STILL no shared point, and the reach bands themselves do not overlap at x=0
+
+**Recorded:** Sept 13, 2026 · **Follows:** the ADR-032 entry above (first
+pass: home-seeded, residual+cross-arm-collision only, all 36 candidates FAIL) ·
+**Task:** re-run the same sweep with four named corrections (C1-C4) plus two
+additions, and relocate `HANDOFF_POSITION_XYZ` to a passing candidate if one
+exists.
+
+**What changed versus the first pass, and why each change was expected to
+matter.**
+- **C1 (grid targets the pinch point).** Unchanged in substance --
+  `ik.solve_position_ik` already targets the pinch point (ADR-025), not the
+  gripper body, in both passes. Made explicit this pass by also checking
+  each solved configuration for a joint pinned at its `jnt_range` bound
+  (margin < 1e-4 m), not merely residual convergence.
+- **C2 (seed from the handoff-APPROACH pose, not home) -- the correction
+  expected to matter most.** The first pass's own root-cause paragraph
+  attributed the universal FAIL to every solve starting from the folded
+  "home" pose, which lets `ik.py`'s redundant 5-DOF DLS solver fall into a
+  table-tunneling local minimum when asked to reach centrally across the
+  table. This pass stages each arm's solve exactly as
+  `skills_scripted.run_handoff` itself does: solve HOME -> that arm's own
+  APPROACH hover point (`CLEARANCE_HEIGHT_M` above the candidate, offset by
+  `HANDOFF_SIDE_OFFSET_M` for the receiving arm), then -- from THAT
+  resulting configuration, not home again -- solve -> the candidate itself.
+  The residual gated on is this second, seeded solve's residual.
+- **C3 (cross-arm collision, explicit threshold).** Both arms' seeded,
+  converged configs applied SIMULTANEOUSLY via `mj_forward`; rejected if any
+  cross-arm contact is deeper than -0.005 m.
+- **C4 (one direction).** Swept only `from_arm=A, to_arm=B` (the commit
+  gate, `handoff(A, B, fork)`); `handoff(B, A, fork)` is checked
+  opportunistically by actually running the skill, not swept as a second
+  grid (not reached this session -- see Consequences).
+- **Addition 1 (kept, not dropped): arm-vs-world.** Each arm's own solved
+  config applied ALONE (table_top AND every prop -- plate, mug, fork,
+  spoon, water_bottle, drawer), same -0.005 m bar, so a seeded-but-still-
+  tunneling candidate cannot pass merely because the OTHER arm's collision
+  happened to be checked.
+- **Addition 2: grid extended upward.** z in {0.35, 0.38, 0.40} (as
+  specified) PLUS z in {0.44, 0.47} (extra rows), on the reasoning that
+  z=0.35 IS `TABLE_SURFACE_Z` and a real handoff should happen in free space
+  above it, not at or grazing the surface.
+
+**What was measured.** `scripts/probe_handoff_reachability.py`, rewritten
+for this pass, run on bm-ptl (ADR-020). Full 60-row table (12 y-values x 5
+z-values, x=0 fixed):
+`docs/hardware/m06-handoff-reachability.md`.
+
+**Result: ALL 60 candidates FAIL, and `both_reachable` is False on EVERY
+SINGLE row -- not merely the collision checks.** This is a stronger, more
+precisely diagnosed non-go than the first pass, not a repeat of the same
+ambiguous result: the seeding correction (C2) measurably did **not** move
+armA's residual at all for most rows where it had previously failed badly
+(e.g. `(0, -0.12, 0.35)`: 0.21540 m in BOTH the first pass and this one,
+identical to 5 decimal places) -- because `CLEARANCE_HEIGHT_M` is only 0.08
+m above the candidate, the seeded approach pose sits in the same
+local-minimum basin as the candidate itself for targets the solver already
+fails on from home. Reported honestly rather than claimed as a fix that
+worked: **C2, applied exactly as instructed (a kinematic IK reseed, not a
+physically-simulated pick-then-transfer), did not rescue any candidate this
+session found.**
+
+**A second, independent finding, confirmed by a direct control check (not
+merely inferred from the sweep table): at x=0, the two arms' own
+convergence bands do not overlap AT ALL, and each arm converges BETTER on
+the side OPPOSITE its own base, not the side it is mounted on.** Measured
+directly: `arm A -> (0, -0.20, 0.40)` (arm A's OWN side, base at y=-0.25):
+residual 0.260, does not converge. `arm A -> (0, +0.20, 0.40)` (the far
+side): residual 0.061, much closer (still not under the 0.01 m bar, but an
+order of magnitude tighter). Arm B is the exact mirror
+(`(0,+0.20,0.40)`=0.260, `(0,-0.20,0.40)`=0.061). A known-good off-
+centerline control target, `(0.30, -0.05, 0.50)` for arm A / its mirror
+`(-0.30, 0.05, 0.50)` for arm B, both converge cleanly (residual 0.00848 m
+each) -- confirming the solver and the arm/geom lookups are not swapped or
+broken; the crossed, non-overlapping reach pattern at x=0 is a real,
+measured property of this scene's arm mounting, not a script defect. Given
+this, at x=0 there is a wide dead band (roughly y in [-0.04, 0.10] for arm
+A's failure side crossed with arm B's mirrored failure side) where NEITHER
+arm converges well, and the two arms' respective "good" bands sit almost
+entirely on each other's own base side -- the opposite of what a shared
+midline transfer point needs.
+
+**Decision: do NOT change `HANDOFF_POSITION_XYZ`.** Per this task's own
+explicit stop condition ("If NOTHING passes even at z in {0.44, 0.47}, stop
+and report... that would mean the arms have no collision-free shared
+workspace at any tested height, which is an ADR-021 arm-placement decision,
+not a constant change"), `skills_scripted.py` is left untouched by this
+entry. The extended z rows (0.44, 0.47) do not change the verdict --
+`both_reachable` fails identically at every height tested, so this is not a
+height problem the way the first pass's own note speculated it might be;
+it is an x=0 lateral-reach problem, orthogonal to z.
+
+**Correction to this task's own pre-written framing.** The instruction text
+supplied for this ADR entry asserts "ADR-021's assumed 0.10 m shared band
+has... been superseded by measurement twice." The actual ledger in
+`DECISIONS.md` is longer than that: ADR-026's home-pose re-measurement, then
+`probe_reachability.py`'s residual-only envelope sweep, then the first
+ADR-032 pass's collision-checked sweep, and now this second pass, have each
+in turn found the shared band smaller or less real than the previous
+measurement claimed -- more than two supersessions on the record, and this
+entry is not the first to say so (the first ADR-032 entry above already
+made the same correction, saying "a third time"). Restating the number
+here as "twice" would understate the file's own history, so it is not
+repeated as given.
+
+**Consequences.** `handoff(A, B, fork)` is NOT re-verified this session --
+no candidate exists to verify against, so the VERIFY step this task
+specifies (is_holding checks, `docs/images/m06-handoff-complete.png`) is
+not attempted; rendering a scene with no valid transfer point applied would
+misrepresent a check that never ran. `handoff(B, A, fork)`'s opportunistic
+check is likewise not run for the same reason (C4 gates it on a chosen
+position that does not exist). `pytest tests/test_skills.py` is unchanged
+by this entry (no source file changed): 4 passed / 4 failed, before and
+after, identical to the first pass's own reported baseline, same four
+tests, same reasons. This strengthens, not merely repeats, the
+recommendation already on record: resolving this needs either (a) moving
+one or both arm bases (ADR-021's own placement assumption -- now shown to
+produce a crossed, non-overlapping reach pattern at the table's own
+centerline, not merely an optimistic band), or (b) an IK-solver change (out
+of `skills_scripted.py`'s scope) that does not depend on which basin the
+seed pose happens to land in. Recommending, not deciding, per this task's
+own instruction that an arm-placement change is a decision for the user.
+
+**Handoff status, stated plainly for a reader who only reads this
+paragraph.** As of this pass, `handoff` does not work: two independent
+sweeps (36 rows, then 60 rows) both found zero mutually-reachable transfer
+candidates for arm A -> arm B. A third, home-seeded sweep (36 rows,
+`c9d7d82`) was later run for comparison and likewise found none. This is a
+recorded negative finding, not a pending diagnostic with an expected
+imminent fix — the next step is an arm-placement or IK-solver decision
+outside this module's own scope, per the Consequences above.
+
+**Source commit:** `ba76190` ("M06: handoff position via measured
+mutual-reachability sweep (ADR-032)."), given/confirmed against this
+session's git log; the home-seeded comparison sweep referenced above is
+`c9d7d82` ("M06 handoff diagnostic: home-pose reachability sweep for
+comparison."), a diagnostic-only commit, not a further ADR-032 pass.
+
+---
+
+### ADR-033 — `pick(A, water_bottle)`: per-prop APPROACH/RETREAT hover height for tall props, fixing a hover point that sat BELOW the bottle's own physical top
+
+**Recorded:** Sept 13, 2026 · **Follows:** `docs/hardware/m06-water-bottle-diagnostic.md`
+(commit `635a902`), which found the bottle displaced ~0.157 m in x / -0.061 m
+in z from its reset position DURING (non-convergent) APPROACH/DESCEND,
+entirely before GRIP starts, with ADR-031's GRIP-dwell freeze itself
+confirmed working correctly (pinch point constant to 4 decimals across all
+300 dwell frames) · **Task:** apply the smallest fix that makes
+`pick(A, water_bottle)` succeed, choosing between (a) re-reading the
+object's position at GRIP start or (b) not knocking it during approach.
+
+**Branch chosen: (b), not (a) — and why (a) would not have worked at all,
+not merely worked poorly.** `grasp.WeldGrasp.attempt_grasp`'s Gate 2
+(proximity) already measures the pinch point against the object's OWN LIVE
+`data.xpos` every call (`grasp.py:356-363`), not against any fixed
+`grasp_point`/`hold_pos` value computed in `skills_scripted.py`. Re-reading
+the bottle's position and recomputing `grasp_point` at GRIP start (option
+a) would change ONLY the value logged/used for `_dwell`'s post-hoc IK
+residual report — it is never used to re-aim the arm during the dwell
+(ADR-031 freezes the arm's ctrl to wherever DESCEND already left it) and
+never used by Gate 2 (which already reads the bottle live). So (a) is not
+merely riskier here, as the task's framing anticipated — it is a no-op
+against the actual failure: the arm's frozen GRIP-dwell pose is wherever
+DESCEND converged to, and DESCEND converged near the bottle's ORIGINAL
+resting spot while the bottle had already been knocked ~0.16 m away by
+APPROACH's own motion, before GRIP or any re-read could matter.
+
+**Root cause, found by measuring the scene geometry `run_pick` was already
+targeting.** `scripts/gen_dual_scene.py`'s `water_bottle_cap` geom is
+`pos="0 0 0.10" size="0.012 0.01"` sitting on `water_bottle_body`'s
+`size="0.03 0.09"` cylinder — the cap's own top surface sits at local
+z = 0.10 + 0.01 = 0.11 m above the body origin (reset z=0.44), i.e. world
+z=0.55 m. The old `hover = grasp_point + CLEARANCE_HEIGHT_M` formula gave
+hover.z = 0.46 + 0.08 = 0.54 m — **0.01 m BELOW the bottle's own physical
+top**, not above it as "hover" is supposed to be. Every other pickable prop
+(plate/mug/fork/spoon) has its `GRASP_POINT_OFFSET_M` sitting at or near its
+own physical top already, so the same `CLEARANCE_HEIGHT_M` margin genuinely
+clears them; only the bottle's grasp point (intentionally lower, near its
+neck, partway down a ~0.20 m combined body+cap) leaves its own upper
+structure un-cleared by the existing formula. This is consistent with (does
+not contradict) the diagnostic's own finding that APPROACH/DESCEND both
+report `converged=False` at their full 500-step budgets — a "hover" target
+that is not actually clear of the object is exactly the kind of target that
+can produce sustained, escalating contact during a redundant 5-DOF
+incremental IK drive.
+
+**Fix applied.** Added `OBJECT_TOP_LOCAL_Z_M` (`skills_scripted.py`), a
+per-prop dict giving a prop's own physical top as a local z offset above its
+body origin, currently populated only for `"bottle": 0.11` (the measured cap
+top, from the scene geometry above). `run_pick`'s `hover` is now
+`max(grasp_point.z, obj_pos0.z + OBJECT_TOP_LOCAL_Z_M.get(target_object,
+offset.z)) + CLEARANCE_HEIGHT_M` instead of the old
+`grasp_point.z + CLEARANCE_HEIGHT_M`. For every prop except the bottle,
+`.get(..., offset.z)`'s fallback makes `obj_pos0.z + offset.z ==
+grasp_point.z` exactly, so `max(...)` is a no-op and their hover height is
+byte-for-byte unchanged — this is a per-prop, additive correction, not a
+change to the shared formula or to `CLEARANCE_HEIGHT_M` itself. No change to
+`grasp.py`, `ik.py`, `executor.py`, `scenes/so101/`, or `gen_dual_scene.py`
+(the bottle's mass/geometry are read, not modified).
+
+**Measured result (bm-ptl, `mujoco==3.2.7`, seed 0).** `pick(A,
+water_bottle)`: bottle position at reset `(0.2200, 0.0000, 0.4400)`; at GRIP
+start (post-DESCEND, reproduced via `run_pick`'s own `_run_waypoint`/
+`_run_dwell` helpers) `(0.2372, 0.0440, 0.4404)` — displacement now ~0.017 m
+in x / ~0.0004 m in z versus the old ~0.157 m / -0.061 m, a lateral nudge
+during the redundant IK solve's approach, not a knock; weld attaches at
+`attach_frame=1155` (whole-skill-call frame count via the real
+`ScriptedSkillExecutor.execute`), `is_holding('A')=='water_bottle'`, final
+z=0.6191 (initial 0.4400, success threshold 0.3700) — lifted 0.179 m.
+`SkillResult.success=True`. `pytest tests/test_skills.py`: 4 failed / 4
+passed before this change and 4 failed / 4 passed after (same four
+pre-existing failures — `test_open_drawer_reaches_near_limit`,
+`test_pick_plate_lifts_above_table`, `test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b` — all unrelated to the bottle and
+unaffected by this change, confirmed by identical failure reasons/residuals
+before and after).
+
+**Not done.** No ADR-031 correction is needed — its GRIP freeze was already
+confirmed working correctly by the referenced diagnostic and is untouched
+here.
+
+**Skills working as of this commit, stated plainly:** `pick(A, fork)`,
+`place(A, fork, table)`, and `pick(A, water_bottle)`. `pick(A, mug)`,
+`open_drawer`, and `handoff` do not work as of this commit.
+`pytest tests/test_skills.py` is 4 passed / 4 failed.
+
+**Source commit:** `d239a55` (given).
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
