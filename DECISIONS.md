@@ -11,6 +11,131 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-032 (second pass) — Handoff-position sweep re-run with four seeding/collision corrections plus an extended-height grid; STILL no shared point, and the reach bands themselves do not overlap at x=0
+
+**Recorded:** Sept 13, 2026 · **Follows:** the ADR-032 entry directly below (first
+pass: home-seeded, residual+cross-arm-collision only, all 36 candidates FAIL) ·
+**Task:** re-run the same sweep with four named corrections (C1-C4) plus two
+additions, and relocate `HANDOFF_POSITION_XYZ` to a passing candidate if one
+exists.
+
+**What changed versus the first pass, and why each change was expected to
+matter.**
+- **C1 (grid targets the pinch point).** Unchanged in substance --
+  `ik.solve_position_ik` already targets the pinch point (ADR-025), not the
+  gripper body, in both passes. Made explicit this pass by also checking
+  each solved configuration for a joint pinned at its `jnt_range` bound
+  (margin < 1e-4 m), not merely residual convergence.
+- **C2 (seed from the handoff-APPROACH pose, not home) -- the correction
+  expected to matter most.** The first pass's own root-cause paragraph
+  attributed the universal FAIL to every solve starting from the folded
+  "home" pose, which lets `ik.py`'s redundant 5-DOF DLS solver fall into a
+  table-tunneling local minimum when asked to reach centrally across the
+  table. This pass stages each arm's solve exactly as
+  `skills_scripted.run_handoff` itself does: solve HOME -> that arm's own
+  APPROACH hover point (`CLEARANCE_HEIGHT_M` above the candidate, offset by
+  `HANDOFF_SIDE_OFFSET_M` for the receiving arm), then -- from THAT
+  resulting configuration, not home again -- solve -> the candidate itself.
+  The residual gated on is this second, seeded solve's residual.
+- **C3 (cross-arm collision, explicit threshold).** Both arms' seeded,
+  converged configs applied SIMULTANEOUSLY via `mj_forward`; rejected if any
+  cross-arm contact is deeper than -0.005 m.
+- **C4 (one direction).** Swept only `from_arm=A, to_arm=B` (the commit
+  gate, `handoff(A, B, fork)`); `handoff(B, A, fork)` is checked
+  opportunistically by actually running the skill, not swept as a second
+  grid (not reached this session -- see Consequences).
+- **Addition 1 (kept, not dropped): arm-vs-world.** Each arm's own solved
+  config applied ALONE (table_top AND every prop -- plate, mug, fork,
+  spoon, water_bottle, drawer), same -0.005 m bar, so a seeded-but-still-
+  tunneling candidate cannot pass merely because the OTHER arm's collision
+  happened to be checked.
+- **Addition 2: grid extended upward.** z in {0.35, 0.38, 0.40} (as
+  specified) PLUS z in {0.44, 0.47} (extra rows), on the reasoning that
+  z=0.35 IS `TABLE_SURFACE_Z` and a real handoff should happen in free space
+  above it, not at or grazing the surface.
+
+**What was measured.** `scripts/probe_handoff_reachability.py`, rewritten
+for this pass, run on bm-ptl (ADR-020). Full 60-row table (12 y-values x 5
+z-values, x=0 fixed):
+`docs/hardware/m06-handoff-reachability.md`.
+
+**Result: ALL 60 candidates FAIL, and `both_reachable` is False on EVERY
+SINGLE row -- not merely the collision checks.** This is a stronger, more
+precisely diagnosed non-go than the first pass, not a repeat of the same
+ambiguous result: the seeding correction (C2) measurably did **not** move
+armA's residual at all for most rows where it had previously failed badly
+(e.g. `(0, -0.12, 0.35)`: 0.21540 m in BOTH the first pass and this one,
+identical to 5 decimal places) -- because `CLEARANCE_HEIGHT_M` is only 0.08
+m above the candidate, the seeded approach pose sits in the same
+local-minimum basin as the candidate itself for targets the solver already
+fails on from home. Reported honestly rather than claimed as a fix that
+worked: **C2, applied exactly as instructed (a kinematic IK reseed, not a
+physically-simulated pick-then-transfer), did not rescue any candidate this
+session found.**
+
+**A second, independent finding, confirmed by a direct control check (not
+merely inferred from the sweep table): at x=0, the two arms' own
+convergence bands do not overlap AT ALL, and each arm converges BETTER on
+the side OPPOSITE its own base, not the side it is mounted on.** Measured
+directly: `arm A -> (0, -0.20, 0.40)` (arm A's OWN side, base at y=-0.25):
+residual 0.260, does not converge. `arm A -> (0, +0.20, 0.40)` (the far
+side): residual 0.061, much closer (still not under the 0.01 m bar, but an
+order of magnitude tighter). Arm B is the exact mirror
+(`(0,+0.20,0.40)`=0.260, `(0,-0.20,0.40)`=0.061). A known-good off-
+centerline control target, `(0.30, -0.05, 0.50)` for arm A / its mirror
+`(-0.30, 0.05, 0.50)` for arm B, both converge cleanly (residual 0.00848 m
+each) -- confirming the solver and the arm/geom lookups are not swapped or
+broken; the crossed, non-overlapping reach pattern at x=0 is a real,
+measured property of this scene's arm mounting, not a script defect. Given
+this, at x=0 there is a wide dead band (roughly y in [-0.04, 0.10] for arm
+A's failure side crossed with arm B's mirrored failure side) where NEITHER
+arm converges well, and the two arms' respective "good" bands sit almost
+entirely on each other's own base side -- the opposite of what a shared
+midline transfer point needs.
+
+**Decision: do NOT change `HANDOFF_POSITION_XYZ`.** Per this task's own
+explicit stop condition ("If NOTHING passes even at z in {0.44, 0.47}, stop
+and report... that would mean the arms have no collision-free shared
+workspace at any tested height, which is an ADR-021 arm-placement decision,
+not a constant change"), `skills_scripted.py` is left untouched by this
+entry. The extended z rows (0.44, 0.47) do not change the verdict --
+`both_reachable` fails identically at every height tested, so this is not a
+height problem the way the first pass's own note speculated it might be;
+it is an x=0 lateral-reach problem, orthogonal to z.
+
+**Correction to this task's own pre-written framing.** The instruction text
+supplied for this ADR entry asserts "ADR-021's assumed 0.10 m shared band
+has... been superseded by measurement twice." The actual ledger in this
+file is longer than that: ADR-026's home-pose re-measurement, then
+`probe_reachability.py`'s residual-only envelope sweep, then the first
+ADR-032 pass's collision-checked sweep, and now this second pass, have each
+in turn found the shared band smaller or less real than the previous
+measurement claimed -- more than two supersessions on the record, and this
+entry is not the first to say so (the first ADR-032 entry below already
+made the same correction, saying "a third time"). Restating the number
+here as "twice" would understate the file's own history, so it is not
+repeated as given.
+
+**Consequences.** `handoff(A, B, fork)` is NOT re-verified this session --
+no candidate exists to verify against, so the VERIFY step this task
+specifies (is_holding checks, `docs/images/m06-handoff-complete.png`) is
+not attempted; rendering a scene with no valid transfer point applied would
+misrepresent a check that never ran. `handoff(B, A, fork)`'s opportunistic
+check is likewise not run for the same reason (C4 gates it on a chosen
+position that does not exist). `pytest tests/test_skills.py` is unchanged
+by this entry (no source file changed): 4 passed / 4 failed, before and
+after, identical to the first pass's own reported baseline, same four
+tests, same reasons. This strengthens, not merely repeats, the
+recommendation already on record: resolving this needs either (a) moving
+one or both arm bases (ADR-021's own placement assumption -- now shown to
+produce a crossed, non-overlapping reach pattern at the table's own
+centerline, not merely an optimistic band), or (b) an IK-solver change (out
+of `skills_scripted.py`'s scope) that does not depend on which basin the
+seed pose happens to land in. Recommending, not deciding, per this task's
+own instruction that an arm-placement change is a decision for the user.
+
+---
+
 ## ADR-032 — Handoff-position re-measurement: NO collision-free shared point found in the specified sweep; NOT fixed, escalated instead of a constant change
 
 **Recorded:** Sept 13, 2026 · **Follows:** ADR-031 (GRIP-dwell freeze, which made
