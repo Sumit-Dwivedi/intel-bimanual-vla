@@ -424,22 +424,29 @@ def main() -> int:
     # The previous per-panel-recomputed lookat/distance (a moving camera)
     # is replaced outright, not kept as a fallback.
     #
-    # Side view, centred on the transfer point (`transfer_point`, ADR-036's
+    # Centred on the transfer point (`transfer_point`, ADR-036's
     # `HANDOFF_POSITION_XYZ`) rather than on either arm's own gripper --
     # the transfer point is the one location common to the whole story (A
     # arrives there holding the fork, B takes it from there, both retreat
     # away from it), so it stays meaningful across all four milestones even
     # though milestone 1 (B still at HOME) and milestone 4 (both arms
     # retreated) put the arms themselves at very different places.
-    # Parameters per this task's own suggested start: elevation=-15,
-    # azimuth=90 (a side view: looking along the table's x-axis lets the
-    # arms' y-separation -- exactly what ADR-038 fix 2's lateral retreat
-    # adds -- read as LEFT/RIGHT screen motion, not foreshortened the way
-    # `overhead` foreshortens it per candidate 3's own printed caveat
-    # above), distance=1.2 m (wide enough to keep both arms' full reach,
-    # including arm B still at HOME in milestone 1, inside frame -- verified
-    # by inspecting the four rendered panels, not assumed).
-    cam_fixed_sequence = {"azimuth": 90, "elevation": -15, "distance": 1.2, "lookat": list(transfer_point)}
+    #
+    # Parameters, ACTUALLY VERIFIED BY INSPECTING THE RENDERED IMAGE, not
+    # assumed from the task's own suggested starting point. The suggested
+    # start (elevation=-15, azimuth=90, distance=1.2) was tried FIRST and
+    # rendered -- inspection showed only ONE arm visible in any panel; at
+    # azimuth=90 the two arms (offset only in y from a shared x~0 base
+    # line) sit almost exactly in line with the viewing ray, so one
+    # occludes the other instead of separating left/right as intended.
+    # `m06-handoff-candidate-2.png`'s own camera (azimuth=130,
+    # elevation=-22) was ALREADY confirmed (by inspection, same method) to
+    # show both arms clearly separated plus the red fork -- reused here,
+    # with distance widened from that candidate's 0.6 m to 0.9 m so arm B
+    # (still at HOME, farther from `transfer_point`, in milestone 1) is not
+    # cropped out of the first panel. Re-inspected after this change:
+    # both arms visible, clearly separated, in all four panels.
+    cam_fixed_sequence = {"azimuth": 130, "elevation": -22, "distance": 0.9, "lookat": list(transfer_point)}
     seq_order = [
         ("m1_holding_fork", "1"),
         ("m2_at_transfer", "2"),

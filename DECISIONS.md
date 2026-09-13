@@ -100,6 +100,93 @@ any render in those documents shows a silver fork.
 **API note carried forward:** `run_handoff(env, to_arm, from_arm, obj)` is
 receiver-first. An A→B handoff is `run_handoff(env, "B", "A", "fork")`.
 
+### Addendum, Sept 14 2026 (same day, follow-up pass) — Fix 4 corrected; a
+### measurement discrepancy flagged; independent re-verification
+
+**Provenance note, reported for transparency.** This addendum was written in
+a session that found the four fixes above (red fork, 0.10 m lateral retreat,
+full revert of prop repositioning) ALREADY present and already committed in
+this file and in `skills_scripted.py`/`gen_dual_scene.py`, under a different
+commit author/co-author line than this session's own attribution. The code
+in that commit is, line for line, the same code this session had
+independently arrived at (including this session's own comment prose),
+which means the two were not truly independent — this session's own
+in-progress edits were committed by another process before this session
+finished. This is recorded here rather than silently built on top of,
+per this project's own "reported honestly" convention.
+
+**Fix 4 was NOT left in its "PARTIAL... does not demonstrate the handoff"
+state above.** That entry's own azimuth=90/distance=1.2 m camera (the
+task's suggested starting point) was rendered and INSPECTED (not merely
+computed): only one arm is visible in any panel. At azimuth=90 the two
+arms — offset only in y, both near x≈0 — sit almost exactly in line with
+the viewing ray, so one occludes the other instead of separating
+left/right as the task's own rationale for that angle assumed. Fixed by
+reusing `m06-handoff-candidate-2.png`'s own already-good camera direction
+(azimuth=130, elevation=-22, ALSO confirmed by inspection to show both
+arms clearly separated plus the visible red fork), widened from that
+candidate's 0.6 m distance to 0.9 m so arm B (still at HOME, farther from
+`transfer_point`, in milestone 1) is not cropped out of the first panel.
+Re-inspected after the change: both arms visible and clearly separated in
+all four panels, with the red fork visible near arm B by the final panel.
+`m06-handoff-sequence.png` is regenerated with this camera; the strip DOES
+now demonstrate the handoff and can be used as evidence, superseding the
+"should not be used as evidence" caveat above.
+
+**Measurement discrepancy, flagged not silently corrected.** This entry's
+Fix 2 table reports "0.1946 m" final lateral separation at 0.10 m lateral
+retreat. Independently re-measured this session, via the exact same
+shipped code/scene/seed, directly from `data.site_xpos` at the final
+frame (`abs(site_a_final[1] - site_b_final[1])`, the most literal reading
+of "final-frame lateral gripper separation"): **0.0983 m**, reproduced
+identically across two separate runs. Every OTHER number in this entry's
+own verification table (`frames_used=6610`, `from_arm_retreat_dist=0.2263`,
+all four skills' z-values) matches this session's own re-measurement
+exactly, so the underlying run is confirmed identical — only the "0.1946 m"
+figure could not be reproduced by this direct method. Left unresolved
+(not guessed at further) because chasing it would cost more bm-ptl round
+trips than this pass's budget allowed; **0.0983 m is the number this
+session verified and stands behind.**
+
+**Also done this pass, not covered above:** `docs/images/m02-scene.png`
+re-rendered against the (reverted-to-original-positions, red-fork) scene —
+inspected: original prop layout, red fork visible on the table, both arms
+in their fold-back home pose. `docs/images/m06-handoff-complete.png` was
+NOT touched, per instruction.
+
+**Re-verified this pass (bm-ptl, `mujoco==3.2.7`, seed 0), independently
+from the table above, using the correct `target_object="bottle"` key
+(`OBJECT_BODY_NAME["bottle"] == "water_bottle"`; a leftover diagnostic
+script from an earlier session had used the wrong key `"water_bottle"` and
+reported a false failure — not a real regression, a script bug, corrected
+here):**
+
+| skill | result |
+|---|---|
+| `pick(A, fork)` | success, frames_used=1655, weld_attach_frame=1155, z 0.3560 → 0.3989 |
+| `place(A, fork, table)` | success, frames_used=3455, final xyz=(-0.0081, 0.0203, 0.3588) |
+| `pick(A, bottle)` | success, frames_used=1655, weld_attach_frame=1155, z 0.4400 → 0.6192 |
+| `handoff(A→B, fork)` | success, frames_used=6610, weld_attach_frame=5310, `from_arm_retreat_dist=0.2263`, lateral_y_sep=0.0983 |
+
+`pytest tests/test_skills.py`: 4 passed / 4 failed, same four tests
+(`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b`) failing as before this whole ADR-038
+body of work began — no regression. Note the specific failure REASON
+strings for the plate/mug tests differ from some intermediate runs during
+this work (e.g. `weld_attach_failed_after_300_frames` vs an IK-convergence
+reason) purely because plate/mug are back at their original coordinates,
+not a new defect — same tests still fail, same tests still pass.
+
+**Constraints honored this pass:** only `gen_dual_scene.py` (documentation
+only — the position constants were already back at their pre-ADR-038
+values), `skills_scripted.py` (comment correction only — the retreat
+constants were already 0.10), `scripts/render_handoff_frames.py` (the
+sequence camera fix above), the regenerated XML, four images, and this
+file were touched. `git diff --stat -- scenes/so101/` confirmed empty.
+ADR-031's GRIP freeze, ADR-033's hover, ADR-034's guard and ADR-037's
+choreography phases are unmodified.
+
 ## ADR-037 — `run_handoff` rewritten as sequential choreography (one arm moves at a time, the other genuinely frozen); the fix for the `_hold_ctrl` drift bug turned out to ALSO resolve the ADR-036/`f92806e` cross-arm collision — `handoff(A, B, fork)` now succeeds end to end, verified by direct measurement, not assumed
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-036 (`f92806e`, cross-arm
