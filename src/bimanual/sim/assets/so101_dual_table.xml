@@ -92,7 +92,14 @@
     <material name="plate_material" rgba="0.92 0.92 0.88 1"/>
     <material name="mug_material" rgba="0.10 0.75 0.20 1"/>
     <material name="mug_handle_material" rgba="0.10 0.75 0.20 1"/>
-    <material name="fork_material" rgba="0.72 0.73 0.76 1"/>
+    <!-- ADR-038 fix 1: the fork is the handoff demo's target object, and
+         at silver-grey (0.72 0.73 0.76) it was indistinguishable from the
+         off-white plate and the identically-coloured spoon in every render,
+         making the handoff impossible to read. Bright red is a colour
+         change ONLY -- geometry, mass and collision are untouched, so no
+         skill behaviour depends on it. spoon_material is deliberately left
+         silver so only the fork stands out. -->
+    <material name="fork_material" rgba="1.0 0.15 0.15 1.0"/>
     <material name="spoon_material" rgba="0.72 0.73 0.76 1"/>
     <material name="bottle_material" rgba="0.10 0.40 0.95 1"/>
 

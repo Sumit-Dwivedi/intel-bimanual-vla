@@ -265,6 +265,27 @@ HOME_WRIST_ROLL = 0.0
 #: FLUSH on the table gives a parallel jaw nothing to slide under. A foot
 #: ring gives the plate the SAME affordance real dinnerware has: the dish
 #: overhangs its own foot, leaving a gap a jaw can enter from below.
+#:
+#: ADR-038 fix 3, ATTEMPTED THEN REVERTED: a prior pass moved
+#: PLATE_POS/MUG_POS/SPOON_POS/BOTTLE_POS's xy out to the table's four
+#: corners, to declutter the handoff render's sightline. Measured on
+#: bm-ptl (real `ScriptedSkillExecutor` + `WeldGrasp` path, seed 0, not a
+#: one-shot IK check): with all four props moved, `handoff(A, B, fork)`
+#: newly fails at Phase 3 (`to_arm`'s own approach), where it previously
+#: (ADR-037) succeeded. A bisection (revert one prop at a time) found NO
+#: single prop responsible -- every partial combination tried (any one
+#: prop reverted alone; PLATE+MUG reverted with SPOON+BOTTLE left moved)
+#: reproduced the IDENTICAL failure (`IK residual=0.0875 m` to 4 decimal
+#: places every time); only reverting ALL FOUR restored Phase 3->4
+#: success. This matches ADR-037's own already-documented warning that
+#: this handoff sits on a "knife-edge" convergence margin ("flips
+#: pass/fail on essentially no perturbation") -- not a new, unexplained
+#: bug, but the SAME fragility, now triggered by an unrelated scene
+#: regeneration rather than a specific colliding geometry. Per this
+#: task's explicit priority ("regressing a working skill is not
+#: acceptable"), FIX 3 is reverted in full: all four positions below are
+#: back to their PRE-ADR-038 values, unchanged from `311430e`. See
+#: DECISIONS.md's ADR-038 entry for the full measurement table.
 PLATE_POS = (-0.15, 0.00, 0.355)
 
 #: M06a grasp fix E. Foot cylinder: narrower and shorter, resting directly
@@ -291,9 +312,17 @@ PLATE_DISH_HALF_HEIGHT_M = 0.004  # 0.8 cm total height
 #: the foot's centre) of the dish geom's centre: foot's own half-height
 #: (reaching the foot's top surface) plus the dish's own half-height.
 PLATE_DISH_LOCAL_Z_M = PLATE_FOOT_HALF_HEIGHT_M + PLATE_DISH_HALF_HEIGHT_M
+#: ADR-038 fix 3, reverted -- see PLATE_POS's comment above for the full
+#: measurement/rationale. Back to its PRE-ADR-038 value.
 MUG_POS = (0.05, -0.03, 0.39)
+#: FORK_POS is unaffected by ADR-038 fix 3 either way -- it is the
+#: handoff skill's own target object and stays in the shared reach band
+#: the skill needs; it gets fix 1's colour change instead (see
+#: `fork_material` in TEMPLATE below).
 FORK_POS = (-0.05, 0.05, 0.356)
+#: ADR-038 fix 3, reverted -- see PLATE_POS's comment above.
 SPOON_POS = (0.00, 0.08, 0.356)
+#: ADR-038 fix 3, reverted -- see PLATE_POS's comment above.
 BOTTLE_POS = (0.22, 0.00, 0.44)
 
 # drawer_slide qpos in the home keyframe: 0.0 (closed) -- the "home" pose
@@ -920,7 +949,14 @@ TEMPLATE = """<?xml version="1.0"?>
     <material name="plate_material" rgba="0.92 0.92 0.88 1"/>
     <material name="mug_material" rgba="0.10 0.75 0.20 1"/>
     <material name="mug_handle_material" rgba="0.10 0.75 0.20 1"/>
-    <material name="fork_material" rgba="0.72 0.73 0.76 1"/>
+    <!-- ADR-038 fix 1: the fork is the handoff demo's target object, and
+         at silver-grey (0.72 0.73 0.76) it was indistinguishable from the
+         off-white plate and the identically-coloured spoon in every render,
+         making the handoff impossible to read. Bright red is a colour
+         change ONLY -- geometry, mass and collision are untouched, so no
+         skill behaviour depends on it. spoon_material is deliberately left
+         silver so only the fork stands out. -->
+    <material name="fork_material" rgba="1.0 0.15 0.15 1.0"/>
     <material name="spoon_material" rgba="0.72 0.73 0.76 1"/>
     <material name="bottle_material" rgba="0.10 0.40 0.95 1"/>
 

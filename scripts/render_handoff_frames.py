@@ -296,6 +296,11 @@ def main() -> int:
     site_b_final = np.array(data.site_xpos[site_b_id], dtype=np.float64, copy=True)
     fork_pos_final = np.array(data.xpos[body_id], dtype=np.float64, copy=True)
     print(f"  DIAG site_a_final(xyz)={site_a_final} site_b_final(xyz)={site_b_final} fork_pos_final(xyz)={fork_pos_final} armA_to_armB_dist={np.linalg.norm(site_a_final-site_b_final):.4f}")
+    # ADR-038 fix 2 (lateral retreat): the metric this task's own risk
+    # section asks be REPORTED, not assumed -- the achieved LATERAL (y)
+    # gripper separation at the final frame, a number, not a pass/fail.
+    lateral_y_separation = float(abs(site_a_final[1] - site_b_final[1]))
+    print(f"  ADR-038 fix 2 measured: final-frame LATERAL (y) gripper separation = {lateral_y_separation:.4f} m")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -371,17 +376,17 @@ def main() -> int:
     #     measured 0.1331 m separation and the visible fork are a real
     #     fraction of the frame, not lost in a whole-table shot.
     #   - Candidate 2: a wider 3/4 elevated hero shot (azimuth=130) -- a
-    #     genuinely different angle, and also the sequence strip's camera
-    #     (re-centred per panel, see below) since it stays valid across
-    #     every milestone's very different arm poses, which the tight shot
-    #     (tuned only for the final pose) would not.
+    #     genuinely different angle from candidate 1's tight shot. (The
+    #     4-panel sequence strip below now uses its OWN separate ADR-038
+    #     fix-4 fixed side camera, not this one -- see that section's own
+    #     comment.)
     #   - Candidate 3: `overhead`, the brief-mandated named camera. Per this
-    #     run's own sweep and the geometry (`from_arm`'s retreat is a
-    #     near-pure vertical lift, `HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M`
-    #     applied only to z -- `run_handoff`'s Phase 5a), a straight-down
-    #     camera foreshortens exactly the axis most of the separation lives
-    #     on. Rendered anyway, per the brief, and reported honestly below
-    #     rather than silently dropped.
+    #     run's own sweep and the geometry (ADR-038 fix 2's retreat now has
+    #     a deliberate LATERAL component, but a straight-down camera still
+    #     foreshortens the vertical component of the same retreat), a
+    #     straight-down camera is not the most legible angle for this
+    #     motion. Rendered anyway, per the brief, and reported honestly
+    #     below rather than silently dropped.
     mid = (site_a_final + site_b_final) / 2.0
     cam_tight_separation = {"azimuth": 20, "elevation": -10, "distance": 0.35, "lookat": list(mid)}
     cam_threequarter_wide = {"azimuth": 130, "elevation": -22, "distance": 0.6, "lookat": [0.0, 0.0, 0.45]}
@@ -410,16 +415,31 @@ def main() -> int:
         print(f"  wrote {filename}  ({label})  mean_pixel={img.mean():.1f}")
 
     # --- 4-panel sequence strip ---------------------------------------------
-    # All four panels use the SAME azimuth/elevation (the wide 3/4 angle,
-    # `cam_threequarter_wide`'s direction) for visual continuity across the
-    # story, but the lookat/distance are RECOMPUTED per panel from that
-    # panel's own restored gripper positions -- the wide shot's fixed
-    # lookat=[0,0,0.45] is tuned for the final pose's midpoint, not for
-    # e.g. milestone 1 (arm A alone, near its own side of the table, arm B
-    # still at HOME) or milestone 3 (arm B just gripped, arm A still at the
-    # transfer point) -- a fixed frame would either crop the acting arm out
-    # or leave it tiny in a mostly-empty frame.
-    az, el = cam_threequarter_wide["azimuth"], cam_threequarter_wide["elevation"]
+    # ADR-038 fix 4: ONE fixed camera (identical azimuth/elevation/distance/
+    # lookat) across ALL FOUR panels -- a fixed reference frame is the whole
+    # point of a progression strip: it is what lets a viewer track the SAME
+    # fork moving between the two arms, panel to panel, rather than a
+    # per-panel-recentred camera that would make the fork (and the arms)
+    # appear to jump around the frame even when nothing "jumped" physically.
+    # The previous per-panel-recomputed lookat/distance (a moving camera)
+    # is replaced outright, not kept as a fallback.
+    #
+    # Side view, centred on the transfer point (`transfer_point`, ADR-036's
+    # `HANDOFF_POSITION_XYZ`) rather than on either arm's own gripper --
+    # the transfer point is the one location common to the whole story (A
+    # arrives there holding the fork, B takes it from there, both retreat
+    # away from it), so it stays meaningful across all four milestones even
+    # though milestone 1 (B still at HOME) and milestone 4 (both arms
+    # retreated) put the arms themselves at very different places.
+    # Parameters per this task's own suggested start: elevation=-15,
+    # azimuth=90 (a side view: looking along the table's x-axis lets the
+    # arms' y-separation -- exactly what ADR-038 fix 2's lateral retreat
+    # adds -- read as LEFT/RIGHT screen motion, not foreshortened the way
+    # `overhead` foreshortens it per candidate 3's own printed caveat
+    # above), distance=1.2 m (wide enough to keep both arms' full reach,
+    # including arm B still at HOME in milestone 1, inside frame -- verified
+    # by inspecting the four rendered panels, not assumed).
+    cam_fixed_sequence = {"azimuth": 90, "elevation": -15, "distance": 1.2, "lookat": list(transfer_point)}
     seq_order = [
         ("m1_holding_fork", "1"),
         ("m2_at_transfer", "2"),
@@ -429,33 +449,12 @@ def main() -> int:
     panels = []
     for key, digit in seq_order:
         restore_snapshot(model, data, milestones[key]["state"])
-        a_now = np.array(data.site_xpos[site_a], dtype=np.float64, copy=True)
-        b_now = np.array(data.site_xpos[site_b_id], dtype=np.float64, copy=True)
-        gap = float(np.linalg.norm(a_now - b_now))
-        # Milestone 1 is the one exception: to_arm (B) is still parked at
-        # HOME at this point in the choreography (Phase 1, "run_handoff"'s
-        # own docstring), which can be far from from_arm (A) -- a midpoint
-        # between the two would land in empty space between them, cropping
-        # the one arm that actually matters for this panel out of frame
-        # (measured directly on this run's own m1: a first attempt at a
-        # single midpoint-based formula for all four panels produced exactly
-        # that empty-frame failure). Centre on A alone here instead; from
-        # milestone 2 onward the two arms are already close (B has finished
-        # its own approach by the time m2 is captured -- see this file's
-        # m2 definition above), so the midpoint formula is representative.
-        if gap > 0.3:
-            panel_mid = a_now
-            panel_dist = 0.35
-        else:
-            panel_mid = (a_now + b_now) / 2.0
-            panel_dist = float(np.clip(1.8 * gap + 0.30, 0.4, 0.75))
-        cam = {"azimuth": az, "elevation": el, "distance": panel_dist, "lookat": list(panel_mid)}
-        img = render_current(model, data, cam, PANEL_W, PANEL_H)
+        img = render_current(model, data, cam_fixed_sequence, PANEL_W, PANEL_H)
         digit_stamp(img, digit)
         panels.append(img)
     strip = build_strip(panels)
     write_png(OUT_DIR / "m06-handoff-sequence.png", strip)
-    print(f"  wrote m06-handoff-sequence.png  shape={strip.shape}")
+    print(f"  wrote m06-handoff-sequence.png  shape={strip.shape}  camera(fixed)={cam_fixed_sequence}")
 
     env.close()
     return 0

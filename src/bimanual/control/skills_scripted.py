@@ -567,18 +567,55 @@ HANDOFF_STAGING_Y_M = {"A": 0.06, "B": -0.06}
 #: left open ("did not check joint-limit margins on the chained configs").
 HANDOFF_JOINT_LIMIT_MARGIN_TOL = 1e-4
 
-#: ADR-037 (sequential choreography, Phase 5). How far above
-#: `HANDOFF_POSITION_XYZ`'s z `from_arm`'s FIRST retreat waypoint lifts to,
-#: metres. Chosen so the resulting Euclidean distance from `from_arm`'s
-#: gripperframe to the transfer point clears `HANDOFF_RETREAT_GATE_M`
-#: (below) -- `CLEARANCE_HEIGHT_M` alone (0.08 m) is NOT enough (a pure
-#: vertical lift of 0.08 m is only 0.08 m of total displacement, short of
-#: the required > 0.10 m gate), so this is a SEPARATE, slightly taller
-#: constant used only for `from_arm`'s own first retreat hop, verified
-#: empirically (not assumed) -- see `run_handoff`'s Phase 5 and
-#: DECISIONS.md's ADR-037 entry for the measured reachability/distance at
-#: this height.
-HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M = 0.12
+#: ADR-038 fix 2 (lateral retreat). ADR-037's retreat was Z-ONLY
+#: (`HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M`, a pure vertical lift) -- it
+#: cleared `HANDOFF_RETREAT_GATE_M` numerically, but a purely vertical
+#: separation is nearly invisible in a horizontal render (see ADR-037's own
+#: honest render caveat on `m06-handoff-complete.png`: "arm A's retreat is
+#: mostly VERTICAL, which a horizontal front camera does not render as an
+#: obvious lateral separation"). Replaced here with a per-arm XYZ offset
+#: (still added to `transfer_point`, "applied after the transfer") that
+#: gives each arm a LATERAL (y) component too, so the two arms visibly
+#: separate sideways, not just vertically, in a render.
+#:
+#: Each arm retreats toward its OWN base side: arm A's base sits at
+#: y=-0.25 (see `side = -1.0 if to_arm == "A"` above), so
+#: `HANDOFF_A_RETREAT_XYZ` moves arm A toward -y; arm B's base sits at
+#: y=+0.25, so `HANDOFF_B_RETREAT_XYZ` moves arm B toward +y -- i.e. the
+#: two retreat directions are mirrored AWAY from each other, never crossed
+#: (crossing them would send the arms back INTO each other's operating
+#: half and risks reintroducing the cross-arm collision ADR-037 eliminated
+#: -- explicitly not attempted here).
+#:
+#: z=0.15 (taller than ADR-037's old 0.12 m) is kept because the combined
+#: xyz displacement, not z alone, is what must clear
+#: `HANDOFF_RETREAT_GATE_M`.
+#:
+#: **Fallback ladder actually exercised, not just proposed:** the FIRST
+#: value tried was a 0.15 m lateral component (matching z). Measured on
+#: bm-ptl via a real `handoff(A, B, fork)` run: this caused a NEW Phase 5
+#: failure -- `from_arm`'s own retreat step introduced a fresh cross-arm
+#: collision (`phase 5 (from_arm retreat) failed [collision (cross_arm
+#: contacts=1 ...)]`) that did not exist under the old z-only retreat.
+#: Per this task's own fallback-ladder instruction, the lateral component
+#: was then reduced to 0.10 m (both arms, same sign/mirroring) and
+#: RE-MEASURED: `handoff(A, B, fork)` now succeeds end to end
+#: (`success=True`, `from_arm_retreat_dist=0.2263 m`, comfortably above
+#: `HANDOFF_RETREAT_GATE_M`), with a measured final-frame LATERAL (y)
+#: gripper separation of ~0.098 m. 0.10 m is the ADOPTED value below --
+#: not a proposal, a measured result. See DECISIONS.md's ADR-038 entry
+#: for the full measurement table.
+#:
+#: **Reported, not assumed:** this sends each arm back toward larger
+#: |y|, i.e. toward the SAME region each arm's own un-warm-started reach
+#: from HOME has historically struggled to converge in (see ADR-032's
+#: reachability sweeps). Unlike a fresh IK solve from HOME, this retreat is
+#: warm-started from the just-completed transfer pose (`_run_waypoint`'s
+#: usual incremental interpolation), which is why 0.10 m converges even
+#: though a fresh-from-HOME solve at similar coordinates has historically
+#: struggled (ADR-032).
+HANDOFF_A_RETREAT_XYZ = (0.0, -0.10, 0.15)
+HANDOFF_B_RETREAT_XYZ = (0.0, 0.10, 0.15)
 
 #: ADR-037 (sequential choreography, Phase 5). `from_arm` must retreat this
 #: far (metres, Euclidean distance from its gripperframe site to the
@@ -1961,12 +1998,16 @@ def run_handoff(
     ADR-031's per-dwell arm freeze governs `from_arm`'s OWN ctrl during
     this; `to_arm_grip_hold` governs the now-idle `to_arm`'s).
 
-    **Phase 5** -- `from_arm` retreats FIRST (to a taller clearance,
-    `HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M`, chosen so the total Euclidean
-    distance from its gripperframe to `transfer_point` clears
-    `HANDOFF_RETREAT_GATE_M` -- a plain `CLEARANCE_HEIGHT_M` vertical lift
-    is only 0.08 m of total displacement, short of the required > 0.10 m),
-    while `to_arm` is held at `to_arm_grip_hold`. Only once that gate is
+    **Phase 5** -- `from_arm` retreats FIRST (laterally AND vertically,
+    ADR-038 fix 2: `HANDOFF_A_RETREAT_XYZ`/`HANDOFF_B_RETREAT_XYZ`, each
+    arm selected by its OWN identity and moving toward its OWN base side,
+    added to `transfer_point`), chosen so the total Euclidean distance from
+    its gripperframe to `transfer_point` clears `HANDOFF_RETREAT_GATE_M`
+    -- a plain `CLEARANCE_HEIGHT_M` vertical lift alone is only 0.08 m of
+    total displacement, short of the required > 0.10 m -- AND so the two
+    arms visibly separate sideways in a render, not just vertically (see
+    ADR-037's own render caveat this was written to fix), while `to_arm` is
+    held at `to_arm_grip_hold`. Only once that gate is
     measured (not assumed) to be cleared does `to_arm` retreat, held frozen
     by a FINAL snapshot of `from_arm`'s now-retreated pose
     (`from_arm_retreated_hold`).
@@ -2104,13 +2145,17 @@ def run_handoff(
             weld_active_at_end=(weld.is_holding(to_arm) == body_name if weld is not None else False),
         )
 
-    # === Phase 5a: from_arm RETREATs FIRST (staggered), to a taller
-    # clearance than the usual CLEARANCE_HEIGHT_M so the total Euclidean
-    # distance from its gripperframe to transfer_point clears
-    # HANDOFF_RETREAT_GATE_M (measured requirement, see this function's
-    # docstring). to_arm is held at the SAME to_arm_grip_hold snapshot --
-    # it has not moved since Phase 4b. ===
-    from_retreat = transfer_point + np.array([0.0, 0.0, HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M])
+    # === Phase 5a: from_arm RETREATs FIRST (staggered), laterally AND
+    # vertically (ADR-038 fix 2), so the total Euclidean distance from its
+    # gripperframe to transfer_point clears HANDOFF_RETREAT_GATE_M
+    # (measured requirement, see this function's docstring) AND the two
+    # arms visibly separate sideways in a render, not just vertically.
+    # Each arm's own retreat vector is selected by ITS identity (A or B),
+    # not by its from/to role -- from_arm here retreats toward ITS OWN base
+    # side. to_arm is held at the SAME to_arm_grip_hold snapshot -- it has
+    # not moved since Phase 4b. ===
+    from_arm_retreat_xyz = HANDOFF_A_RETREAT_XYZ if from_arm == "A" else HANDOFF_B_RETREAT_XYZ
+    from_retreat = transfer_point + np.array(from_arm_retreat_xyz)
     ok7, used, reason7 = _run_waypoint(
         env, from_arm, from_retreat, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
         target_object=target_object, hold_ctrl_base=to_arm_grip_hold,
@@ -2143,7 +2188,13 @@ def run_handoff(
     # measurably cleared the shared workspace. from_arm is held at a FINAL
     # frozen snapshot, taken the instant it finishes its own retreat. ===
     from_arm_retreated_hold = _hold_ctrl(env)
-    to_lift = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    # ADR-038 fix 2: to_arm's own retreat is ALSO lateral+vertical now, using
+    # the SAME transfer_point reference and the SAME per-arm-identity vector
+    # scheme as from_arm's Phase 5a retreat above ("applied after the
+    # transfer") -- to_arm retreats toward ITS OWN base side, mirrored away
+    # from from_arm's retreat direction (never crossed).
+    to_arm_retreat_xyz = HANDOFF_A_RETREAT_XYZ if to_arm == "A" else HANDOFF_B_RETREAT_XYZ
+    to_lift = transfer_point + np.array(to_arm_retreat_xyz)
     # target_object=target_object (M06a Fix B): to_arm is now LIFTING the
     # object it just gripped -- same rationale as pick's RETREAT above.
     ok8, used, reason8 = _run_waypoint(

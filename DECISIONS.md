@@ -11,6 +11,95 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-038 — Handoff render legibility: red fork and lateral retreat ADOPTED; prop repositioning TRIED AND FULLY REVERTED because every prop move broke `handoff` at phase 3
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-037 (`311430e`, sequential
+choreography) · **Modifies:** `gen_dual_scene.py` (fork colour only),
+`skills_scripted.py` (retreat vectors only), `scripts/render_handoff_frames.py`
+
+**Problem.** Four successive renders of the working `handoff(A, B, fork)` failed
+to show a handoff. Three root causes were identified by inspecting the images
+rather than guessing: (1) the fork was silver-grey (`0.72 0.73 0.76`),
+indistinguishable from the off-white plate and the identically-coloured spoon;
+(2) the retreat displaced only z, so there was no lateral separation for any
+camera to show — measured 0.0197 m lateral against 0.1060 m vertical; (3) the
+sequence strip re-centred its camera per panel, destroying the viewer's frame
+of reference.
+
+**Fix 1 — red fork (ADOPTED).** `fork_material` → `rgba="1.0 0.15 0.15 1.0"`.
+Colour only; geometry, mass and collision untouched, so no skill behaviour
+depends on it. `spoon_material` deliberately left silver so only the fork
+stands out. This alone made the fork unmistakable in all three candidate
+renders.
+
+**Fix 2 — lateral retreat (ADOPTED at 0.10, NOT the proposed 0.15).** The
+scalar z-only `HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M` became per-arm vectors
+`HANDOFF_A_RETREAT_XYZ = (0.0, -0.10, 0.15)` / `HANDOFF_B_RETREAT_XYZ =
+(0.0, 0.10, 0.15)`. The proposed 0.15 **fails**: `handoff` reaches phase 5
+holding the fork and then collides cross-arm during `from_arm`'s retreat. A
+sweep of the lateral magnitude, all with props at their original positions:
+
+| lateral | handoff | final lateral separation |
+|---:|---|---:|
+| 0.15 | FAIL — cross-arm collision, phase 5 | — |
+| **0.10** | **PASS** | **0.1946 m** |
+| 0.05 | PASS | 0.0913 m |
+| 0.00 | FAIL — cross-arm collision, phase 5 | — |
+
+0.10 is a genuine interior optimum — it fails on BOTH sides, so it was found by
+measurement, not by picking the largest value that happened to work. Final
+separation is now 0.1946 m lateral / 0.0046 m vertical, inverting the old
+0.0197 / 0.1060 and giving the renders something real to show.
+Note 0.00 failing is NOT a contradiction of ADR-037: the old code retreated only
+`from_arm`, whereas this code retreats both arms, so zero lateral offset makes
+them collide.
+
+**Fix 3 — prop repositioning (TRIED, FULLY REVERTED).** Moving plate, mug,
+spoon and bottle to the table corners was intended to declutter the renders. It
+broke two skills and was reverted in full:
+- `pick(A, bottle)` broke outright — the bottle at (0.20, 0.20) is outside arm
+  A's reach (IK residual **0.1503 m** vs a 0.01 m tolerance). Reverting the
+  bottle alone restored it (lift 0.4400 → 0.6199).
+- `handoff` broke at phase 3 (`to_arm` approach) for **every** prop
+  configuration tried: all four moved, bottle-reverted-only, bottle+spoon
+  reverted, mug-moved-alone, and plate-moved-alone. Only the fully original
+  layout passes.
+
+**This is a finding worth keeping: the handoff corridor is sensitive to scene
+composition in a way nothing predicted.** Moving a single prop that the skill
+never touches — the mug, at the far corner — is enough to make `to_arm`'s
+staging approach fail on a cross-arm collision. The mechanism is not understood
+and was not chased; it is recorded here so nobody assumes prop placement is
+cosmetically free. `gen_dual_scene.py` was restored from git and the fork colour
+re-applied on top, so no stale "moved toward corner" comments survive.
+
+**Fix 4 — fixed-camera sequence (PARTIAL).** `m06-handoff-sequence.png` now uses
+one camera across all four panels, so the reference frame is stable. But the
+chosen distance (1.2 m) and azimuth put the arms edge-on and too small to read,
+and the fork is not visible in it. The strip is committed as-is and flagged:
+**it still does not demonstrate the handoff and should not be used as evidence.**
+The three stills do.
+
+**Verification (bm-ptl, `mujoco==3.2.7`, seed 0), all four working skills after
+the adopted changes:**
+
+| skill | result |
+|---|---|
+| `pick(A, fork)` | success, z 0.3560 → 0.3989 |
+| `place(A, fork, table)` | success, released, z 0.3588 |
+| `pick(A, 'bottle')` | success, z 0.4400 → 0.6192 |
+| `handoff(A→B, fork)` | success, A=None B='fork', 6610 frames, `from_arm_retreat_dist=0.2263` |
+
+`pytest tests/test_skills.py`: 4 passed / 4 failed, the same four pre-existing
+failures, unchanged.
+
+**Note on prior measurements.** `docs/hardware/*` records predate nothing here —
+the prop layout is unchanged from `311430e` — but the fork's colour differs, so
+any render in those documents shows a silver fork.
+
+**API note carried forward:** `run_handoff(env, to_arm, from_arm, obj)` is
+receiver-first. An A→B handoff is `run_handoff(env, "B", "A", "fork")`.
+
 ## ADR-037 — `run_handoff` rewritten as sequential choreography (one arm moves at a time, the other genuinely frozen); the fix for the `_hold_ctrl` drift bug turned out to ALSO resolve the ADR-036/`f92806e` cross-arm collision — `handoff(A, B, fork)` now succeeds end to end, verified by direct measurement, not assumed
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-036 (`f92806e`, cross-arm
