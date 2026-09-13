@@ -11,6 +11,106 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-032 — Handoff-position re-measurement: NO collision-free shared point found in the specified sweep; NOT fixed, escalated instead of a constant change
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-031 (GRIP-dwell freeze, which made
+`pick(A, fork)` succeed) · **Task:** relocate `HANDOFF_POSITION_XYZ` into the
+measured shared reach envelope, per instruction to STOP and escalate rather than
+guess if no candidate passes.
+
+**Context.** `pick(A, fork)` succeeds; `handoff(A, B, fork)` gets through arm
+A's pick and fails at waypoint 3 (`to_arm` APPROACH) -- arm B cannot reach the
+current `HANDOFF_POSITION_XYZ = (0.0, -0.01, 0.35)`. The existing comment on
+that constant cites `m06-reachability-probe.md`'s "Shared handoff band: y in
+[-0.12, 0.10]" line as justification, but that band was measured by
+`probe_reachability.py`'s `run_envelope_sweep`, which (its own docstring says
+so explicitly) checks IK residual convergence ONLY -- "collision not checked
+for the sweep". A grid point can converge kinematically while the solved
+configuration drives an arm segment through the table or a prop. That
+caveat, not the band itself, is why this task re-measures instead of trusting
+the existing constant.
+
+**What was measured.** New script `scripts/probe_handoff_reachability.py`,
+run on bm-ptl (ADR-020) and cross-checked byte-identical on this developer's
+laptop (mujoco 3.2.7 both places): sweep x=0 (the constant's existing x),
+y from -0.12 to 0.10 in 0.02 m steps (12 values), z in {0.35, 0.38, 0.40}.
+For each of the 36 (y, z) points, IK is solved independently for arm A and
+arm B (from the home-keyframe reset pose, ADR-026), and each arm's solved
+joint configuration is applied to a scratch `MjData` and checked for any
+NEW contact beyond that arm's measured reset-pose baseline (0 for both
+arms) -- the exact same per-arm-independent residual+collision method
+`probe_reachability.py`'s own primary probes use for their PASS bar,
+copied (not imported) into the new script so it has no coupling to that
+script's grid constants. Full table:
+`docs/hardware/m06-handoff-reachability.md`.
+
+**Result: ALL 36 candidates FAIL for at least one arm. NO (y, z) point in
+the specified sweep passed for both arms.** This was not expected to be
+uniform -- z=0.35 (exactly `TABLE_SURFACE_Z`) was flagged in advance as the
+likeliest to fail, but z=0.38 and z=0.40 (3-5 cm clearance above the table)
+failed identically. Inspecting the actual MuJoCo contacts for representative
+FAIL rows (not merely trusting the boolean) confirms these are genuine,
+non-trivial collisions, not a script artifact: e.g. arm A solved toward
+(0.00, 0.06, 0.40) (residual 0.00926 m, well converged) produces
+`armA_lower_arm`/`armA_wrist` vs. `table_top` contacts at up to -0.0237 m
+penetration, plus contacts with the (stationary, unrelated) `mug` and
+`fork` bodies at up to -0.031 m -- the solved arm literally swings through
+the tabletop and through props resting nearby, not merely grazing. A
+control check confirmed the machinery itself is not universally broken:
+a known off-centerline target, (0.30, -0.05, 0.50), solved with residual
+0.00848 m and **zero** new contacts for arm A -- so the collision check
+correctly reports "no collision" when there genuinely is none; it is the
+x=0 centerline candidates specifically, at this z band, that tunnel.
+
+**Root cause, not fixed here (out of this task's permitted file list, and
+already flagged as an existing, out-of-scope finding).** This is the same
+`ik.py`/DLS-solver local-minimum behavior `m06-reachability-probe.md`'s own
+"Step 4" section already documented for `plate_at_rest`/`mug_at_rest`/
+`bottle_at_rest`: solving toward a point requires reaching centrally
+across/over the table from the folded "home" seed, and the redundant 5-DOF
+position-only solver (ADR-024) has no notion of the table's existence, so
+it happily converges to a position-accurate configuration that gets there
+by swinging the forearm through the table and through whatever sits on it,
+rather than up and over. `ik.py` is on this task's do-not-touch list, and
+fixing the solver (multi-start solving, an obstacle-aware cost term, or a
+different seed) is exactly the kind of code change this task was not
+scoped to make.
+
+**Decision: do NOT change `HANDOFF_POSITION_XYZ`.** Per this task's own
+explicit instruction ("If NO candidate passes for both arms, stop and
+report the table... That would mean the two arms have no collision-free
+shared workspace at any tested height... it would need an arm-placement
+decision, not a constant change"), `skills_scripted.py` is left untouched
+this commit. Picking any (y, z) from this sweep and writing it into the
+constant anyway would repeat exactly the mistake this task was assigned to
+fix: a plausible-looking constant that was never actually verified
+collision-free.
+
+**What this means for ADR-021.** ADR-021's original ~0.30 m reach / 0.50 m
+base-gap layout assumption, already shown too optimistic once by ADR-026's
+home-pose re-measurement and again by `probe_reachability.py`'s residual-only
+band, is now superseded a third time: even the residual-only band's claimed
+overlap does not survive a collision check at any of the three heights this
+task specifies. Whether a collision-free shared point exists at some OTHER
+(x, y, z) outside this specific sweep is not established either way by this
+result -- only that none exists in the region this task was scoped to check.
+Resolving this for real needs either (a) moving one or both arm bases
+(ADR-021's own placement assumption) so a shared reach point exists further
+from the table's central tunneling zone, or (b) an IK-solver fix (out of
+`skills_scripted.py`'s scope) that avoids the table-tunneling local minimum.
+Recommending, not deciding, per this task's own instruction that an
+arm-placement change is a decision for the user, not this commit.
+
+**Consequences.** `handoff(A, B, fork)` is NOT re-verified in this commit
+(the task's VERIFY step is conditioned on a chosen position existing).
+`docs/images/m06-handoff-complete.png` is not produced. `pytest
+tests/test_skills.py` is unchanged by this commit (no source file changed)
+-- the same 4 failed / 4 passed as before, `test_handoff_mug_ends_held_by_arm_b`
+still failing for its own pre-existing, unrelated reason (arm A's `pick`
+of the mug fails to converge, per that test's own captured output).
+
+---
+
 ## ADR-031 — IK freeze during GRIP dwell to prevent shifting-pinch-point retreat
 
 **Recorded:** Sept 13, 2026 · **Follows:** the "M06 Phase 2 follow-up" entry below
