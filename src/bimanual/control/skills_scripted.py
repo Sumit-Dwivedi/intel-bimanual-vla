@@ -1461,8 +1461,8 @@ def run_place(
     # up (if not already held)" -- this branch was the only place that
     # promise was not actually implemented; previously this call ran
     # UNCONDITIONALLY even when `weld.is_holding(arm) == body_name` already.
-    # Measured failure this fix addresses (`scripts/probe_place_bottle_
-    # verify.py`, bm-ptl, seed 0): running `pick(A, water_bottle)` then
+    # Measured failure this fix addresses (`scripts/probe_place_bottle.py`,
+    # bm-ptl, seed 0): running `pick(A, water_bottle)` then
     # `place(A, water_bottle, table)` in the same episode -- i.e. exactly
     # the sequence a `TaskPlan` produces, and exactly what this docstring's
     # parenthetical anticipates -- had the nested `run_pick` recompute a

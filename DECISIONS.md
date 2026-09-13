@@ -110,7 +110,7 @@ ADR-033's per-prop hover and ADR-034's already-held guard are all unmodified
 replaces the direct `_run_waypoint` calls at handoff's own waypoints 1-4
 with the staged/interpolated equivalents).
 
-: `run_place` never checked whether the object it was told to place was already held, causing a redundant internal re-pick to target an unreachable height; fixed by skipping the nested pick when already held. A second, unrelated waypoint-1 reachability failure remains and is reported, not patched.
+## ADR-034 — `place(A, water_bottle, table)` verification: `run_place` never checked whether the object it was told to place was already held, causing a redundant internal re-pick to target an unreachable height; fixed by skipping the nested pick when already held. A second, unrelated waypoint-1 reachability failure remains and is reported, not patched.
 
 **Recorded:** Sept 13, 2026 · **Follows:** ADR-033 (`pick(A, water_bottle)`'s
 per-prop hover fix, commit `d239a55`), which fixed `pick`'s own hover height

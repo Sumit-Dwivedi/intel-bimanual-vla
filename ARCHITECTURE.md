@@ -1620,11 +1620,25 @@ proximity and jaw closure — an explicit abstraction of physical grasping,
 dwell so the closing jaw's own shifting pinch point cannot make the arm
 retreat mid-grasp. **ADR-033** gives the water bottle its own
 APPROACH/RETREAT hover height so the hover point clears the bottle's own
-physical top instead of sitting below it. **Handoff does not currently
-work**: three independent reachability sweeps (ADR-032, two passes, plus an
-earlier pass) each found zero shared, collision-free transfer points
-reachable by both arms; the cause is under active investigation and
-unresolved as of this writing.
+physical top instead of sitting below it. **ADR-034** fixed a real bug in
+`run_place` (it unconditionally re-picked an object the arm already held,
+sending it to an unreachable hover) but `place(A, water_bottle, table)`
+still does not work — a second, different IK residual failure (0.0138 m
+against the 0.01 m tolerance, unimproved at four times the step budget, with
+the destination x landing on the place path's own `+0.30` safety clip bound)
+now surfaces at the destination-approach waypoint instead. **Handoff does
+not currently work**, and the understanding of why has changed since the
+original three reachability sweeps (ADR-032, two passes, plus an earlier
+pass) reported zero mutually-reachable candidates: a later warm-start IK
+diagnostic (`2115a1e`) showed those sweeps were measuring a seed-dependent
+IK local minimum from the folded "home" pose, not a true kinematic limit of
+the arms' reach. **ADR-035** built on that diagnostic and added target
+interpolation to the `handoff` traverse, which genuinely carries the skill
+three waypoints further than before — waypoint 3 (`to_arm`'s APPROACH,
+previously the sweep's own failure point) now converges reliably. The skill
+still fails, but one waypoint later than it used to: at waypoint 4, on an
+arm-vs-`table_top` collision during `to_arm`'s interpolated descend, not on
+unreachability.
 
 ---
 
@@ -2533,6 +2547,235 @@ here.
 `pytest tests/test_skills.py` is 4 passed / 4 failed.
 
 **Source commit:** `d239a55` (given).
+
+---
+
+### ADR-034 — `place(A, water_bottle, table)` verification: `run_place` never checked whether the object it was told to place was already held, causing a redundant internal re-pick to target an unreachable height; fixed by skipping the nested pick when already held. A second, unrelated waypoint-1 reachability failure remains and is reported, not patched.
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-033 (`pick(A, water_bottle)`'s
+per-prop hover fix, commit `d239a55`), which fixed `pick`'s own hover height
+but was never exercised against `place`'s path (`run_place`'s destination
+`approach_above_dest` uses the plain `TABLE_SURFACE_Z + CLEARANCE_HEIGHT_M`
+formula, no per-prop term, `skills_scripted.py`) · **Task:** verify
+`place(A, water_bottle, table)` by running `pick(A, water_bottle)` then
+`place(A, water_bottle, table)` in the same episode (the destination string
+`table_side` named in the brief is not implemented by `run_place` —
+`destination != "table"` is rejected outright — so `"table"`, the value
+every other working `place` call in this repo already uses, was used
+instead).
+
+**Verification result: place did NOT succeed on first attempt.** Probe:
+`scripts/probe_place_bottle.py`, bm-ptl, `mujoco==3.2.7`, seed 0.
+
+**First failure, before any code change.** `pick(A, water_bottle)` succeeded
+(`weld_attach_frame=1155`, final pick z=0.6192, `is_holding('A')==
+'water_bottle'`). The immediately-following `place(A, water_bottle, table)`
+failed at `"waypoint 1 (approach) failed [convergence (IK residual=0.1639 m
+>= 0.01 m)]"` — inside `run_place`'s own NESTED `run_pick` call, not `place`'s
+own destination waypoints. Root cause: `run_place` calls `run_pick`
+UNCONDITIONALLY every time, regardless of whether `arm` already holds
+`target_object` — its own docstring already said "pick the object up (if
+not already held)" but the code never implemented that conditional. With the
+bottle already lifted and held at z=0.6192 (not resting on the table), the
+nested `run_pick` re-read the bottle's CURRENT (airborne) position as
+`obj_pos0` and, per ADR-033's `OBJECT_TOP_LOCAL_Z_M["bottle"]=0.11`,
+recomputed a hover roughly 0.17 m higher still — a target the arm could not
+kinematically reach in the 500-step waypoint budget, so `place` failed
+before ever reaching its own destination logic, and the weld was never
+released (`is_holding('A')` stayed `'water_bottle'`).
+
+**This is NOT the ADR-033 failure mode, and ADR-033's `OBJECT_TOP_LOCAL_Z_M`
+pattern does not address it.** ADR-033 fixed a hover point sitting BELOW a
+STATIONARY object's own physical top during a fresh pick. Here the object
+was already held and airborne; the defect is that `place` re-picks an object
+it is already holding at all, not that any hover-height formula undershoots
+the object's top. Applying ADR-033's pattern here would have been the wrong
+fix — confirmed by tracing the actual failing waypoint (the nested pick's
+APPROACH, not any of `place`'s own destination waypoints) before writing any
+code.
+
+**Fix applied (`skills_scripted.py`, `run_place` only).** Added a guard:
+`already_held = weld is not None and weld.is_holding(arm) == body_name`. If
+true, the nested `run_pick` call is skipped entirely and `place` proceeds
+straight to its own destination waypoints with the object already in hand;
+`weld_attach_frame` correctly reports `None` in this path (no new attach
+happened during this `place` call, per that field's own documented meaning).
+If `weld is None` or the object is not already held, behaviour is
+byte-for-byte unchanged (the nested `run_pick` call still runs exactly as
+before). No change to `grasp.py`, `ik.py`, `executor.py`,
+`scenes/so101/`, or `gen_dual_scene.py`.
+
+**Result after the fix: the first failure is gone, but `place` still does
+not succeed — a second, different failure now surfaces, and it was NOT
+patched.** Re-running the same probe: the nested-pick failure disappears
+entirely (no more waypoint-1-inside-pick failure); `place` now fails at its
+OWN `"waypoint 1 (approach destination) failed [convergence (IK
+residual=0.0138 m >= 0.01 m)]"` — a plain kinematic IK-solver residual that
+misses the 0.01 m tolerance by only 0.0038 m. Diagnosed before touching any
+code (`scripts/probe_place_waypoint1_diag.py`): driving toward the same
+target for a further 2000 steps (four times the normal 500-step waypoint
+budget) does not shrink this residual — it plateaus, which rules out "just
+needs more steps" and is consistent with a genuine reachability-envelope
+edge, not a slow-convergence artifact. Independently, the destination x
+computed for this run landed exactly on `run_place`'s own safety clip bound
+(`dest_xy[0]` clipped to its `+0.30` limit), which is suggestive of the same
+kind of arm-specific reachability-envelope boundary this repo has already
+found and documented elsewhere (e.g. ADR-027's plate-rim direction fix,
+ADR-032's handoff-position sweep) — but this was not independently
+re-measured across other start positions, so it is reported as a plausible
+explanation, not a proven one.
+
+**Why this was not also fixed here.** `PLACE_OFFSET_XY_M`/the destination
+clip bounds are shared by every prop's `place` call, not bottle-specific;
+changing them to dodge one measured edge case, without re-verifying every
+other prop's place path (none of which currently reach this waypoint at all
+— `test_place_plate_returns_to_table_rest` fails earlier, at the nested
+pick's own grip, per ADR-024's already-documented grasp-reliability gap) is
+exactly the kind of speculative, unverified change the task instructions
+say not to make. This is reported, not patched.
+
+**Net honest status: `place(A, water_bottle, table)` still returns
+`SkillResult.success=False`; `is_holding('A')` still ends as
+`'water_bottle'`, not `None`; the bottle never reaches the table in this
+run.** `pytest tests/test_skills.py`: 4 failed / 4 passed before this change
+and 4 failed / 4 passed after (identical failure reasons/residuals for all
+four pre-existing failures, confirmed line-by-line) — this fix changed no
+existing test's outcome, it only changes what a NEW bottle-place probe
+(not part of the pytest suite) reports.
+
+**Not done.** No change to `ARCHITECTURE.md` (out of scope for this task, at
+the time this ADR was recorded — synced retroactively in a later
+documentation pass). No change to `ik.py`, `grasp.py`, `executor.py`,
+`gen_dual_scene.py`, or `scenes/so101/`. No change to ADR-031's GRIP freeze
+or ADR-033's pick hover. No speculative fix applied to the second
+(waypoint-1-destination) reachability failure — it is left open and
+reported here for a follow-up diagnostic pass, same as ADR-032's
+handoff-position gap was left open rather than patched with an unverified
+guess.
+
+**Net result, stated plainly: `place(A, water_bottle, table)` does not
+work.** The already-held bug this ADR fixed was real and is fixed, but the
+skill as a whole still fails, now at its own destination-approach waypoint.
+
+**Source commit:** `1a97153` ("M06: place(A, water_bottle, table)
+verification — fixed a real bug (run_place unconditionally re-picked an
+already-held object, sending it to an unreachable hover), one different
+reachability failure remains and reported not patched (ADR-034)").
+
+---
+
+### ADR-035 — Target interpolation in the `handoff` traverse: implemented per the corrected brief; genuinely progresses the skill three waypoints further, but `handoff(A, B, fork)` still fails at a NEW waypoint (arm-vs-table_top collision during `to_arm`'s interpolated descend) — reported honestly, not patched
+
+**Recorded:** Sept 13, 2026 · **Follows:** `2115a1e` (warm-start IK diagnostic,
+`docs/hardware/m06-handoff-warmstart-diagnostic.md`) · **Modifies:**
+`src/bimanual/control/skills_scripted.py` only, per task scope
+
+**What was built.** The diagnostic's own pseudocode had a Zeno bug (re-reading
+"current position" from the sim every loop iteration means the arm only ever
+covers a shrinking fraction of the remaining distance and never arrives) —
+fixed by capturing `start_pos` ONCE, before the loop, and interpolating
+`start_pos + (end_pos - start_pos) * (i / n_steps)` for a fixed `i`
+(`_run_interpolated_waypoint`). The diagnostic's chain also never started from
+"wherever the arm happened to be" — it started from a pre-verified converged
+staging cell in each arm's own reachable band and walked inward. Verified
+directly (not assumed) that this matters for the real skill: `to_arm`'s
+APPROACH waypoint, solved directly from HOME, measured IK residual 0.0875 m
+(a clear fail) at (y=0.02, z=0.43 — the actual hover height `run_handoff`
+uses, not the z=0.35 the diagnostic's own table covered). A fresh sweep this
+session at z=0.43 (mirroring the diagnostic's z=0.35 sweep) found the SAME
+disjoint-band shape at the actual hover height: arm A's home-converged band
+starts at y=+0.06 (residual 0.00999), arm B's mirror at y=-0.06 (residual
+0.00999) — recorded as `HANDOFF_STAGING_Y_M`. `_run_approach_with_staging`
+tries the direct shot first (the common case, e.g. `from_arm`, which is
+already warm from `pick`); only on failure does it drive to the arm's own
+staging cell, confirm THAT converges, then interpolate onward
+(`_run_interpolated_waypoint`) to the real APPROACH target. Both DESCEND
+waypoints (from_arm to the transfer point, to_arm to the receiving point)
+are unconditionally interpolated the same way, since the corrected brief's
+item 3 confirmed both real targets (`HANDOFF_POSITION_XYZ`'s y=-0.01, and
+y=-0.04/y=+0.02 with `HANDOFF_SIDE_OFFSET_M`) sit inside the diagnostic's
+own verified y in [-0.06, +0.02] chained band. Joint-limit margin
+(`HANDOFF_JOINT_LIMIT_MARGIN_TOL`, matching
+`scripts/probe_handoff_reachability_home.py`'s own gate) is checked after
+every interpolation step against the PHYSICALLY-REALIZED qpos, closing the
+diagnostic's own explicitly-left-open caveat that its chain checked residual
+only.
+
+**Verification run: `handoff(A, B, fork)` (`to_arm=B, from_arm=A`), the
+skill this task specified, not the pre-existing `test_handoff_mug_...` (which
+fails for an unrelated, already-documented pick-reach reason and does not
+exercise the traverse this ADR touches).** Per-waypoint outcome:
+
+| waypoint | outcome |
+|---|---|
+| `pick(A, fork)` (nested) | succeeds, weld attaches (frames 1-655) |
+| 1: from_arm (A) APPROACH, hover `(-0.065, 0.05, 0.44)` then re-target `(0, -0.01, 0.43)` | direct shot converges, residual 0.0099 — no staging needed (A already warm from `pick`) |
+| 2: from_arm (A) DESCEND to transfer point `(0, -0.01, 0.35)`, interpolated | **all 4 interpolation steps converge**, residuals 0.0100/0.0082/0.0085/0.0083/0.0036 |
+| 3: to_arm (B) APPROACH, hover `(0, 0.02, 0.43)` | direct shot FAILS (residual 0.0875, matching the fresh sweep) → staged to `(0, -0.06, 0.43)` (residual 0.0032) → **interpolated in 5 steps to `(0, 0.02, 0.43)`, ALL converge** (residuals 0.0032/0.0098/0.0076/0.0046) — **this is the fix working**: waypoint 3 now succeeds where it failed 100% of the time before this change |
+| 4: to_arm (B) DESCEND to receiving point `(0, 0.02, 0.35)`, interpolated (3 steps) | step 1 converges (residual 0.0045); **step 2/3 (target `(0.0077, 0.0043, 0.351)`) fails — not a convergence failure, a COLLISION failure: a new armB-vs-`table_top` contact past `TABLE_COLLISION_DEPTH_TOL_M`, versus zero at baseline** |
+
+**Net result: three additional waypoints now pass that failed 100% of the
+time before this commit (waypoint 3 specifically, the one the diagnostic
+targeted, now succeeds), but the skill call still does not reach the end —
+it fails at a new waypoint the old, single-shot code never reached in the
+first place.** This is exactly the caveat the diagnostic's own "what this
+did NOT check" section flagged: "a static IK chain is not an executable
+trajectory... real execution is exactly what tests this." The IK-chain
+diagnostic proved *kinematic* reachability and (separately, in its Part 3)
+found the arm-vs-table_top collision check itself fires on otherwise-sensible
+converged poses, calling it a probable mesh-collision artifact needing
+recalibration before it can gate anything — but recalibrating that check is
+explicitly out of this commit's scope (touches `ADR-027`'s existing
+collision-detection semantics, not target interpolation), so this ADR does
+NOT patch around it. Whether the physical contact at
+`(0.0077, 0.0043, 0.351)` — 1 mm above `TABLE_SURFACE_Z` — is a genuine
+graze or the same mesh-collision-hull artifact Part 3 flagged is an open
+question this ADR leaves open, honestly, rather than tuning
+`TABLE_COLLISION_DEPTH_TOL_M` or the waypoint height to make it disappear.
+
+**Per this task's explicit instruction ("If `handoff(A, B, fork)` fails:
+STOP. Report the specific waypoint and failure mode. Do not attempt further
+fixes"), no further iteration was attempted.** `handoff(B, A, fork)` (the
+opportunistic mirror check) was NOT run — the 60-minute cap for this task
+was already consumed by the investigation above establishing WHERE and WHY
+the interpolation needed to start from a converged pose (the fresh z=0.43
+sweep was not optional groundwork: without it, `HANDOFF_STAGING_Y_M` would
+have been guessed, not measured). No `docs/images/m06-handoff-complete.png`
+was rendered — the run did not succeed, and rendering a failed handoff would
+misrepresent the outcome.
+
+**Test suite: unchanged, as required.** `pytest tests/test_skills.py`
+before and after this commit: **4 passed, 4 failed**, identical set
+(`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`, `test_handoff_mug_ends_held_by_arm_b`
+still fail, all for their own already-documented, unrelated reasons — the
+mug test specifically still fails at `pick(A, mug)`'s own approach
+convergence, never reaching this commit's code path at all). No regression;
+per this task's own framing, this split was never expected to move, since no
+test in the suite exercises `handoff`'s success path with a prop that
+survives `pick`.
+
+**Constraints honored:** only `skills_scripted.py` and this file were
+modified. `grasp.py`, `ik.py`, `executor.py`, `gen_dual_scene.py`,
+`scenes/so101/` and `ARCHITECTURE.md` are untouched (this last is now synced
+retroactively by this documentation pass). ADR-031's GRIP freeze, ADR-033's
+per-prop hover and ADR-034's already-held guard are all unmodified (confirmed
+by diff — this commit only adds new functions/constants and replaces the
+direct `_run_waypoint` calls at handoff's own waypoints 1-4 with the
+staged/interpolated equivalents).
+
+**Net result, stated plainly: `handoff(A, B, fork)` does not work.**
+Interpolation genuinely carried the skill past a waypoint it previously
+failed 100% of the time (waypoint 3), but the call now fails one waypoint
+later, at waypoint 4, on an arm-vs-`table_top` collision during `to_arm`'s
+interpolated descend — a different failure mode than the reachability gap
+this ADR targeted, and it was not patched.
+
+**Source commit:** `f521775` ("M06 handoff: target interpolation in traverse
+implemented (ADR-035, based on 2115a1e warm-start diagnostic) — fixes
+waypoint 3's convergence as diagnosed, but handoff(A, B, fork) still fails at
+a NEW waypoint (arm-vs-table_top collision on to_arm's interpolated
+descend), reported not patched.").
 
 ---
 
