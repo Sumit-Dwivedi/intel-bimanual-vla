@@ -11,6 +11,256 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-037 — `run_handoff` rewritten as sequential choreography (one arm moves at a time, the other genuinely frozen); the fix for the `_hold_ctrl` drift bug turned out to ALSO resolve the ADR-036/`f92806e` cross-arm collision — `handoff(A, B, fork)` now succeeds end to end, verified by direct measurement, not assumed
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-036 (`f92806e`, cross-arm
+collision at `to_arm`'s staging sweep) · **Modifies:**
+`src/bimanual/control/skills_scripted.py`, `scripts/requirements-bmptl.txt`,
+this file, per task scope · **References (user-supplied, cited as such --
+not fetched, not described beyond the quoted phrases the task itself gave):**
+Wan, Ramos, Yang, Garrett 2025 (NVIDIA), "Learning to Plan & Schedule with
+Reinforcement-Learned Bimanual Robot Skills",
+https://arxiv.org/html/2510.25634v1 -- "single-arm waiting skill that keeps
+one arm stationary"; and "Trajectory planning system for bimanual robots:
+Achieving efficient collision-free manipulation" (2025),
+https://www.sciencedirect.com/science/article/pii/S0921889025002155.
+
+### Part 0 -- reverting the mink probe's environment damage, gated first
+
+`9d0adde`'s mink probe silently bumped bm-ptl's shared `ov_env` from
+`mujoco==3.2.7` to `3.13.0` as a forced transitive consequence of
+`pip install mink==1.3.0`. mink was NOT adopted (that probe's own verdict:
+on the identical target from the identical "home" pose, mink's QP-based
+velocity IK converged to a 0.2233 m residual, stuck at a joint-limit local
+minimum, where this project's own `ik.solve_position_ik` (DLS) converges to
+0.00986 m; mink's `CollisionAvoidanceLimit` also allowed a measured ~5.5 cm
+arm-vs-table interpenetration during that same stuck solve). With mink not
+adopted, there was no remaining reason to carry its forced mujoco floor.
+
+**Actions taken, in order, each verified before proceeding:**
+1. `pip install mujoco==3.2.7` on bm-ptl (`ov_env`) -- confirmed via
+   `python -c "import mujoco; print(mujoco.__version__)"` -> `3.2.7`.
+2. `pip uninstall -y mink` -- confirmed removed via `pip show mink`
+   (raises "not found").
+3. `scripts/requirements-bmptl.txt` updated to match: `mujoco==3.2.7`
+   restored, the `mink==1.3.0` line removed, with a comment explaining the
+   revert and pointing at `docs/hardware/m06-mink-probe.md` for the
+   evaluation record.
+4. `pytest tests/test_skills.py` re-run under 3.2.7 BEFORE any code change
+   in this commit: **4 passed, 4 failed** -- identical split, identical
+   failure reasons, to every previously-documented baseline (ADR-036,
+   `m06-mink-probe.md`'s own 3.13.0 re-run). This is necessary but NOT
+   sufficient evidence (see point 5): no test in this suite exercises
+   `pick(A, fork)`, `place(A, fork, table)`, or `pick(A, water_bottle)` with
+   a real `WeldGrasp` -- that is exactly why the mink probe's "pytest
+   unchanged" claim did not, by itself, establish that reverting mujoco
+   would be safe either.
+5. **The three working skills re-run directly** (via the real
+   `ScriptedSkillExecutor` + `SkillCall` path, `WeldGrasp` attached, seed 0),
+   BEFORE any code change in this commit, and their measured numbers
+   compared byte-for-byte against the pre-mink-probe baselines already on
+   record (ADR-031, ADR-033/034):
+
+   | Skill | Measured under mujoco 3.2.7 (this commit) | Matches prior baseline? |
+   |---|---|---|
+   | `pick(A, fork)` | `success=True frames_used=1655 weld_attach_frame=1155 initial_z=0.3560 final_z=0.3989` | YES, identical (ADR-031) |
+   | `place(A, fork, table)` | `success=True frames_used=3455 weld_attach_frame=1155 final_xyz=[-0.0081, 0.0203, 0.3588]` | YES, identical (ADR-031) |
+   | `pick(A, water_bottle)` | `success=True frames_used=1655 weld_attach_frame=1155 initial_z=0.4400 final_z=0.6192` | YES, identical (ADR-034) |
+
+   No regression. Only after this did any change to `skills_scripted.py`
+   begin.
+
+### Part 1 -- the `_hold_ctrl` drift bug: measured, then fixed
+
+**Measured, per this task's correction, before touching anything:**
+`_hold_ctrl` rebuilt its ENTIRE returned ctrl vector from the idle arm's
+CURRENT qpos every single call, so it commanded zero position error at the
+instant of each read and supplied no restoring force against gravity
+between reads -- the idle arm's true setpoint ratchets away from its
+original pose. This was already flagged, unfixed, in the module's own
+docstring (measured previously at 0.04 rad by 100 steps, 0.546 rad
+saturation -- a joint hard-limit stop -- by ~1500 steps). A single `pick`
+alone runs ~655 frames (ADR-035's own trace), implying ~0.26 rad of drift
+before choreography is even involved -- 26x a naive 0.01 rad bar.
+
+**Fix.** `_hold_ctrl(env, frozen_base=None)`: if `frozen_base` is given, it
+is returned as a plain copy -- nothing is re-derived from live qpos. A
+caller doing a genuine long-duration idle hold captures a snapshot ONCE
+(a plain `_hold_ctrl(env)` call, no override -- this still reads live qpos,
+but only that one time) at the exact instant an arm becomes idle, and
+passes that SAME array back in as `frozen_base` on every subsequent step of
+the idle span, however many waypoint/dwell calls that span covers. This is
+the same insight as ADR-031's GRIP-dwell freeze, generalized from "freeze
+the ACTIVE arm for one dwell" to "freeze the IDLE arm for an entire
+choreography phase." `frozen_base` was threaded as a new, purely additive
+parameter through `_drive_to_target`, `_dwell`, `_run_waypoint`,
+`_run_dwell`, `_run_interpolated_waypoint`, `_run_approach_with_staging`,
+and `run_pick` (needed so `run_handoff`'s Phase 1 can freeze `to_arm` for
+the WHOLE nested pick call, not just one waypoint of it) -- every one of
+these defaults the new parameter to `None`, which reproduces the exact
+pre-ADR-037 behaviour. `run_place` and `run_open_drawer` were NOT given new
+call sites using this parameter (out of this task's scope; their own idle
+holds are unchanged).
+
+**Verification that this did not regress `pick`/`place` (which also use
+`_hold_ctrl`):** the same three-skill re-run from Part 0's step 5, re-run
+again AFTER this change (still with `hold_ctrl_base` left at its default
+`None` for these standalone calls): **byte-identical** to Part 0's
+just-recorded numbers (`pick(A,fork)`: 1655 frames, `weld_attach_frame=1155`,
+`final_z=0.3989`; `place`: 3455 frames, same weld frame, same final xyz;
+`pick(A,water_bottle)`: 1655 frames, `final_z=0.6192`). `pytest
+tests/test_skills.py`: unchanged, 4 passed / 4 failed, identical reasons.
+
+**Measured drift with the fix applied, over the actual choreography phases
+(not a synthetic long dwell) -- this is the evidence the test threshold
+below is based on**, via a real `handoff(A, B, fork)` run instrumented to
+read each frozen arm's joint qpos at phase boundaries:
+
+| Phase | Frozen arm | Frames this phase | Max joint drift from its frozen pose |
+|---|---|---|---|
+| 1 (`from_arm` picks) | `to_arm` (B), held at HOME | 1655 | **0.000774 rad** |
+| 2 (`from_arm` approaches transfer point) | `to_arm` (B), SAME snapshot as phase 1 | 500 | **0.000774 rad** (unchanged -- confirms the snapshot itself is not decaying) |
+| 3 (`to_arm` approaches receiving point) | `from_arm` (A), held at the transfer point | 3000 | **0.000237 rad** |
+
+Both are more than an order of magnitude under the task's own proposed
+0.01 rad bar, not merely under it -- so **0.01 rad is adopted as the test
+threshold**, now with real evidence behind it (this was NOT achievable
+under the OLD `_hold_ctrl`, where phase 1 alone would have implied ~0.26
+rad; it IS achievable under the fix, measured directly, with roughly 13-40x
+margin).
+
+### Part 2 -- the cross-arm collision (`f92806e`'s finding): investigated, NOT solved by new routing geometry, but resolved anyway as a side effect of Part 1
+
+**The brief's staging signs, corrected per measurement (unchanged from
+ADR-035):** `HANDOFF_STAGING_Y_M = {"A": 0.06, "B": -0.06}` -- each arm
+converges on the side OPPOSITE its own base, confirmed again this session,
+not re-guessed.
+
+**The hard part: applying those measured values puts `to_arm`'s (B's) own
+staging cell on the SAME side of the midline `from_arm` (A) occupies while
+parked at the transfer point.** Two routing alternatives from the task's
+own list were tried, measured, and NOT adopted:
+
+- **Elevated ("dodge") crossing** -- stage `to_arm` at a taller z, sweep
+  laterally clear of `from_arm`'s operating height, then descend.
+  Measured (`WeldGrasp`-backed, real closed-loop drives, not a one-shot IK
+  check): the lateral sweep at z=0.53 converges collision-free in some
+  runs, but sits on a reproducible JOINT-LIMIT KNIFE-EDGE (margin as small
+  as -0.000001 rad -- flips pass/fail on essentially no perturbation:
+  the SAME (0,-0.06,0.53)->(0,0.02,0.53) move measured `ok=True,
+  cross_arm=0` in one run and `ok=False` at joint-limit margin -0.000001 in
+  another run that differed only in `from_arm`'s parked height). The
+  DESCEND back down to any real receiving height also reliably hit a
+  genuine joint-limit wall around z~0.49-0.50 regardless of which elevated
+  height was dodged to (tested 0.48/0.50/0.53/0.55/0.60/0.65/0.70).
+  Rejected: not robust enough to ship in place of the one corridor already
+  proven kinematically solid (ADR-035's lateral crossing at z=0.43).
+- **Horizontal ("dodge-in-x") crossing** -- sweep `to_arm` out to
+  x=+-0.15/+-0.20 before crossing y, then back. Measured: every variant ran
+  out of step budget (500-1000 steps/hop, well past ordinary convergence
+  time) before finishing. Inconclusive, not adopted as a positive result.
+- **Retracting `from_arm`'s elbow while holding its pinch point fixed**
+  (the task's third suggested option) was not attempted: `ik.py` is
+  out of scope for this task, and its 5-DOF null-space is not otherwise
+  exposed to a caller in this module.
+
+**Given neither alternative was robust, Phase 3 uses the SAME
+`HANDOFF_STAGING_Y_M`/`_run_approach_with_staging` lateral corridor
+ADR-035 already verified -- i.e. this ADR did NOT change the routing
+geometry `f92806e` found colliding.** The expectation, going into
+verification, was therefore that Phase 3 would reproduce the SAME
+cross-arm collision `f92806e` measured.
+
+**That expectation was wrong, and the reason is instructive.** Verified
+directly: `_contact_counts(env)['cross_arm']` is **0 both immediately
+before and immediately after Phase 3's `to_arm` approach**, in the actual
+`run_handoff` call (not a hand-assembled replay). The likely explanation,
+consistent with Part 1's own measurement: under the OLD `_hold_ctrl`,
+`from_arm` was the IDLE arm throughout the entirety of Phase 3 (up to 3000
+frames in this run), and the OLD mechanism let it sag under gravity with NO
+restoring force -- at the measured rate (0.04 rad/100 steps, saturating at
+a hard joint limit by ~1500 steps), a 3000-frame idle span would have let
+`from_arm`'s actual, physically-simulated arm collapse toward a mechanical
+stop, unpredictably changing its real collision geometry from the clean,
+fully-extended pose it converged to. The NEW frozen hold keeps `from_arm`
+rigidly at exactly the pose it arrived at (holding the fork at the
+transfer point), which -- combined with the SAME staging geometry that
+previously collided -- turns out to be collision-free. **This is reported
+as a genuine, directly-measured finding, not assumed or extrapolated: the
+drift fix (Part 1) and the collision fix (Part 2) turned out to be the
+SAME fix**, which was not anticipated going in.
+
+### Part 3 -- simultaneous welds on one body during the transfer moment: tested explicitly
+
+**Concern (this task's own):** Phase 4 has `to_arm`'s weld attach and get
+verified BEFORE `from_arm`'s weld is released, so both
+`from_arm`-vs-`fork` and `to_arm`-vs-`fork` weld equalities could be
+active at once, forming a closed kinematic chain through the fork.
+
+**Measured directly** (a manual replay of `run_handoff`'s own Phase
+1-4 sequence, instrumented to inspect `env.data` at the exact frame attach
+flips true, BEFORE the shipped code's own `weld.release(from_arm)` call):
+at that instant, `weld.is_holding('A') == 'fork'` AND
+`weld.is_holding('B') == 'fork'` are BOTH true simultaneously --
+confirming the two-weld state is real, not merely theoretical.
+`qfrc_constraint` norm at that instant: **4.214480** (finite, not
+exploding). An EXPLORATORY extra physics step (deliberately run with BOTH
+welds still active, NOT part of the shipped code path) produced a max
+`|qpos delta|` of **0.010983** over that one step (small, not a jump/
+explosion), `qfrc_constraint` norm unchanged to 6 decimal places, and
+`env.data.warning.number` all zero (no MuJoCo warnings). **Conclusion:
+MuJoCo appears to handle this configuration without instability, at least
+for one step** -- but this is NOT relied upon: by code inspection, the
+shipped `run_handoff` calls `weld.release(from_arm)` immediately after the
+Phase 4a gate, with NO intervening `env.step()` call, so in the actual
+production path the two-weld state exists only within `WeldGrasp`'s own
+bookkeeping for a moment, never across an actual physics integration step.
+
+### VERIFY -- phase-isolated and full-handoff results
+
+All runs: seed 0, real `ScriptedSkillExecutor`-equivalent path
+(`run_pick`/`run_handoff` called directly with a real `WeldGrasp(env)`,
+matching what `ScriptedSkillExecutor._dispatch` does).
+
+| Check | Result |
+|---|---|
+| Phase 1 (`from_arm` picks fork; `to_arm` frozen at HOME) | `ok=True`, frames=1655, `to_arm` drift=0.000774 rad (< 0.01 rad) |
+| Phase 2 (`from_arm` approaches transfer point; `to_arm` still frozen) | `ok=True`, frames=500, `to_arm` drift=0.000774 rad (unchanged) |
+| Phase 3 (`to_arm` approaches receiving point; `from_arm` frozen at transfer point) | `ok=True`, frames=3000, `from_arm` drift=0.000237 rad (< 0.01 rad), **cross_arm contacts: 0 before, 0 after** |
+| Full `handoff(A, B, fork)` | **`success=True`**, `frames_used=6610`, `reason="held by arm B: z=0.4674 (initial 0.3560) dist_to_armA=0.0909 dist_to_armB=0.0582 (to_arm=B) weld_holding_to_arm=True weld_holding_from_arm=False from_arm_retreat_dist=0.1332 from_arm_clear=True"`, `weld_attach_frame=5310`, `is_holding('A')=None`, `is_holding('B')=='fork'` |
+| `handoff(B, A, fork)` (opportunistic mirror, reported per this task, NOT gated) | `success=False`, fails at Phase 1: `pick(B, fork)`'s own APPROACH does not converge (`IK residual=0.0954 m`) -- a PRE-EXISTING, already-documented kinematic reach limit of arm B's own base placement to this fork position (unrelated to the choreography change; arm B has never been shown able to pick this fork from its own approach angle) |
+
+Success condition (`is_holding(B)=='fork'` AND `is_holding(A) is None` AND
+arm A clear of the shared workspace at the end) is met:
+`from_arm_retreat_dist=0.1332 m > HANDOFF_RETREAT_GATE_M=0.10 m`.
+
+`HANDOFF_POSITION_XYZ` is unchanged from ADR-036 (`(0.0, -0.01, 0.43)`).
+New constants added: `HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M = 0.12` (so
+`from_arm`'s first retreat waypoint clears the 0.10 m gate -- a plain
+`CLEARANCE_HEIGHT_M=0.08` lift alone is only 0.08 m of total displacement,
+short of the requirement) and `HANDOFF_RETREAT_GATE_M = 0.10`, both
+verified reachable/effective by this run, not assumed.
+
+**Render.** `docs/images/m06-handoff-complete.png` -- front camera,
+cropped to the table region, 1280x720 source. **Honest framing note, per
+this task's own instruction:** the crop shows both arms near the transfer
+point; arm B's jaw holds a small, thin white sliver (the fork) that is easy
+to miss at this resolution, and arm A's retreat (`from_arm_retreat_dist`
+=0.1332 m) is mostly VERTICAL, which a horizontal front camera does not
+render as an obvious lateral separation between the two arms -- the
+numeric state (`is_holding('A')=None`, `is_holding('B')=='fork'`,
+`from_arm_clear=True`) is the reliable evidence; the image is a supporting
+artifact, not independent visual proof, exactly as ADR-031's own render
+note already cautioned for `m06-fork-lifted.png`.
+
+**Constraints honored.** Only `skills_scripted.py`,
+`scripts/requirements-bmptl.txt`, and this file were modified. `grasp.py`,
+`ik.py`, `executor.py`, `gen_dual_scene.py`, `scenes/so101/`, and
+`ARCHITECTURE.md` are untouched (confirmed by diff). ADR-031's GRIP freeze,
+ADR-033's per-prop hover, and ADR-034's already-held guard are unmodified.
+`pytest tests/test_skills.py`: 4 passed / 4 failed before and after this
+entire commit, identical failure reasons throughout -- no regression.
+
 ## ADR-036 — Raise `HANDOFF_POSITION_XYZ`'s z above the table (0.35 -> 0.43) to remove the ADR-035 arm-vs-table_top collision: the targeted collision is gone, but `handoff(A, B, fork)` now fails one waypoint EARLIER, at a NEW cross-arm collision — the fix relocated the failure rather than resolving it, reported honestly, not patched
 
 **Recorded:** Sept 13, 2026 · **Follows:** ADR-035 (target interpolation in

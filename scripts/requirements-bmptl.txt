@@ -2,32 +2,32 @@ numpy==2.4.6
 openvino==2026.3.1
 openvino-telemetry==2025.2
 
-# mujoco pin bumped 3.2.7 -> 3.13.0 as a FORCED, TRANSITIVE consequence of
-# installing mink (below), not a production decision made for its own sake.
-# `pip install mink==1.3.0` on bm-ptl (ov_env) resolved mink's own
-# `mujoco>=3.10.0` requirement by uninstalling the previously-pinned 3.2.7
-# and installing 3.13.0 in the same venv -- verified by `pip show mujoco`
-# before/after. There is no mink release compatible with 3.2.7 (checked
-# every 1.x release's own wheel METADATA, not just 1.3.0's: 1.0.0/1.1.0
-# require mujoco>=3.3.6, 1.1.1/1.2.0 require mujoco>=3.8.1, 1.3.0 requires
-# mujoco>=3.10.0 -- the floor has crept up release to release but every one
-# of them is already above 3.2.7; see docs/hardware/m06-mink-probe.md for
-# the full version-resolution trail). Kept
-# at the resolved value here, not reverted, because `pytest
-# tests/test_skills.py` was re-run under 3.13.0 and reproduced the exact
-# same 4 passed / 4 failed baseline with byte-identical failure reasons
-# (m06-mink-probe.md) -- i.e. this bump is verified not to change existing
-# production behaviour, so pinning the file to match what is actually
-# installed is more honest than pinning a version nothing on bm-ptl runs.
-mujoco==3.13.0
+# mujoco: pinned back to 3.2.7 (ADR-037). `9d0adde`'s mink probe bumped this
+# to 3.13.0 as a forced, transitive consequence of `pip install mink==1.3.0`
+# (mink's own METADATA requires `mujoco>=3.10.0`, and every 1.x mink release
+# checked in docs/hardware/m06-mink-probe.md requires a floor above 3.2.7 --
+# there is no mink release compatible with this project's original pin).
+# mink was evaluated (docs/hardware/m06-mink-probe.md) and NOT adopted: on
+# the identical target from the identical "home" pose, mink's QP-based
+# velocity IK converged to a 0.2233 m residual (stuck at a joint-limit local
+# minimum) where this project's own `ik.solve_position_ik` (DLS) converges
+# to 0.00986 m, and mink's `CollisionAvoidanceLimit` allowed a measured
+# ~5.5 cm arm-vs-table interpenetration during that same stuck solve. With
+# mink not adopted, there is no remaining reason to carry its forced mujoco
+# floor -- reverted to the version every skill in this repo was built and
+# measured against. Re-verified after reverting (this commit): `pytest
+# tests/test_skills.py` unchanged (4 passed / 4 failed, identical reasons),
+# and `pick(A, fork)`, `place(A, fork, table)`, `pick(A, water_bottle)` all
+# re-run directly (not merely via pytest, which covers none of the three)
+# with the same measured outcomes as before the mink probe -- see
+# DECISIONS.md's ADR-037 entry for the actual numbers.
+mujoco==3.2.7
 
-# mink: collision-aware IK library (M06 handoff probe, ADR pending --
-# docs/hardware/m06-mink-probe.md). Apache-2.0. Current PyPI release as of
-# 2026-09-14 (`pip index versions mink` -> 1.3.0; the brief's assumed
-# `1.2.0` does not reflect PyPI's current state and was not used). Pulls in
-# `qpsolvers[daqp]` (daqp is MIT-licensed, installs as a normal wheel, no
-# separate step needed on this platform) and the mujoco bump above.
-mink==1.3.0
+# mink was removed from this file (ADR-037): not adopted, see above. The
+# probe that installed it (`scripts/probe_mink_bimanual.py`) still exists
+# in the repo as a historical artifact/finding, but nothing on the
+# production path (`skills_scripted.py`, `ik.py`) imports mink, and this
+# venv no longer needs it installed.
 
 # Test runner (ADR-025 housekeeping pin). Matches scripts/requirements-dev.txt
 # so tests/test_skills.py can run through pytest on bm-ptl (ov_env), where the

@@ -567,6 +567,29 @@ HANDOFF_STAGING_Y_M = {"A": 0.06, "B": -0.06}
 #: left open ("did not check joint-limit margins on the chained configs").
 HANDOFF_JOINT_LIMIT_MARGIN_TOL = 1e-4
 
+#: ADR-037 (sequential choreography, Phase 5). How far above
+#: `HANDOFF_POSITION_XYZ`'s z `from_arm`'s FIRST retreat waypoint lifts to,
+#: metres. Chosen so the resulting Euclidean distance from `from_arm`'s
+#: gripperframe to the transfer point clears `HANDOFF_RETREAT_GATE_M`
+#: (below) -- `CLEARANCE_HEIGHT_M` alone (0.08 m) is NOT enough (a pure
+#: vertical lift of 0.08 m is only 0.08 m of total displacement, short of
+#: the required > 0.10 m gate), so this is a SEPARATE, slightly taller
+#: constant used only for `from_arm`'s own first retreat hop, verified
+#: empirically (not assumed) -- see `run_handoff`'s Phase 5 and
+#: DECISIONS.md's ADR-037 entry for the measured reachability/distance at
+#: this height.
+HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M = 0.12
+
+#: ADR-037 (sequential choreography, Phase 5). `from_arm` must retreat this
+#: far (metres, Euclidean distance from its gripperframe site to the
+#: transfer point) before `to_arm` is allowed to begin its OWN retreat --
+#: the task's own Phase 5 spec ("once `from_arm`'s gripper is > 0.10 m from
+#: the transfer point, `to_arm` retreats"), checked directly against the
+#: PHYSICALLY-REALIZED site position, not assumed from the waypoint target
+#: alone (PD settling can leave a small residual, ADR-027's own
+#: `POS_CONVERGENCE_TOL_M` rationale).
+HANDOFF_RETREAT_GATE_M = 0.10
+
 #: `open_drawer` tuning (ADR-027 lateral approach).
 #:
 #: How far outside the table's -y edge (table_top spans y in [-0.25, 0.25])
@@ -642,28 +665,50 @@ def _gripper_ctrl(model, arm: str, fraction: float) -> float:
     return float(lo + fraction * (hi - lo))
 
 
-def _hold_ctrl(env) -> np.ndarray:
-    """A full-length ctrl vector that commands every actuator to hold its
-    CURRENT joint position -- the safe default for whichever arm is not
-    being actively driven this step (ADR-010: "the idle arm [is held] at a
-    safe pose" while the other arm works the shared workspace).
+def _hold_ctrl(env, frozen_base: np.ndarray | None = None) -> np.ndarray:
+    """A full-length ctrl vector that commands every actuator to hold a
+    position -- the safe default for whichever arm is not being actively
+    driven this step (ADR-010: "the idle arm [is held] at a safe pose"
+    while the other arm works the shared workspace).
 
-    Kept over a `skill_start`-pinned alternative as of M06 Phase 2 Commit 1
-    (module docstring above has the full comparison): re-anchoring to
-    CURRENT qpos, not a fixed skill-start snapshot, is the only one of the
-    two designs that stays correct across `run_handoff`, where the "idle"
-    arm mid-call is holding the object at the transfer point, not sitting
-    at its pose from the top of the skill.
+    **ADR-037 fix: `frozen_base`, if given, is returned as a COPY directly
+    -- nothing is re-derived from `env.data.qpos` in that case.** Before
+    ADR-037, this function ALWAYS recomputed the returned vector fresh from
+    CURRENT qpos every single call (see the measured drift this caused,
+    below). `docs/hardware/m06-handoff-choreography.md`'s own re-measurement
+    confirmed that gap directly: because re-reading qpos and commanding
+    zero position error at that instant supplies no restoring force against
+    gravity between reads, the idle arm's true setpoint ratchets away from
+    its original pose monotonically -- 0.040 rad by 100 steps (already past
+    a 0.01 rad bar), 0.546 rad (a joint hard-limit stop, not a controller
+    limit) by roughly 1500 steps. A single `pick`'s ~655-frame trace alone
+    implies ~0.26 rad of drift, and `run_handoff`'s sequential choreography
+    (ADR-037) holds one arm idle across an entire multi-waypoint PHASE --
+    several thousand frames -- so this is not a cosmetic gap for that
+    caller. The fix follows the same insight as ADR-031's GRIP-dwell
+    freeze: a caller doing a genuine long-duration idle hold captures a
+    snapshot ONCE, at the instant the arm becomes idle (via a plain
+    `_hold_ctrl(env)` call, no `frozen_base` -- which still reads live qpos
+    for that ONE snapshot), and then passes that SAME array back in as
+    `frozen_base` on every subsequent step of the idle span, however many
+    waypoint/dwell calls that span covers. Because the idle arm's own ctrl
+    entries are never touched by `_write_arm_ctrl` (only the ACTIVELY DRIVEN
+    arm's slice is overwritten each step), holding the frozen array fixed
+    means the idle arm's actuator setpoint is exactly what it was at the
+    moment it stopped moving -- a real PD position error develops as soon as
+    gravity sag begins, and the actuator's own gain (`kp=998.22`, ADR-016)
+    corrects it, instead of the setpoint chasing the sag.
 
-    **Known limitation, measured by `scripts/probe_ctrl_hold.py`, not
-    fixed here:** because this re-reads qpos fresh every step and commands
-    zero position error at that instant, it supplies no restoring force
-    against gravity between reads -- the idle arm can sag monotonically
-    over a long dwell (measured: 0.04 rad by 100 steps, saturating at
-    0.546 rad -- a joint hard-limit stop, not a controller limit -- by
-    roughly 1500 steps). It reliably prevents the ADR-026 zero-pose
-    interpenetration case; it does not keep the idle arm motionless.
+    `frozen_base=None` (every caller that existed before ADR-037: `run_pick`,
+    `run_place`, `run_open_drawer`, and any `run_handoff` call site that
+    does not opt in) reproduces this function's ORIGINAL qpos-chasing
+    behaviour exactly, unchanged -- this is a purely additive, backward-
+    compatible parameter; nothing about those callers' numerics changes
+    (verified: see DECISIONS.md's ADR-037 entry for the pick/place/handoff
+    re-run after this change).
     """
+    if frozen_base is not None:
+        return np.array(frozen_base, dtype=np.float64, copy=True)
     ctrl = np.zeros(env.model.nu, dtype=np.float64)
     for aid in range(env.model.nu):
         jid = int(env.model.actuator_trnid[aid, 0])
@@ -722,6 +767,7 @@ def _drive_to_target(
     max_steps: int,
     pos_tol: float = POS_CONVERGENCE_TOL_M,
     target_object: str | None = None,
+    hold_ctrl_base: np.ndarray | None = None,
 ) -> tuple[bool, int, dict]:
     """One closed-loop phase: repeatedly solve IK toward `target_pos` and
     step physics (holding the other arm still via `_hold_ctrl`) until the
@@ -734,6 +780,13 @@ def _drive_to_target(
     `CRUSH_THRESHOLD_M` bar instead of `PROP_COLLISION_DEPTH_TOL_M`.
     Picking something up requires the gripper to approach and touch it;
     `None` (the default) applies the tight bar to every prop, as before.
+
+    `hold_ctrl_base` (ADR-037): passed straight through to `_hold_ctrl` as
+    its `frozen_base` -- a caller doing a genuine long-duration idle hold
+    (`run_handoff`'s sequential choreography) supplies the SAME captured
+    array across many calls so the idle arm's setpoint never re-derives
+    from (sagging) live qpos. `None` (the default) reproduces this
+    function's pre-ADR-037 per-step qpos-chasing hold, unchanged.
 
     Returns (converged, steps_used, prop_violations). `converged=False` at
     `max_steps` is a normal outcome for a hard subgoal, not necessarily a bug
@@ -781,7 +834,7 @@ def _drive_to_target(
     consecutive: dict[str, int] = {}
     while steps < max_steps:
         solution = ik.solve_position_ik(env.model, env.data, arm, target)
-        ctrl = _hold_ctrl(env)
+        ctrl = _hold_ctrl(env, frozen_base=hold_ctrl_base)
         _write_arm_ctrl(ctrl, env.model, arm, solution.joint_angles, gripper_ctrl)
         env.step(ctrl)
         steps += 1
@@ -806,6 +859,7 @@ def _dwell(
     target_object: str | None = None,
     weld: WeldGrasp | None = None,
     weld_object_name: str | None = None,
+    hold_ctrl_base: np.ndarray | None = None,
 ) -> tuple[int, dict, int | None]:
     """Hold `arm`'s gripperframe near `hold_pos` for `n_steps`, commanding
     `gripper_fraction` on the jaw throughout. Used to let a grasp/release
@@ -838,6 +892,12 @@ def _dwell(
     `weld=None` (the default -- every RELEASE dwell, and `open_drawer`'s
     GRIP/RELEASE dwells, which have no weld concept) leaves this function's
     behavior identical to before this commit.
+
+    `hold_ctrl_base` (ADR-037): same meaning as `_drive_to_target`'s
+    parameter of the same name -- threaded to `_hold_ctrl` so a long idle
+    hold spanning this dwell (and possibly other calls before/after it)
+    uses one frozen snapshot instead of re-deriving from live qpos.
+    `None` (the default) is unchanged pre-ADR-037 behaviour.
 
     **ADR-031: arm frozen for the whole dwell -- `hold_pos` is no longer
     re-solved against every step.** `ik.solve_position_ik` targets the
@@ -885,7 +945,7 @@ def _dwell(
     frozen_arm_ctrl = np.array([env.data.ctrl[aid] for aid in arm_actuator_ids], dtype=np.float64)
 
     for i in range(n_steps):
-        ctrl = _hold_ctrl(env)
+        ctrl = _hold_ctrl(env, frozen_base=hold_ctrl_base)
         _write_arm_ctrl(ctrl, env.model, arm, frozen_arm_ctrl, gripper_ctrl)
         env.step(ctrl)
 
@@ -1143,6 +1203,7 @@ def _run_waypoint(
     baseline: dict,
     pos_tol: float = POS_CONVERGENCE_TOL_M,
     target_object: str | None = None,
+    hold_ctrl_base: np.ndarray | None = None,
 ) -> tuple[bool, int, str | None]:
     """Drive `arm` to `target_pos` (one APPROACH/DESCEND/RETREAT/PULL
     waypoint of a staged skill, ADR-027) and validate it against
@@ -1171,9 +1232,14 @@ def _run_waypoint(
     holding, not a defect. Every OTHER prop keeps the tight bar
     unconditionally, including at RETREAT -- that bystander protection is
     never weakened by this parameter.
+
+    `hold_ctrl_base` (ADR-037): threaded straight through to
+    `_drive_to_target`/`_hold_ctrl`. `None` (the default) is unchanged
+    pre-ADR-037 behaviour.
     """
     _, steps, in_loop_violations = _drive_to_target(
-        env, arm, target_pos, gripper_fraction, max_steps, pos_tol=pos_tol, target_object=target_object
+        env, arm, target_pos, gripper_fraction, max_steps, pos_tol=pos_tol, target_object=target_object,
+        hold_ctrl_base=hold_ctrl_base,
     )
     if in_loop_violations:
         named = ", ".join(
@@ -1205,6 +1271,7 @@ def _run_dwell(
     target_object: str | None = None,
     weld: WeldGrasp | None = None,
     weld_object_name: str | None = None,
+    hold_ctrl_base: np.ndarray | None = None,
 ) -> tuple[bool, int, str | None, int | None]:
     """Dwell at `hold_pos` (a GRIP or RELEASE waypoint, ADR-027) while
     opening/closing the jaw, then validate exactly like `_run_waypoint`.
@@ -1232,10 +1299,13 @@ def _run_dwell(
     `weld`/`weld_object_name` (M06 Phase 2 Commit 2): passed straight
     through to `_dwell`; `None` (the default) leaves this function's
     behavior identical to before this commit.
+
+    `hold_ctrl_base` (ADR-037): threaded straight through to `_dwell`/
+    `_hold_ctrl`. `None` (the default) is unchanged pre-ADR-037 behaviour.
     """
     steps, in_loop_violations, attach_frame = _dwell(
         env, arm, hold_pos, gripper_fraction, n_steps, target_object=target_object,
-        weld=weld, weld_object_name=weld_object_name,
+        weld=weld, weld_object_name=weld_object_name, hold_ctrl_base=hold_ctrl_base,
     )
     if in_loop_violations:
         named = ", ".join(
@@ -1284,6 +1354,7 @@ def run_pick(
     target_object: str,
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
     weld: WeldGrasp | None = None,
+    hold_ctrl_base: np.ndarray | None = None,
 ) -> SkillResult:
     """pick(object, arm): APPROACH (clearance above the grasp point) ->
     DESCEND (onto it) -> GRIP (close + attempt weld attach) -> RETREAT (back
@@ -1312,6 +1383,16 @@ def run_pick(
     and still confirmed held, not merely "was welded at some earlier frame".
     Success (with `weld=None`): the older initial-z-relative
     `PICK_LIFT_MARGIN_M` check, unchanged from before this commit.
+
+    `hold_ctrl_base` (ADR-037): threaded to every waypoint/dwell this
+    function runs, for a caller doing a genuine long-duration idle hold of
+    the OTHER arm across this ENTIRE `run_pick` call (`run_handoff`'s
+    Phase 1, where `to_arm` must stay frozen at HOME for the whole nested
+    pick, not just one waypoint of it). `None` (the default -- every
+    standalone `pick(...)` call, e.g. `tests/test_skills.py`) reproduces
+    this function's pre-ADR-037 behaviour exactly: the OTHER arm is still
+    held (ADR-010), just via `_hold_ctrl`'s original per-step qpos-chasing
+    default rather than a caller-supplied frozen snapshot.
     """
     frames = 0
     body_name = OBJECT_BODY_NAME.get(target_object)
@@ -1339,7 +1420,8 @@ def run_pick(
     hover_z = max(float(grasp_point[2]), float(obj_pos0[2] + top_local_z)) + CLEARANCE_HEIGHT_M
     hover = np.array([grasp_point[0], grasp_point[1], hover_z])
     ok, used, reason = _run_waypoint(
-        env, arm, hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object
+        env, arm, hover, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object,
+        hold_ctrl_base=hold_ctrl_base,
     )
     frames += used
     remaining -= used
@@ -1348,7 +1430,8 @@ def run_pick(
 
     # Waypoint 2: DESCEND -- onto the grasp point itself, gripper still open.
     ok, used, reason = _run_waypoint(
-        env, arm, grasp_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object
+        env, arm, grasp_point, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object,
+        hold_ctrl_base=hold_ctrl_base,
     )
     frames += used
     remaining -= used
@@ -1364,6 +1447,7 @@ def run_pick(
     ok, used, reason, attach_frame_local = _run_dwell(
         env, arm, grasp_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,
         target_object=target_object, weld=weld, weld_object_name=body_name if weld is not None else None,
+        hold_ctrl_base=hold_ctrl_base,
     )
     frames += used
     remaining -= used
@@ -1387,7 +1471,8 @@ def run_pick(
     # proof of a successful grasp, not a defect, so it stays exempt (up to
     # CRUSH_THRESHOLD_M) through RETREAT too.
     ok, used, reason = _run_waypoint(
-        env, arm, hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object
+        env, arm, hover, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline, target_object=target_object,
+        hold_ctrl_base=hold_ctrl_base,
     )
     frames += used
     remaining -= used
@@ -1633,6 +1718,7 @@ def _run_interpolated_waypoint(
     baseline: dict,
     target_object: str | None = None,
     step_size: float = HANDOFF_INTERP_STEP_M,
+    hold_ctrl_base: np.ndarray | None = None,
 ) -> tuple[bool, int, str | None]:
     """ADR-035: drive `arm` from `start_pos` to `end_pos` in `step_size`
     increments, re-converging (IK residual + collision, via the existing
@@ -1666,6 +1752,9 @@ def _run_interpolated_waypoint(
     Returns `(ok, frames_used, reason)`, `reason` naming the specific
     intermediate step (and its target) that failed, so a caller-side
     failure localises exactly like every other waypoint in this module.
+
+    `hold_ctrl_base` (ADR-037): threaded to every `_run_waypoint` call this
+    function makes. `None` (the default) is unchanged pre-ADR-037 behaviour.
     """
     start = np.asarray(start_pos, dtype=np.float64).reshape(3)
     end = np.asarray(end_pos, dtype=np.float64).reshape(3)
@@ -1681,6 +1770,7 @@ def _run_interpolated_waypoint(
             return False, frames, f"interpolation step {i}/{n_steps} failed [no budget remaining]"
         ok, used, reason = _run_waypoint(
             env, arm, target_i, gripper_fraction, max_steps, baseline, target_object=target_object,
+            hold_ctrl_base=hold_ctrl_base,
         )
         frames += used
         remaining -= used
@@ -1707,6 +1797,7 @@ def _run_approach_with_staging(
     remaining_budget: int,
     baseline: dict,
     target_object: str | None = None,
+    hold_ctrl_base: np.ndarray | None = None,
 ) -> tuple[bool, int, str | None]:
     """ADR-035 correction 2: an arm's very first move of a `handoff` call
     (this arm has not been driven anywhere yet this call, so its live
@@ -1727,11 +1818,16 @@ def _run_approach_with_staging(
     driven waypoint of its own, not merely a re-seeded solve.
 
     Returns `(ok, frames_used, reason)`.
+
+    `hold_ctrl_base` (ADR-037): threaded to every waypoint/interpolation
+    call this function makes. `None` (the default) is unchanged pre-ADR-037
+    behaviour.
     """
     hover = np.asarray(hover_target, dtype=np.float64).reshape(3)
     max_steps = min(APPROACH_DESCENT_STEPS, remaining_budget)
     ok, used, reason = _run_waypoint(
         env, arm, hover, gripper_fraction, max_steps, baseline, target_object=target_object,
+        hold_ctrl_base=hold_ctrl_base,
     )
     if ok:
         return True, used, None
@@ -1746,6 +1842,7 @@ def _run_approach_with_staging(
     max_steps = min(APPROACH_DESCENT_STEPS, remaining)
     ok2, used2, reason2 = _run_waypoint(
         env, arm, staging_target, gripper_fraction, max_steps, baseline, target_object=target_object,
+        hold_ctrl_base=hold_ctrl_base,
     )
     frames += used2
     remaining -= used2
@@ -1757,6 +1854,7 @@ def _run_approach_with_staging(
 
     ok3, used3, reason3 = _run_interpolated_waypoint(
         env, arm, staging_target, hover, gripper_fraction, remaining, baseline, target_object=target_object,
+        hold_ctrl_base=hold_ctrl_base,
     )
     frames += used3
     if not ok3:
@@ -1775,63 +1873,116 @@ def run_handoff(
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
     weld: WeldGrasp | None = None,
 ) -> SkillResult:
-    """handoff(object, from_arm, to_arm) (ADR-010's grip-state sequence,
-    staged per ADR-027; weld wiring is M06 Phase 2 Commit 2, ADR-030):
+    """handoff(object, from_arm, to_arm): ADR-037's SEQUENTIAL CHOREOGRAPHY
+    -- one arm moves at a time, the other is genuinely frozen (not merely
+    "not explicitly driven"), replacing the earlier same-point-targeting
+    design (ADR-010/027/030) that this ADR's own investigation found still
+    fails on a cross-arm collision (`f92806e`) even though nothing in the
+    OLD code ever moved both arms in the SAME physics step either -- the
+    problem `f92806e` found was never simultaneity, it was that `from_arm`
+    sits STATIC in a spot `to_arm`'s own approach sweeps through, and
+    sequencing alone does not move `from_arm` out of the way (see Phase 3's
+    own docstring paragraph below, and DECISIONS.md's ADR-037 entry for the
+    full measurement trail, including the staging-geometry alternatives
+    that were tried and NOT adopted).
 
-      1. `from_arm` picks the object up (nested `run_pick`, `weld` threaded
-         through so `from_arm`'s own initial grasp attaches exactly like a
-         standalone `pick`).
-      2. `from_arm` APPROACHes `HANDOFF_POSITION_XYZ` directly (ADR-035:
-         staged via `_run_approach_with_staging` if it does not converge in
-         one shot). **ADR-036: no separate DESCEND waypoint follows this.**
-         Before ADR-036, `HANDOFF_POSITION_XYZ` sat at table height and this
-         APPROACH stopped at a hover `CLEARANCE_HEIGHT_M` above it, requiring
-         a second DESCEND waypoint down onto the table-height transfer point
-         -- exactly the waypoint whose final interpolation step collided
-         with `table_top` (ADR-035's finding). `HANDOFF_POSITION_XYZ` now
-         sits AT the old hover height (mid-air, not tabletop), so this single
-         APPROACH already ends at the real transfer point; a further DESCEND
-         would be a no-op (start == end) and has been removed rather than
-         left in as dead code that reports success without moving.
-      3. `to_arm` APPROACHes the receiving point directly (offset to the
-         opposite side of the transfer point via `HANDOFF_SIDE_OFFSET_M`,
-         same collision-avoidance rationale as before, ADR-024); ADR-035
-         staging applies here too -- this is usually the arm that actually
-         needs it, since it has not moved yet this call. **ADR-036: no
-         separate DESCEND follows this either, for the same reason as step 2.**
-      4. `to_arm` GRIPs -- closes and attempts weld attach every step
-         (same mechanism as `run_pick`'s GRIP), until it attaches or
-         `GRIP_HOLD_FRAMES` runs out.
-      4a. **ADR-030's transfer-safety gate**: `weld.is_holding(to_arm) ==
-          body_name` is checked EXPLICITLY here, BEFORE `from_arm` is ever
-          asked to release. If it does not hold (attach never engaged, or
-          something released it in between), the skill fails immediately
-          with `handoff_transfer_failed` and `from_arm`'s weld is left
-          untouched -- the object stays with `from_arm` rather than ending
-          up held by neither arm.
-      5. `from_arm` RELEASEs -- `weld.release(from_arm)` is called BEFORE
-         the jaw is commanded open (same ordering rationale as `place`'s
-         RELEASE), only after step 4a has confirmed the transfer.
-      6. Both RETREAT, STAGGERED, lifting `CLEARANCE_HEIGHT_M` further above
-         the (now mid-air) transfer/receiving point: `from_arm` retreats
-         first, THEN `to_arm` retreats -- sequential, not concurrent, so the
-         two arms do not cross paths on the way out while both are still
-         near the transfer point. **ADR-036 flag:** this retreat height
-         (`HANDOFF_POSITION_XYZ`'s new z=0.43 plus `CLEARANCE_HEIGHT_M`=0.08,
-         i.e. 0.51) has never been tested for reachability before this
-         change -- verified empirically as part of this task, not assumed;
-         see DECISIONS.md ADR-036 for the measured per-waypoint outcome.
+    **Phase 1** -- `from_arm` picks the object up (nested `run_pick`, `weld`
+    threaded through so `from_arm`'s own initial grasp attaches exactly like
+    a standalone `pick`). `to_arm` is held stationary at HOME for this
+    entire phase via a FROZEN ctrl snapshot (`to_arm_hold`, ADR-037's
+    `_hold_ctrl(frozen_base=...)` fix -- see that function's docstring for
+    the measured drift this replaces: 0.04 rad by 100 steps, ~0.26 rad
+    implied over a nested pick's own ~655-frame trace, under the OLD
+    per-step qpos-chasing hold).
 
-    `weld=None` (the default) reproduces this module's pre-Commit-2
-    behavior throughout (no attach attempts, no transfer gate, no release
-    calls) -- the old lift-margin/distance-only success check below.
+    **Phase 2** -- `from_arm` APPROACHes (and, since ADR-036, directly
+    arrives at -- no separate DESCEND) `HANDOFF_POSITION_XYZ`
+    (`transfer_point`), staged via `_run_approach_with_staging` if it does
+    not converge in one shot (ADR-035). `to_arm` is STILL held at the SAME
+    `to_arm_hold` snapshot from Phase 1 -- it has not moved, so the
+    snapshot taken before Phase 1 is still exactly correct; no arm is EVER
+    idle-held via a stale or re-derived-from-a-different-instant vector.
+
+    **Phase 3** -- `from_arm` is now held stationary at `transfer_point`,
+    STILL HOLDING THE OBJECT, via a NEW frozen snapshot (`from_arm_hold`,
+    captured the instant Phase 2 finishes) -- while `to_arm` APPROACHes the
+    receiving point (`HANDOFF_SIDE_OFFSET_M` off `transfer_point`, ADR-024),
+    staged the same way Phase 2 was.
+
+    **This is the phase `f92806e` found collides, and sequential
+    choreography by itself does not fix it.** `from_arm` is genuinely
+    STATIC here (Phase 2 already finished; it is not "not yet driven", it
+    has arrived and stopped) -- yet its own body occupies exactly the
+    region `to_arm`'s home-seeded staging cell (`HANDOFF_STAGING_Y_M["B"]
+    = -0.06`) must cross through to reach the receiving point on the
+    OPPOSITE side (`+HANDOFF_SIDE_OFFSET_M`). This ADR's own measurement
+    (DECISIONS.md) tried two routing alternatives instead of the plain
+    lateral crossing this phase still uses:
+      - **Elevated ("dodge") crossing**: stage `to_arm` at a taller z,
+        sweep laterally clear of `from_arm`'s operating height, then
+        descend. Measured: the LATERAL sweep at z=0.53 converges
+        collision-free in some runs, but is reproducibly ON A JOINT-LIMIT
+        KNIFE-EDGE (margin as small as -0.000001 rad -- i.e. flips pass/fail
+        on essentially no perturbation) at every elevated height tried
+        (0.48-0.70), and the DESCEND back down to the real receiving height
+        reliably hits a genuine joint-limit wall around z~0.49-0.50
+        regardless of the height dodged to. Rejected as NOT robust enough
+        to ship in place of the one corridor that IS kinematically solid.
+      - **Horizontal ("dodge-in-x") crossing**: sweep `to_arm` out to
+        x=+-0.15/+-0.20 before crossing y, then back. Measured:
+        inconclusive -- ran out of step budget mid-interpolation in every
+        variant tried (500-1000 steps per hop, well past ordinary
+        convergence time), suggesting this corridor is not meaningfully
+        easier, not that it is fine given more budget.
+    Neither alternative is adopted. This phase therefore uses the SAME
+    `HANDOFF_STAGING_Y_M`/`_run_approach_with_staging` lateral corridor
+    ADR-035 already verified kinematically -- the one corridor proven to
+    converge -- and is EXPECTED, per this measurement, to still fail here
+    with a cross-arm collision. That is reported as this ADR's actual,
+    honest verification result (see DECISIONS.md), not patched over by
+    routing `to_arm` through a shakier alternative.
+
+    **Phase 4** -- `to_arm` GRIPs (closes the jaw, attempts weld attach
+    every step until it engages or `GRIP_HOLD_FRAMES` runs out -- same
+    mechanism as `run_pick`'s GRIP, ADR-030), `from_arm` still frozen at
+    `from_arm_hold`. **4a**: `weld.is_holding(to_arm) == body_name` is
+    checked EXPLICITLY here, BEFORE `from_arm` is ever asked to release
+    (ADR-030's transfer-safety gate, unchanged). **This task's Part 3
+    concern -- two simultaneous welds on one body (`from_arm`-vs-fork AND
+    `to_arm`-vs-fork both active at once, a closed kinematic chain through
+    the fork) -- is tested explicitly**, not assumed safe: see
+    DECISIONS.md's ADR-037 entry for the measured constraint forces/qpos
+    delta during the exact frame window both welds are simultaneously
+    active. **4b**: `weld.release(from_arm)` is called BEFORE the jaw is
+    commanded open (same ordering rationale as `place`'s RELEASE), only
+    once 4a has confirmed the transfer. `to_arm` is then frozen at a NEW
+    snapshot (`to_arm_grip_hold`, captured the instant it finishes
+    gripping) while `from_arm` runs its own RELEASE dwell (open the jaw,
+    ADR-031's per-dwell arm freeze governs `from_arm`'s OWN ctrl during
+    this; `to_arm_grip_hold` governs the now-idle `to_arm`'s).
+
+    **Phase 5** -- `from_arm` retreats FIRST (to a taller clearance,
+    `HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M`, chosen so the total Euclidean
+    distance from its gripperframe to `transfer_point` clears
+    `HANDOFF_RETREAT_GATE_M` -- a plain `CLEARANCE_HEIGHT_M` vertical lift
+    is only 0.08 m of total displacement, short of the required > 0.10 m),
+    while `to_arm` is held at `to_arm_grip_hold`. Only once that gate is
+    measured (not assumed) to be cleared does `to_arm` retreat, held frozen
+    by a FINAL snapshot of `from_arm`'s now-retreated pose
+    (`from_arm_retreated_hold`).
+
+    `weld=None` (the default) reproduces this module's pre-ADR-037
+    attach/release/gate behavior throughout (no attach attempts, no
+    transfer gate, no release calls) -- the older lift-margin/distance-only
+    success check below is unchanged in that case.
 
     Success (with `weld` given): the object ends measurably closer to
     `to_arm`'s gripperframe site than `from_arm`'s, has been lifted since
-    the handoff began, AND `weld.is_holding(to_arm) == body_name` while
-    `weld.is_holding(from_arm)` is not -- i.e. the transfer is confirmed by
-    the weld state itself, not merely by which gripper is geometrically
-    closer. Success (with `weld=None`): the older distance+lift-only check.
+    the handoff began, `weld.is_holding(to_arm) == body_name` while
+    `weld.is_holding(from_arm)` is not, AND `from_arm` is clear of the
+    shared workspace at the end (`HANDOFF_RETREAT_GATE_M`, checked in
+    Phase 5). Success (with `weld=None`): the older distance+lift-only
+    check.
     """
     frames = 0
     if to_arm == from_arm:
@@ -1844,131 +1995,160 @@ def run_handoff(
     initial_z = float(env.data.xpos[body_id][2])
     baseline = _contact_counts(env)
 
-    pick_budget = max(1, step_budget // 2)
-    pick_result = run_pick(env, from_arm, target_object, step_budget=pick_budget, weld=weld)
-    frames += pick_result.frames_used
-    if not pick_result.success:
-        return SkillResult(
-            False, f"handoff aborted: pick by arm {from_arm} failed ({pick_result.reason})", frames,
-            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=False,
-        )
-
-    remaining = step_budget - frames
-    if remaining <= 0:
-        return SkillResult(False, "waypoint 1 (from_arm approach) failed [convergence (no budget remaining after pick)]", frames)
-
     close_frac, open_frac = GRIPPER_CLOSE_FRACTION, GRIPPER_OPEN_FRACTION
     hx, hy, hz = HANDOFF_POSITION_XYZ
     transfer_point = np.array([hx, hy, hz])
     side = -1.0 if to_arm == "A" else 1.0  # arm A base at y=-0.25, arm B at y=+0.25
     receiving_point = transfer_point + np.array([0.0, side * HANDOFF_SIDE_OFFSET_M, 0.0])
 
-    # Waypoint 1: from_arm APPROACH -- drives directly to transfer_point
-    # (ADR-036: transfer_point now sits at the old hover height, mid-air,
-    # not table height, so no separate DESCEND follows -- see run_handoff's
-    # docstring). ADR-035: staged if from_arm's HOME (or wherever it
-    # currently is) does not converge to this in one shot.
+    # === Phase 1: from_arm picks the object; to_arm held stationary at
+    # HOME for the WHOLE phase (ADR-037 frozen snapshot, taken before
+    # anything in this call has moved). ===
+    to_arm_hold = _hold_ctrl(env)
+    pick_budget = max(1, step_budget // 2)
+    pick_result = run_pick(
+        env, from_arm, target_object, step_budget=pick_budget, weld=weld, hold_ctrl_base=to_arm_hold,
+    )
+    frames += pick_result.frames_used
+    if not pick_result.success:
+        return SkillResult(
+            False, f"phase 1 (from_arm pick) failed ({pick_result.reason})", frames,
+            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=False,
+        )
+
+    remaining = step_budget - frames
+    if remaining <= 0:
+        return SkillResult(False, "phase 2 (from_arm approach) failed [convergence (no budget remaining after pick)]", frames)
+
+    # === Phase 2: from_arm approaches/arrives at the transfer point
+    # (ADR-036: no separate DESCEND, transfer_point already sits at hover
+    # height). to_arm is STILL held at the SAME to_arm_hold snapshot -- it
+    # has not moved since Phase 1, so nothing needs re-snapshotting. ===
     ok, used, reason = _run_approach_with_staging(
         env, from_arm, transfer_point, close_frac, remaining, baseline, target_object=target_object,
+        hold_ctrl_base=to_arm_hold,
     )
     frames += used
     remaining -= used
     if not ok:
-        return SkillResult(False, f"waypoint 1 (from_arm approach) failed [{reason}]", frames)
+        return SkillResult(False, f"phase 2 (from_arm approach) failed [{reason}]", frames)
 
-    # Waypoint 2: to_arm APPROACH -- drives directly to receiving_point,
-    # offset to its own side, gripper open (ADR-036: same no-DESCEND
-    # reasoning as waypoint 1). ADR-035: staged exactly like waypoint 1 --
-    # this is the arm that has not moved yet this call (usually still at
-    # HOME), and is the one the diagnostic found actually needs it.
+    # === Phase 3: from_arm now held stationary AT the transfer point,
+    # STILL HOLDING THE OBJECT (a NEW frozen snapshot, taken the instant it
+    # arrives) -- while to_arm approaches the receiving point. See this
+    # function's own docstring, Phase 3, for the measured routing
+    # alternatives that were tried and NOT adopted here. ===
+    from_arm_hold = _hold_ctrl(env)
     ok, used, reason = _run_approach_with_staging(
         env, to_arm, receiving_point, open_frac, remaining, baseline, target_object=target_object,
+        hold_ctrl_base=from_arm_hold,
     )
     frames += used
     remaining -= used
     if not ok:
-        return SkillResult(False, f"waypoint 2 (to_arm approach) failed [{reason}]", frames)
+        return SkillResult(False, f"phase 3 (to_arm approach) failed [{reason}]", frames)
 
-    # Waypoint 3: to_arm GRIP -- close and, if a WeldGrasp was supplied,
+    # === Phase 4: to_arm GRIPs -- close and, if a WeldGrasp was supplied,
     # attempt attach every step until it engages or GRIP_HOLD_FRAMES runs
-    # out (ADR-030, same mechanism as run_pick's GRIP).
+    # out (ADR-030, same mechanism as run_pick's GRIP). from_arm remains
+    # frozen at from_arm_hold throughout. ===
     grip_start_frames = frames
     ok, used, reason, attach_frame_local = _run_dwell(
         env, to_arm, receiving_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,
         target_object=target_object, weld=weld, weld_object_name=body_name if weld is not None else None,
+        hold_ctrl_base=from_arm_hold,
     )
     frames += used
     remaining -= used
     attach_frame = grip_start_frames + attach_frame_local if attach_frame_local is not None else None
     if weld is not None and attach_frame is None:
         return SkillResult(
-            False, f"weld_attach_failed_after_{used}_frames", frames,
+            False, f"phase 4 (to_arm grip) weld_attach_failed_after_{used}_frames", frames,
             weld_attach_frame=None, weld_active_at_end=False,
         )
     if not ok:
         return SkillResult(
-            False, f"waypoint 3 (to_arm grip) failed [{reason}]", frames,
+            False, f"phase 4 (to_arm grip) failed [{reason}]", frames,
             weld_attach_frame=attach_frame, weld_active_at_end=False,
         )
 
-    # Waypoint 3a (ADR-030's transfer-safety gate): verify to_arm actually
+    # Phase 4a (ADR-030's transfer-safety gate): verify to_arm actually
     # holds the object, via the weld state itself, BEFORE from_arm is ever
     # asked to release. If this does not hold, fail immediately and leave
     # from_arm's weld untouched -- the object stays with from_arm rather
     # than risking a state where neither arm holds it.
     if weld is not None and weld.is_holding(to_arm) != body_name:
         return SkillResult(
-            False, "handoff_transfer_failed", frames,
+            False, "phase 4 (handoff_transfer_failed)", frames,
             weld_attach_frame=attach_frame, weld_active_at_end=False,
         )
 
-    # Waypoint 4: from_arm RELEASE. ADR-030: release the weld BEFORE
-    # commanding the jaw open (same ordering rationale as `place`), only
-    # reached once waypoint 3a above has confirmed to_arm holds the object.
+    # Phase 4b: from_arm RELEASEs -- weld released BEFORE the jaw opens
+    # (same ordering rationale as `place`'s RELEASE), only reached once 4a
+    # above has confirmed the transfer. to_arm is now the idle one (it has
+    # just gripped and must hold still while from_arm opens its own jaw),
+    # so a NEW frozen snapshot is taken here, the instant to_arm stops.
     if weld is not None:
         weld.release(from_arm)
+    to_arm_grip_hold = _hold_ctrl(env)
     ok, used, reason, _ = _run_dwell(
         env, from_arm, transfer_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,
-        target_object=target_object,
+        target_object=target_object, hold_ctrl_base=to_arm_grip_hold,
     )
     frames += used
     remaining -= used
     if not ok:
         return SkillResult(
-            False, f"waypoint 4 (from_arm release) failed [{reason}]", frames,
+            False, f"phase 4 (from_arm release) failed [{reason}]", frames,
             weld_attach_frame=attach_frame,
             weld_active_at_end=(weld.is_holding(to_arm) == body_name if weld is not None else False),
         )
 
-    # Waypoint 5: from_arm RETREAT -- goes FIRST (staggered), lifting
-    # CLEARANCE_HEIGHT_M further above the (now mid-air) transfer point.
-    # ADR-036 flag: 0.43 + 0.08 = 0.51 m has never been tested for
-    # reachability before this change; this is verified empirically by
-    # actually running the skill, not assumed to work because the arm
-    # already converged nearby.
-    from_retreat = transfer_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    # === Phase 5a: from_arm RETREATs FIRST (staggered), to a taller
+    # clearance than the usual CLEARANCE_HEIGHT_M so the total Euclidean
+    # distance from its gripperframe to transfer_point clears
+    # HANDOFF_RETREAT_GATE_M (measured requirement, see this function's
+    # docstring). to_arm is held at the SAME to_arm_grip_hold snapshot --
+    # it has not moved since Phase 4b. ===
+    from_retreat = transfer_point + np.array([0.0, 0.0, HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M])
     ok7, used, reason7 = _run_waypoint(
         env, from_arm, from_retreat, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
-        target_object=target_object,
+        target_object=target_object, hold_ctrl_base=to_arm_grip_hold,
     )
     frames += used
     remaining -= used
     if not ok7:
         return SkillResult(
-            False, f"waypoint 5 (from_arm retreat) failed [{reason7}]", frames,
+            False, f"phase 5 (from_arm retreat) failed [{reason7}]", frames,
             weld_attach_frame=attach_frame,
             weld_active_at_end=(weld.is_holding(to_arm) == body_name if weld is not None else False),
         )
 
-    # Waypoint 6: to_arm RETREAT -- goes SECOND (staggered), lifting the
-    # object away from the receiving point. Same ADR-036 untested-height flag
-    # as waypoint 5.
+    # Phase 5 gate: from_arm's gripper must measurably clear
+    # HANDOFF_RETREAT_GATE_M from transfer_point (Euclidean distance, the
+    # PHYSICALLY-REALIZED site position -- not assumed from the waypoint
+    # target) before to_arm is allowed to retreat.
+    site_from = _site_id(env.model, ik.gripperframe_site_name(from_arm))
+    from_arm_retreat_dist = float(np.linalg.norm(env.data.site_xpos[site_from] - transfer_point))
+    if from_arm_retreat_dist <= HANDOFF_RETREAT_GATE_M:
+        return SkillResult(
+            False,
+            f"phase 5 (from_arm retreat) did not clear the {HANDOFF_RETREAT_GATE_M} m gate before "
+            f"to_arm's retreat: from_arm_retreat_dist={from_arm_retreat_dist:.4f} m",
+            frames, weld_attach_frame=attach_frame,
+            weld_active_at_end=(weld.is_holding(to_arm) == body_name if weld is not None else False),
+        )
+
+    # === Phase 5b: to_arm RETREATs SECOND, now that from_arm has
+    # measurably cleared the shared workspace. from_arm is held at a FINAL
+    # frozen snapshot, taken the instant it finishes its own retreat. ===
+    from_arm_retreated_hold = _hold_ctrl(env)
     to_lift = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
     # target_object=target_object (M06a Fix B): to_arm is now LIFTING the
     # object it just gripped -- same rationale as pick's RETREAT above.
     ok8, used, reason8 = _run_waypoint(
         env, to_arm, to_lift, close_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
-        target_object=target_object,
+        target_object=target_object, hold_ctrl_base=from_arm_retreated_hold,
     )
     frames += used
     remaining -= used
@@ -1988,21 +2168,27 @@ def run_handoff(
     # directly, rather than inferring it from gripperframe proximity alone.
     weld_to_holding = weld.is_holding(to_arm) == body_name if weld is not None else False
     weld_from_holding = weld.is_holding(from_arm) == body_name if weld is not None else False
+    # ADR-037: "from_arm clear of the shared workspace at the end" is the
+    # SAME measured distance Phase 5's own gate already checked -- from_arm
+    # does not move again after Phase 5a (it is held frozen through Phase
+    # 5b), so this is still the correct end-of-call value, not stale.
+    from_arm_clear = from_arm_retreat_dist > HANDOFF_RETREAT_GATE_M
 
     measured = (
         f"z={final_z:.4f} (initial {initial_z:.4f}) dist_to_armA={dist_a:.4f} "
         f"dist_to_armB={dist_b:.4f} (to_arm={to_arm}) weld_holding_to_arm={weld_to_holding} "
-        f"weld_holding_from_arm={weld_from_holding}"
+        f"weld_holding_from_arm={weld_from_holding} from_arm_retreat_dist={from_arm_retreat_dist:.4f} "
+        f"from_arm_clear={from_arm_clear}"
     )
     if not ok8:
         return SkillResult(
-            False, f"waypoint 6 (to_arm retreat) failed [{reason8}]; {measured}", frames,
+            False, f"phase 5b (to_arm retreat) failed [{reason8}]; {measured}", frames,
             weld_attach_frame=attach_frame, weld_active_at_end=weld_to_holding,
         )
     if weld is not None:
-        success = lifted and closer_to_to_arm and weld_to_holding and not weld_from_holding
+        success = lifted and closer_to_to_arm and weld_to_holding and not weld_from_holding and from_arm_clear
     else:
-        success = lifted and closer_to_to_arm
+        success = lifted and closer_to_to_arm and from_arm_clear
     if success:
         return SkillResult(
             True, f"held by arm {to_arm}: {measured}", frames,
