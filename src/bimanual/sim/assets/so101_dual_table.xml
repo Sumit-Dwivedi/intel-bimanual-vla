@@ -427,5 +427,22 @@
     <key name="home" qpos="0.000000 -0.150000 0.000000 0.355000 1.000000 0.000000 0.000000 0.000000 0.050000 -0.030000 0.390000 1.000000 0.000000 0.000000 0.000000 -0.050000 0.050000 0.356000 1.000000 0.000000 0.000000 0.000000 0.000000 0.080000 0.356000 1.000000 0.000000 0.000000 0.000000 0.220000 0.000000 0.440000 1.000000 0.000000 0.000000 0.000000 0.000000 -1.200000 -1.600000 0.000000 0.000000 1.745329 0.000000 -1.200000 -1.600000 0.000000 0.000000 1.745329"/>
   </keyframe>
 
-  <equality/>
+  <!-- ADR-029 (weld-based grasping MECHANISM, Phase 1 -- see
+       src/bimanual/sim/grasp.py). All 10 (armX_gripper, prop) weld
+       constraints are pre-declared here, inactive, and toggled at runtime by
+       WeldGrasp. Nothing in this generated scene, and nothing that consumes
+       it as of this commit, activates one of these welds automatically --
+       wiring a weld into pick/place/handoff is Phase 2, out of scope here. -->
+  <equality>
+    <weld name="weld_armA_plate" body1="plate" body2="armA_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armA_mug" body1="mug" body2="armA_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armA_fork" body1="fork" body2="armA_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armA_spoon" body1="spoon" body2="armA_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armA_water_bottle" body1="water_bottle" body2="armA_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armB_plate" body1="plate" body2="armB_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armB_mug" body1="mug" body2="armB_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armB_fork" body1="fork" body2="armB_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armB_spoon" body1="spoon" body2="armB_gripper" active="false" solref="0.005 1"/>
+    <weld name="weld_armB_water_bottle" body1="water_bottle" body2="armB_gripper" active="false" solref="0.005 1"/>
+  </equality>
 </mujoco>

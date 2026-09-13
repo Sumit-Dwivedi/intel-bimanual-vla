@@ -11,6 +11,136 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-029 — Weld-based grasping mechanism (Phase 1: mechanism verified, not yet wired into skills)
+
+**Recorded:** Sept 13, 2026 · **Follows:** `docs/hardware/grasp-envelope.md` (0 of 30
+caliper thicknesses achieved sustained two-jaw contact -- the gripper's jaw meshes
+collapse to permanently-overlapping convex hulls, MuJoCo issue #239) and
+`DECISIONS.md`'s ADR-028 entry (finger-pad primitives fixed the geometry, verified
+6-132 mm pad separation sweep, but "no `pick()` reaches GRIP under the current
+approach-collision check" -- the arm's reach envelope plus the ~8 cm pinch-point
+kinematic offset, ADR-025, put every graspable target at the edge of what this 5-DOF
+IK can reach; `docs/hardware/m06-grip-diagnostic.md` and
+`m06-grip-diagnostic-after-fix.md`). **Phase 1 only** -- this entry covers the
+mechanism's own verification; wiring it into `pick`/`place`/`handoff` is Phase 2,
+contingent on this entry.
+
+**Context.** Contact-based grasping in this scene is not a code bug to keep chasing;
+it is a structural limit of the simulated gripper's geometry and this arm's
+kinematics, independently confirmed by two prior, unrelated diagnostics (the caliper
+sweep and the GRIP-stage instrumentation). A grasping mechanism is needed that
+abstracts the failing contact subsystem while preserving the rest of the
+perception-to-action pipeline.
+
+**Options.** (a) keep debugging contact-based grasping -- rejected, the limit is
+structural (reach envelope), not tactical; (b) reposition the arm bases -- rejected,
+4-6 h with an uncertain outcome, and it would restart cross-arm collision and
+reachability validation from scratch; (c) weld the object to the gripper via a MuJoCo
+equality constraint, toggled at runtime -- **chosen**, standard sim-robotics practice
+(MoveIt's attached objects, PyBullet's fixed constraints, academic sim-to-real work
+all abstract grasp contact the same way).
+
+**Decision (c), implemented as follows:**
+
+1. **`src/bimanual/sim/grasp.py`'s `WeldGrasp`** tracks at most one held object per
+   arm (`{'A': None, 'B': None}`). `attempt_grasp(arm, object_name,
+   distance_threshold_m=0.05, closure_threshold=0.3)` attaches only if BOTH gates
+   hold: the `armX_gripper` JOINT's qpos is below `closure_threshold` (jaws closing;
+   "open" is the HIGH end of this joint's range, so "below threshold" correctly reads
+   as "closing"), AND the `armX_gripper` BODY's (the fixed jaw, **not** the moving
+   jaw and **not** the joint of the same name -- the exact naming trap `ik.py` and
+   `GLOSSARY.md` already document) world position is within `distance_threshold_m` of
+   the object body's world position. It refuses, logging the specific reason,
+   otherwise. `release(arm)` deactivates the weld; `is_holding(arm)` reports it.
+   Refusing when either gate fails (never "always weld") is the entire point --
+   ADR-029's Consequences below.
+2. **Activation path: (a) pre-declared, chosen over (b) runtime creation.** All 10
+   `(armX_gripper, prop)` weld equality constraints (5 props x 2 arms) are declared
+   in the generated scene XML with `active="false"`, by
+   `scripts/gen_dual_scene.py`'s new `build_weld_constraints()` (HAND-AUTHORED region
+   only -- `scenes/so101/` is untouched, confirmed by `git diff --stat -- scenes/so101/`
+   before commit, same convention as every prior ADR-021/ADR-028 change).
+   `WeldGrasp` only ever toggles `data.eq_active` and rewrites `model.eq_data` for
+   constraints that already exist; option (b) (creating a constraint at runtime) was
+   never needed -- pre-declaring compiled without incident on the first try.
+3. **The eq_data teleport gotcha, resolved empirically for the installed
+   mujoco==3.2.7, not assumed from documentation.** `mjNEQDATA == 11`
+   (`mujoco/include/mujoco/mjmodel.h`): `eq_data[0:3]` = anchor, `eq_data[3:10]` =
+   relpose (3 position + 4 quaternion), `eq_data[10]` = torquescale -- but the shipped
+   headers do not document what "anchor" and "relpose" actually mean geometrically.
+   Determined by direct experiment (5 randomized-pose trials, weld `body1`=object /
+   `body2`=the reference body, gravity enabled, 3000-step rollout, position AND
+   orientation checked before/after): for `body1`=object, `body2`=gripper,
+   ```
+   anchor       = R(gripper_quat)^T @ (object_pos - gripper_pos)   # object's position
+                  in the gripper body's own local frame
+   relpose_pos  = (0, 0, 0)
+   relpose_quat = conj(object_quat) * gripper_quat                 # the GRIPPER's
+                  orientation expressed in the OBJECT's frame (reversed order
+                  relative to the naive "object relative to gripper" -- this was the
+                  one sign that a position-only teleport check would NOT have caught;
+                  it only shows up as orientation drift over many steps)
+   torquescale  = 1.0
+   ```
+   This held position to 2.7e-5 m (solver settling noise, not error) and orientation
+   exactly (quaternion delta 0.0) across 5 random trials, 3000 steps each, under
+   gravity. `mujoco`'s own `mju_rotVecQuat`/`mju_negQuat`/`mju_mulQuat` are used in
+   `grasp.py`, not hand-rolled quaternion math, so the implementation tracks MuJoCo's
+   own convention rather than a reimplementation of it.
+4. **`scripts/probe_weld_grasp.py`** verifies the mechanism end to end against the
+   real `TableSettingEnv`, with no skill layer involved. Full log:
+   `docs/hardware/m06-weld-verification.md`. Run on bm-ptl (ADR-020); mirrored
+   locally first (mujoco imports and compiles on this developer's laptop as of this
+   session, contrary to ADR-020's original finding -- noted, not relied upon; the
+   authoritative run and the committed artifacts are bm-ptl's).
+
+**Verification results, reported exactly as measured:**
+- **Teleport check:** fork position immediately before vs. after `attempt_grasp`
+  activates the weld: **0.000000 m** (both position components identical to 8
+  decimal places).
+- **Tracking:** stepping the arm up (see the finding below on how) for 50 steps, the
+  fork's world z rose from 0.3538 to 0.3551 m (+0.0013 m), tracking the gripper's own
+  rise (0.3810 -> 0.3824 m, +0.0013 m) essentially 1:1.
+- **Release:** `release('A')` returned `True`; `is_holding('A')` became `None`.
+  30 further steps showed the fork's z stop rising and settle down (0.3551 -> 0.3533 m).
+- **Negative control 1 (gripper OPEN, object in range):** `attempt_grasp` returned
+  `False`, logged reason "gripper not closed enough (joint qpos=1.7453 rad >=
+  closure_threshold=0.3000 rad)".
+- **Negative control 2 (gripper CLOSED, object far -- arm left at the "home" rest
+  pose):** `attempt_grasp` returned `False`, logged reason "too far (distance=0.5633 m
+  >= distance_threshold_m=0.0500 m)".
+- **MuJoCo warnings:** none, at any point in the run (`data.warning` checked, same
+  convention as `scripts/run_skill.py`'s diagnostic).
+
+**An honest, unplanned finding surfaced while building the verification script, worth
+recording because it is a real property of this system, not a defect in `WeldGrasp`:**
+`ik.solve_position_ik`'s pinch-point target (ADR-025), combined with ADR-024's fully
+relaxed orientation, let the redundant 5-DOF solve satisfy a progressively-rising
+pinch-point target by rotating the WRIST rather than raising the arm -- the pinch
+point tracked the rising target (solver residual under 0.01 m throughout) while the
+`armA_gripper` BODY (the actual weld attach frame) **fell**. `ik.py` is out of scope
+to modify for this task, so the verification script's UP phase instead drives
+`armA_shoulder_lift` directly (holding every other actuator at its current qpos),
+which reliably raises the whole downstream chain with no orientation ambiguity. The
+resulting rise is modest (millimetre-scale over 50 steps / 0.1 s sim time), consistent
+with the `sts3215` actuator class's own `forcerange=-2.94 2.94` N*m capping how fast
+one joint can lift the downstream mass against gravity in that time -- the same kind
+of actuator force ceiling `docs/hardware/grasp-envelope.md` already measured for the
+gripper actuator's own `forcerange=-3.35 3.35` N.
+
+**Consequences.** Grasping is now **abstracted, not physically simulated** --
+README and video must say so explicitly, per ADR-015's honesty rules (no number or
+description implies contact-based grasping where a weld is doing the work). Pick,
+place and handoff become executable end-to-end **once wired** (Phase 2, not this
+commit). ADR-028's finger-pad work is retained as scene correctness (the pads still
+move correctly and are still the physically modelled jaw geometry) even though grip
+contact itself is abstracted around. M07's randomization stays meaningful: arm poses
+and prop positions still vary session to session; only the attach *moment* is
+abstracted, not the scene state leading up to it. Nothing in `skills_scripted.py`,
+`executor.py`, `ik.py` or `scenes/so101/` was touched by this commit.
+
+---
+
 ## M06a fixes: target-prop exemption, complete jaw collision disable, fork test
 
 **Recorded:** Sept 12, 2026 · **Follows:** ADR-027 (waypoint staging),

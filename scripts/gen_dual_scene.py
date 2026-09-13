@@ -618,6 +618,65 @@ def find_wrist_body(arm_root, prefix):
     return b
 
 
+#: ADR-029 (weld-based grasping, Phase 1): the manipulable prop body names
+#: this scene declares -- see the hand-authored <body name="plate"|"mug"|
+#: "fork"|"spoon"|"water_bottle"> elements in TEMPLATE below.
+#: `build_weld_constraints()` runs before TEMPLATE is formatted, so this list
+#: is duplicated here rather than derived from the template string; a
+#: mismatch would surface immediately as a missing constraint name in
+#: `WeldGrasp`'s own constructor assertion (src/bimanual/sim/grasp.py), the
+#: same "kept in sync manually, checked loudly at the consumer" convention
+#: already used for PLATE_POS/MUG_POS/etc. below.
+WELD_PROP_NAMES = ("plate", "mug", "fork", "spoon", "water_bottle")
+
+
+def build_weld_constraints() -> str:
+    """ADR-029 (Phase 1, weld-based grasping MECHANISM only -- not wired into
+    any skill by this generator or by anything it produces): pre-declare all
+    10 `(armX_gripper, prop)` weld equality constraints, `active="false"`.
+
+    `src/bimanual/sim/grasp.py`'s `WeldGrasp` toggles `data.eq_active` and
+    rewrites `model.eq_data` at runtime; this generator's only job is to make
+    the 10 named constraints EXIST in the compiled model so
+    `mujoco.mj_name2id` can find them (`WeldGrasp.__init__` asserts all 10
+    resolve and raises loudly, naming exactly which are missing, if this
+    function's naming and `WeldGrasp`'s `weld_constraint_name()` ever drift
+    apart). The anchor/relpose/torquescale values declared here are
+    placeholders MuJoCo's `<weld>` element requires syntactically -- they are
+    ALWAYS overwritten by `WeldGrasp.attempt_grasp` before any weld is ever
+    activated; see that module's docstring for why (the eq_data "teleport
+    gotcha": activating a weld without first writing the CURRENT relative
+    pose into `eq_data` snaps the object to whatever pose `eq_data` already
+    held).
+
+    `body1` is the prop (the thing being attached); `body2` is
+    `arm{arm}_gripper` -- the FIXED jaw body driven by `wrist_roll`, NOT the
+    moving jaw (`arm{arm}_moving_jaw_so101_v1`) and NOT the `arm{arm}_gripper`
+    JOINT that drives that moving jaw (see `ik.py`'s and `grasp.py`'s
+    docstrings on this exact naming trap, already flagged in GLOSSARY.md).
+    `solref="0.005 1"` was chosen after an empirical check (5 randomized-pose
+    trials, gravity enabled, 3000-step rollout, outside this repo's committed
+    code) found it holds a welded body's position to within 2.7e-5 m and its
+    orientation exactly, against gravity, for that stiffness -- stiffer than
+    MuJoCo's own equality default (`solref="0.02 1"`), which is appropriate
+    here since the whole point of this constraint is to feel completely
+    rigid, not spring-like.
+    """
+    lines = []
+    for arm in ("A", "B"):
+        gripper_body = f"arm{arm}_gripper"
+        for prop in WELD_PROP_NAMES:
+            lines.append(
+                f'<weld name="weld_arm{arm}_{prop}" body1="{prop}" body2="{gripper_body}" '
+                f'active="false" solref="0.005 1"/>'
+            )
+    expected = len(("A", "B")) * len(WELD_PROP_NAMES)
+    assert len(lines) == expected == 10, (
+        f"ADR-029 expects exactly 10 weld constraints (2 arms x 5 props), got {len(lines)}"
+    )
+    return "\n    ".join(lines)
+
+
 def indent(elem, level=0):
     i = "\n" + level * "  "
     if len(elem):
@@ -729,6 +788,12 @@ def main():
     home_qpos = build_home_qpos(gripper_open_value)
     home_qpos_str = " ".join("%.6f" % v for v in home_qpos)
 
+    # ADR-029 (weld-based grasping, Phase 1): pre-declare all 10 weld
+    # equality constraints, inactive. See build_weld_constraints()'s own
+    # docstring; nothing downstream of this generator is wired to actually
+    # use them yet (that is Phase 2, out of scope here).
+    equality_xml = build_weld_constraints()
+
     out = TEMPLATE.format(
         arm_a=arm_a_xml,
         arm_b=arm_b_xml,
@@ -754,6 +819,7 @@ def main():
         home_qpos=home_qpos_str,
         drawer_housing_y=DRAWER_HOUSING_Y,
         drawer_housing_z=DRAWER_HOUSING_Z,
+        equality=equality_xml,
     )
     DEST.parent.mkdir(parents=True, exist_ok=True)
     DEST.write_text(out, newline="\n")
@@ -1030,7 +1096,15 @@ TEMPLATE = """<?xml version="1.0"?>
     <key name="home" qpos="{home_qpos}"/>
   </keyframe>
 
-  <equality/>
+  <!-- ADR-029 (weld-based grasping MECHANISM, Phase 1 -- see
+       src/bimanual/sim/grasp.py). All 10 (armX_gripper, prop) weld
+       constraints are pre-declared here, inactive, and toggled at runtime by
+       WeldGrasp. Nothing in this generated scene, and nothing that consumes
+       it as of this commit, activates one of these welds automatically --
+       wiring a weld into pick/place/handoff is Phase 2, out of scope here. -->
+  <equality>
+    {equality}
+  </equality>
 </mujoco>
 """
 
