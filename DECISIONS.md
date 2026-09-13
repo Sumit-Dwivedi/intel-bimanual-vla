@@ -11,6 +11,131 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-031 — IK freeze during GRIP dwell to prevent shifting-pinch-point retreat
+
+**Recorded:** Sept 13, 2026 · **Follows:** the "M06 Phase 2 follow-up" entry below
+(Bug 2, pinch-point gate fix, which measured but did not chase the root cause) ·
+**Touches:** `src/bimanual/control/skills_scripted.py`'s `_dwell` only. `ik.py`,
+`grasp.py`, `executor.py`, `scenes/so101/` are unchanged.
+
+**Context.** The prior entry's own instrumentation measured, during
+`pick(A, fork)`'s GRIP dwell, the pinch-point distance to the fork growing
+0.0351 -> 0.0793 m and the gripper-body distance growing 0.0299 -> 0.0795 m
+over the 300-step dwell -- both starting BELOW `WeldGrasp`'s 0.05 m proximity
+gate and ending ABOVE it. Root cause, confirmed by reading `ik.py` directly
+this session (not merely inferred): `ik.solve_position_ik` targets the PINCH
+POINT (ADR-025's midpoint of the fixed and moving jaw BODIES), recomputed
+fresh from the CURRENT qpos on every solve. As a GRIP dwell closes the jaw,
+the moving jaw body's own position shifts, so the midpoint shifts even though
+the dwell's target (`hold_pos`, a fixed point on the object) does not. The old
+`_dwell` loop re-solved IK every step to keep that SHIFTING midpoint pinned on
+the fixed target -- which means it kept commanding the ARM (not just the jaw)
+to move so the midpoint would track the jaw's own closing motion, i.e. the
+arm physically retreated as the jaws closed. Meanwhile the closure gate
+(`armX_gripper` qpos < 0.3) needs about 150 steps to close. The two gates
+therefore passed/failed on opposite ends of the dwell and never held true on
+the same frame, so `weld.attempt_grasp` never returned `True` and
+`weld_attach_frame` stayed `None`.
+
+**Decision.** `_dwell` now captures the driven arm's own 5 positioning-joint
+ctrl targets ONCE, before the dwell loop starts (reading `env.data.ctrl`,
+i.e. wherever the preceding APPROACH/DESCEND waypoint already converged and
+left the arm commanded), and reapplies that SAME frozen ctrl vector every
+step for the rest of the dwell -- no `ik.solve_position_ik` call at all
+inside the loop. Only the gripper joint's ctrl changes step to step, toward
+`gripper_fraction`. This applies to EVERY call of `_dwell` -- GRIP dwells
+(`run_pick`, `run_handoff`'s receiving-arm GRIP, `run_open_drawer`'s GRIP)
+and RELEASE dwells (`run_place`, `run_handoff`'s releasing-arm RELEASE,
+`run_open_drawer`'s RELEASE) alike, since all six route through the one
+shared `_dwell` implementation and the shifting-pinch-point problem is
+symmetric for an opening jaw. The idle-arm `_hold_ctrl` pattern (M06 Phase 2
+Commit 1) is unchanged and is a DIFFERENT mechanism (it governs the arm NOT
+being driven this call; ADR-031 freezes the arm that IS being driven, only
+during a GRIP/RELEASE dwell specifically).
+
+**Verification (bm-ptl), `pick(A, fork)`, seed=0, monkey-patched
+`WeldGrasp.attempt_grasp` instrumentation logging pinch-point distance and
+gripper qpos every 30 GRIP-dwell frames (scratch diagnostic, not shipped,
+same technique as the prior entry's own measurement):
+```
+GRIP frame 1:   pinch_point_distance=0.0351 m  gripper_qpos=1.7449 rad
+GRIP frame 30:  pinch_point_distance=0.0372 m  gripper_qpos=1.5992 rad
+GRIP frame 60:  pinch_point_distance=0.0374 m  gripper_qpos=1.3215 rad
+GRIP frame 90:  pinch_point_distance=0.0373 m  gripper_qpos=1.0065 rad
+GRIP frame 120: pinch_point_distance=0.0373 m  gripper_qpos=0.6807 rad
+GRIP frame 150: pinch_point_distance=0.0373 m  gripper_qpos=0.3519 rad
+```
+Distance now stays flat (~0.035-0.037 m, comfortably under the 0.05 m gate)
+instead of growing to 0.0793 m, while qpos falls steadily as the jaw closes
+-- direct evidence the freeze removed the retreat. Result:
+`success=True frames_used=1655 reason="lifted fork: initial_z=0.3560
+final_z=0.3989 ... weld_attach_frame=1155 weld_active_at_end=True"`,
+`is_holding('A')=='fork'`. `mj_warnings={}`,
+`max_joint_limit_violation=0.00039` (unchanged, negligible). This is the
+first `pick`/`place`/`handoff` call in this project to attach a weld and
+lift a prop past the WELD success threshold.
+
+**Also run (bm-ptl, seed=0), each its own genuinely different outcome, not
+chased further under this ADR's scope:**
+- `pick(A, mug)`: `success=False`, fails at waypoint 1 (approach),
+  `IK residual=0.0532 m` -- the pre-existing, already-documented arm-A
+  kinematic reach limit to `mug_at_rest` (ADR-027/`m06-reachability-probe.md`),
+  unrelated to GRIP dwell and unaffected by this fix (never reaches GRIP).
+- `pick(A, water_bottle)`: `success=False`,
+  `weld_attach_failed_after_300_frames`, `weld_attach_frame=None` -- reaches
+  GRIP but the gate still never fires for this object/offset combination;
+  bottle z fell 0.4400 -> 0.3684 during the dwell. A different, not-yet-
+  diagnosed proximity gap, flagged as a follow-up, not chased under this
+  session's scope (this ADR's job was the GRIP-freeze mechanism, verified
+  above on the fork).
+- `handoff(A->B, fork)`: `success=False`, fails at waypoint 3 (`to_arm`/arm B
+  APPROACH), `IK residual=0.0875 m` -- `from_arm` (A) had already picked the
+  fork successfully (its own nested `pick` succeeded, weld attached); the
+  failure is arm B's own reach limit to `receiving_point`, a different
+  kinematic gap from arm A's, surfaced only because arm A's GRIP now
+  actually completes.
+- `place(A, fork, destination=table)`: **`success=True`**,
+  `frames_used=3455`, `weld_attach_frame=1155`,
+  `weld_active_at_end=False` (released cleanly before jaw-open, per
+  ADR-030's ordering), final position `x=-0.0081 y=0.0203 z=0.3588`
+  (table-resting height, in-bounds).
+
+**Render.** `docs/images/m06-fork-lifted.png` (front camera, end-of-`pick`
+state, 1280x720). Reported honestly: at this camera's distance the fork is a
+small, thin white object near arm A's jaw and the frame does not, by itself,
+visually PROVE the lift the numeric z-delta already establishes -- it is
+included as a supporting artifact, not as independent confirmation.
+`docs/images/m06-handoff-complete.png` was NOT produced: `handoff` did not
+succeed (arm B's own reach limit above), and rendering a failed handoff would
+misrepresent it as the requested "complete" state.
+
+**`pytest tests/test_skills.py` (bm-ptl), before and after this change:
+identical, 4 passed / 4 failed, same four tests
+(`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`, `test_handoff_mug_ends_held_by_arm_b`),
+same reasons** (plate: `weld_attach_failed_after_300_frames` at
+`final_z=0.3524`, an ADR-024 grasp-reliability/offset gap specific to the
+plate, not the pinch-point-retreat mechanism this ADR fixes; drawer/mug: the
+same already-documented arm-A/arm-B kinematic reach limits). No shift in
+which tests pass, in either direction -- the four tests this suite already
+tracked as blocked by OTHER, separately-documented gaps remain blocked by
+those same gaps; this fix unblocks `fork` specifically (not covered by
+`test_skills.py`'s own four object choices) and is verified above via
+`scripts/run_skill.py`/a scratch instrumentation script instead.
+
+**Consequences.** `_dwell`'s per-step loop no longer calls
+`ik.solve_position_ik` at all -- a real behavioural narrowing (the arm
+cannot correct its OWN dwell-time drift by re-solving), justified because
+the thing it was "correcting" toward was itself the source of the retreat.
+The post-hoc `_validate_against_baseline` convergence check (run once, after
+the dwell, by `_run_dwell`) is unaffected -- it still re-solves IK once to
+report a residual for logging/validation purposes. This does not fix the
+plate's or water_bottle's own separate grasp-reliability gaps, or either
+arm's own kinematic reach limits -- those remain open, tracked by the ADRs
+that already found them (ADR-024, ADR-027 and the prior entry below).
+
+---
+
 ## M06 Phase 2 follow-up — Bug 1 (jaw hull collision) audited, found already fixed; Bug 2 (grasp gate) fixed to measure from the pinch point
 
 **Recorded:** Sept 13, 2026 · **Follows:** ADR-030 (weld wired into `pick`/`place`/

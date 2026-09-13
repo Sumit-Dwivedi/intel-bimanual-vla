@@ -137,6 +137,19 @@ it drives one arm while leaving the other's ctrl slice at 0.
 `scripts/probe_ctrl_hold.py` exercises exactly this reproduce-the-pattern
 case directly against `env.step()` (not through this module's own skill
 loops) and reports the measured idle-arm drift.
+
+**ADR-031: the ACTIVE arm is frozen during `_dwell` (GRIP/RELEASE), a
+different mechanism from `_hold_ctrl` above (which only ever governed the
+IDLE arm).** `b9e9cb4`'s own instrumentation found that re-solving
+`ik.solve_position_ik` every dwell step against a fixed target chases the
+PINCH POINT (ADR-025's midpoint of the fixed and moving jaw bodies), which
+physically shifts as the jaw opens or closes -- so the old dwell loop
+commanded the arm to retreat as the jaws closed, and `WeldGrasp`'s
+proximity gate and closure gate never held true on the same frame. `_dwell`
+now captures the driven arm's own 5 positioning-joint ctrl targets once,
+before the dwell starts, and holds that fixed value for every step of the
+dwell instead of re-solving IK -- see `_dwell`'s own docstring for the
+measured before/after distances.
 """
 
 from __future__ import annotations
@@ -735,15 +748,55 @@ def _dwell(
     `weld=None` (the default -- every RELEASE dwell, and `open_drawer`'s
     GRIP/RELEASE dwells, which have no weld concept) leaves this function's
     behavior identical to before this commit.
+
+    **ADR-031: arm frozen for the whole dwell -- `hold_pos` is no longer
+    re-solved against every step.** `ik.solve_position_ik` targets the
+    PINCH POINT (ADR-025: the midpoint of the fixed and moving jaw BODIES,
+    recomputed fresh from whatever the jaw's CURRENT open/closed angle is),
+    not a fixed point on the arm -- so as a GRIP dwell closes the jaw (or a
+    RELEASE dwell opens it), that midpoint physically shifts even though
+    `hold_pos` itself does not. The old per-step loop re-solved IK toward
+    the now-shifted-relative-to-`hold_pos` pinch point every step, which
+    means it kept commanding the ARM to move so the midpoint would track
+    the jaw's own motion -- i.e. the arm chased its own gripper closing,
+    walking backward as the jaws closed. Measured directly (b9e9cb4's
+    instrumentation, `pick(A, fork)`'s GRIP dwell): pinch-point distance to
+    the target grew 0.0351 -> 0.0793 m and gripper-body distance grew
+    0.0299 -> 0.0795 m over the dwell -- both starting BELOW `WeldGrasp`'s
+    0.05 m proximity gate and ending ABOVE it, while the jaw closure gate
+    (`qpos < 0.3`) needs about 150 steps to close -- so the two gates never
+    held true on the same frame and the weld never attached. Fix: capture
+    the arm's 5 positioning-joint ctrl targets ONCE, before this loop
+    starts (wherever the preceding APPROACH/DESCEND waypoint already
+    converged the arm to), and reapply that SAME frozen ctrl every step for
+    the rest of the dwell -- no IK solve at all during the loop. Only the
+    gripper joint's ctrl actually changes step to step (toward
+    `gripper_fraction`). This removes the feedback loop entirely: the arm
+    holds still (modulo ordinary PD droop under gravity, bounded by a fixed
+    setpoint rather than a moving one) while the jaw closes or opens freely
+    underneath it. Applies to EVERY call of this function -- GRIP dwells
+    (`run_pick`'s/`run_handoff`'s own GRIP, `open_drawer`'s GRIP) and
+    RELEASE dwells (`run_place`'s/`run_handoff`'s own RELEASE,
+    `open_drawer`'s RELEASE) alike, since `_dwell` is the one shared
+    implementation for both and the shifting-pinch-point problem is
+    symmetric: an opening jaw shifts the same midpoint the same way, and
+    the arm has no more business chasing it during RELEASE than during
+    GRIP.
     """
     gripper_ctrl = _gripper_ctrl(env.model, arm, gripper_fraction)
-    target = np.asarray(hold_pos, dtype=np.float64).reshape(3)
     target_body = OBJECT_BODY_NAME.get(target_object) if target_object is not None else None
     consecutive: dict[str, int] = {}
+
+    # ADR-031: freeze the arm's own 5 positioning-actuator ctrl targets for
+    # the whole dwell, read once here from `env.data.ctrl` (i.e. whatever
+    # the preceding waypoint already converged and left commanded) rather
+    # than re-solving IK toward `hold_pos` every step below.
+    arm_actuator_ids = [_actuator_id(env.model, name) for name in ik.arm_joint_names(arm)]
+    frozen_arm_ctrl = np.array([env.data.ctrl[aid] for aid in arm_actuator_ids], dtype=np.float64)
+
     for i in range(n_steps):
-        solution = ik.solve_position_ik(env.model, env.data, arm, target)
         ctrl = _hold_ctrl(env)
-        _write_arm_ctrl(ctrl, env.model, arm, solution.joint_angles, gripper_ctrl)
+        _write_arm_ctrl(ctrl, env.model, arm, frozen_arm_ctrl, gripper_ctrl)
         env.step(ctrl)
 
         if weld is not None and weld_object_name is not None:
@@ -1069,6 +1122,16 @@ def _run_dwell(
     `attach_frame` element (M06 Phase 2 Commit 2, ADR-030) is `_dwell`'s own
     dwell-LOCAL attach index, unchanged here (the caller adds its own
     running frame offset to report a whole-skill-call frame number).
+
+    **ADR-031: the arm no longer travels during this dwell.** `_dwell`
+    itself now freezes the arm's 5 positioning-joint ctrl targets for the
+    whole dwell instead of re-solving IK toward `hold_pos` every step (see
+    `_dwell`'s own docstring for the measured before/after numbers and why
+    -- the pinch point `ik.solve_position_ik` targets shifts as the jaw
+    opens/closes, so re-solving toward a fixed `hold_pos` was commanding the
+    arm to retreat). The post-hoc `_validate_against_baseline` call below is
+    unaffected: it still re-solves IK once, after the dwell, to report a
+    convergence residual for the waypoint's final resting pose.
 
     `target_object` is threaded to both `_dwell` (in-loop exemption) and
     `_validate_against_baseline` (post-hoc exemption) so this dwell's own
