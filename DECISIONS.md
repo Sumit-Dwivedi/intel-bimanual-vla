@@ -11,6 +11,114 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-036 — Raise `HANDOFF_POSITION_XYZ`'s z above the table (0.35 -> 0.43) to remove the ADR-035 arm-vs-table_top collision: the targeted collision is gone, but `handoff(A, B, fork)` now fails one waypoint EARLIER, at a NEW cross-arm collision — the fix relocated the failure rather than resolving it, reported honestly, not patched
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-035 (target interpolation in
+the `handoff` traverse, commit `f521775`) · **Modifies:**
+`src/bimanual/control/skills_scripted.py` only, per task scope
+
+**Diagnosis given, verified before changing anything.** ADR-035's own trace
+showed waypoint 4 (`to_arm`'s DESCEND) failing its 2nd/3rd interpolation
+step at target z=0.351 with a new `armB`-vs-`table_top` contact past
+`TABLE_COLLISION_DEPTH_TOL_M`. `HANDOFF_POSITION_XYZ = (0.0, -0.01, 0.35)`
+and `TABLE_SURFACE_Z = 0.35` are indeed the same number, confirmed by
+re-reading both constants (`skills_scripted.py`) before making any change —
+the transfer point sat exactly at tabletop height, and DESCEND was asking
+`to_arm` to put its wrist there.
+
+**Fix applied.** `HANDOFF_POSITION_XYZ`'s z: 0.35 -> 0.43 (`TABLE_SURFACE_Z +
+CLEARANCE_HEIGHT_M`) — the same height ADR-035's own fresh sweep already
+found as a converged, joint-limit-clean staging cell for BOTH arms
+(`HANDOFF_STAGING_Y_M`'s docstring), and the height waypoints 1/3 (APPROACH)
+were already driving to as `transfer_point + CLEARANCE_HEIGHT_M` before this
+change. Chosen over a fresh number specifically so the APPROACH waypoints'
+numeric targets would not change at all — only the now-redundant DESCEND
+step down to table height (the one that collided) would be removed. Checked
+per the task's own warning before concluding anything: with the transfer
+point now AT the old hover height, the separate hover-clearance term used to
+compute each APPROACH's target is gone (transfer_point IS the hover height
+now), so the retreat waypoints (5/6, formerly 7/8) are the only ones now
+targeting a genuinely new, previously-untested height
+(`0.43 + CLEARANCE_HEIGHT_M = 0.51`) — flagged explicitly in the code
+comments, not assumed safe.
+
+**DESCEND waypoints removed, not left as no-ops.** With `HANDOFF_POSITION_XYZ`
+raised to the hover height, the old DESCEND targets (`transfer_point` /
+`receiving_point` at z=0.35) became numerically identical to the preceding
+APPROACH targets (z=0.43 both now) — i.e. start == end, zero distance to
+interpolate. Per this task's own instruction ("removing them is reasonable
+— but say plainly that you removed them and why, rather than leaving dead
+waypoints that report success without moving"), the two DESCEND calls
+(`_run_interpolated_waypoint` invocations, old waypoints 2 and 4) were
+deleted outright and the skill's remaining waypoints renumbered 1-6 (was
+1-8) throughout `run_handoff`'s docstring and its `SkillResult` failure
+messages.
+
+**Verification run: `handoff(A, B, fork)` (`to_arm=B, from_arm=A`), via
+`scripts/probe_handoff_fork.py` (new, read-only, same
+`ScriptedSkillExecutor`/`SkillCall` path `tests/test_skills.py` and
+`scripts/probe_place_bottle.py` use), bm-ptl, seed 0, BEFORE and AFTER this
+change:**
+
+| waypoint (renumbered after this change) | BEFORE this change (probe run) | AFTER this change (probe run) |
+|---|---|---|
+| `pick(A, fork)` (nested) | succeeds, weld attaches | succeeds, weld attaches (unaffected) |
+| 1: `from_arm` (A) APPROACH to transfer point | converges (same numeric target both runs — unaffected by this diff) | converges |
+| old waypoint 2: `from_arm` (A) DESCEND to table-height transfer point | ran and converged in this probe (table-height transfer point still existed) | *(removed outright — no longer exists; see above)* |
+| old waypoint 3 / **new waypoint 2: `to_arm` (B) APPROACH to receiving point** | direct shot fails (residual 0.0875), staged to y=-0.06 SUCCEEDS (residual 0.0032), interpolates onward, all steps converge | direct shot fails (residual 0.0875, identical — unaffected by this change), staging to y=-0.06 now **FAILS with a NEW `cross_arm` collision (contacts=1 vs baseline 0)** |
+| old waypoint 4: `to_arm` (B) DESCEND to receiving point | reaches this waypoint, fails there with the ADR-035 `armB`-vs-`table_top` collision this task set out to fix | *(never reached in this run — skill now fails earlier, at new waypoint 2)* |
+
+**Net result: the diagnosed arm-vs-table_top collision at the old waypoint 4
+is confirmed gone — but `handoff(A, B, fork)` still does not complete.** It
+now fails one waypoint EARLIER than before (at the renumbered waypoint 2,
+`to_arm`'s APPROACH/staging), with a DIFFERENT failure kind: not a
+convergence failure, not a table collision, but a `cross_arm` contact
+between the two arms' own collision geometry. Root cause, confirmed by
+comparing to ADR-035's own trace rather than assumed: before this change,
+`from_arm` (A) had already DESCENDED away from the shared 0.43 m hover band
+down to table height (0.35) by the time `to_arm` (B) staged into that band —
+the two arms were never in the same z-plane at the same time. This change
+removed that DESCEND, so `from_arm` now sits AT the transfer point (0.43)
+holding the fork for the entire remainder of the skill, including while
+`to_arm` drives its own staging move through the SAME 0.43 m plane at
+y=-0.06 — and the two arms' geometry now intersects. **This is exactly the
+"relocate the collision" outcome the task instructions warned to check for
+explicitly, and it is what happened**, not the table collision resolving
+cleanly.
+
+**Also confirmed, per the task's own instruction to check rather than
+assume:** the retreat waypoints' new height (0.51 m, `CLEARANCE_HEIGHT_M`
+above the raised transfer point) was never reached in this run — the skill
+fails at waypoint 2, three waypoints before retreat — so this change
+neither confirms nor refutes reachability at 0.51 m; that remains untested.
+
+**Regression check.** `pytest tests/test_skills.py`: 4 passed / 4 failed,
+identical split and identical failure reasons to the pre-change baseline
+(the one handoff test in the suite, `test_handoff_mug_ends_held_by_arm_b`,
+still fails at the SAME earlier point, inside the nested `pick(A, mug)` call,
+for the unrelated, already-documented reason ADR-035/the test file's own
+docstring records — untouched by this change, since `run_pick` is not
+modified here). No change to `grasp.py`, `ik.py`, `executor.py`,
+`gen_dual_scene.py`, `scenes/so101/`, or `ARCHITECTURE.md`.
+
+**Not patched further, per this task's hard time cap and explicit
+instruction to stop and report rather than iterate.** A candidate next fix
+(stagger `from_arm`'s retreat to happen BEFORE `to_arm`'s APPROACH, rather
+than after `to_arm`'s GRIP/RELEASE as the skill currently orders things) is
+visible from this trace but has not been attempted or verified — recording
+it here as an unverified idea, not a recommendation, since the corrected
+brief for THIS task specified raising `HANDOFF_POSITION_XYZ`, not
+reordering the traverse. `handoff(A, B, fork)` remains unverified working
+end to end after two consecutive fix attempts (ADR-035, ADR-036); no
+`docs/images/m06-handoff-complete.png` was generated, since the task's own
+render step was conditioned on success. `handoff(B, A, fork)` was not
+attempted, since the same to_arm-approach failure this table diagnoses is
+symmetric in `from_arm`/`to_arm` roles and not expected to behave
+differently, and the task did not require it when the primary direction
+fails.
+
+---
+
 ## ADR-035 — Target interpolation in the `handoff` traverse: implemented per the corrected brief; genuinely progresses the skill three waypoints further, but `handoff(A, B, fork)` still fails at a NEW waypoint (arm-vs-table_top collision during `to_arm`'s interpolated descend) — reported honestly, not patched
 
 **Recorded:** Sept 13, 2026 · **Follows:** `2115a1e` (warm-start IK diagnostic,

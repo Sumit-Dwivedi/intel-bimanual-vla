@@ -461,19 +461,28 @@ PULL_DISTANCE_M = 0.15
 #: neither kind of case by accident.
 TABLE_COLLISION_DEPTH_TOL_M = 0.001
 
-#: ADR-027. World-frame (x, y, z) both arms drive toward during `handoff`'s
-#: presenting/receiving waypoints. y=-0.01 is the midpoint of the MEASURED
-#: shared reachable band, y in [-0.12, 0.10] m (`docs/hardware/
-#: m06-reachability-probe.md`'s "RE-MEASURED (ADR-026)" section, re-measured
-#: from the corrected "home" rest pose -- NOT the earlier, superseded
-#: ADR-021 arithmetic estimate). z=0.35 is `TABLE_SURFACE_Z`: handing an
-#: object off AT the table surface height, rather than
-#: `TABLE_SURFACE_Z + 0.10` as the pre-ADR-027 code used, keeps the
-#: transfer point inside the envelope both arms were actually measured to
-#: reach at low z (the same reachability constraint that blocks
-#: `open_drawer`'s lateral approach, see that function's docstring, also
-#: bounds how low a shared-band point can sit).
-HANDOFF_POSITION_XYZ = (0.0, -0.01, 0.35)
+#: **ADR-036: z raised 0.35 -> 0.43.** ADR-035 traced `handoff(A, B, fork)`'s
+#: remaining failure to this exact number: 0.35 is simultaneously
+#: `HANDOFF_POSITION_XYZ`'s z AND `TABLE_SURFACE_Z`, so the transfer point
+#: sat exactly at tabletop height, and `to_arm`'s DESCEND waypoint down onto
+#: it produced a real `armB`-vs-`table_top` contact past
+#: `TABLE_COLLISION_DEPTH_TOL_M` (waypoint 4, step 2/3, target z=0.351 --
+#: one millimetre above the slab). Two arms exchanging an object in mid-air
+#: never need to touch the table at all, so the fix moves the exchange
+#: itself off the tabletop plane: z=0.43 is `TABLE_SURFACE_Z +
+#: CLEARANCE_HEIGHT_M`, the SAME height ADR-035's own fresh sweep this
+#: session (`HANDOFF_STAGING_Y_M`'s docstring) already measured as a
+#: converged, joint-limit-clean staging cell for BOTH arms, and the height
+#: waypoints 1 and 3 (APPROACH) were already driving to before this change
+#: (as `transfer_point + CLEARANCE_HEIGHT_M`). Raising the transfer point to
+#: this already-verified height, rather than to some new number, means
+#: `run_handoff`'s APPROACH waypoints do not change AT ALL numerically --
+#: only the now-redundant DESCEND-to-table-height step (which is what
+#: collided) is removed, see `run_handoff`'s docstring and body. y=-0.01
+#: (the midpoint of the MEASURED shared reachable band, y in [-0.12, 0.10]
+#: m, `docs/hardware/m06-reachability-probe.md`'s "RE-MEASURED (ADR-026)"
+#: section) is unchanged -- only z moved.
+HANDOFF_POSITION_XYZ = (0.0, -0.01, 0.43)
 
 #: Gripper ctrl targets, expressed as a fraction of `armX_gripper`'s
 #: [low, high] `jnt_range` (so they scale automatically if the range ever
@@ -1772,34 +1781,46 @@ def run_handoff(
       1. `from_arm` picks the object up (nested `run_pick`, `weld` threaded
          through so `from_arm`'s own initial grasp attaches exactly like a
          standalone `pick`).
-      2. `from_arm` APPROACHes above `HANDOFF_POSITION_XYZ` at clearance
-         (ADR-035: staged via `_run_approach_with_staging` if it does not
-         converge in one shot).
-      3. `from_arm` DESCENDs to `HANDOFF_POSITION_XYZ` (ADR-035: interpolated
-         in `HANDOFF_INTERP_STEP_M` hops via `_run_interpolated_waypoint`).
-      4. `to_arm` APPROACHes above it, offset to the opposite side
-         (`HANDOFF_SIDE_OFFSET_M`) so the two jaws are not asked to occupy
-         the same point (ADR-024's handoff consequence); ADR-035 staging
-         applies here too -- this is usually the arm actually needing it,
-         since it has not moved yet this call.
-      5. `to_arm` DESCENDs.
-      6. `to_arm` GRIPs -- closes and attempts weld attach every step
+      2. `from_arm` APPROACHes `HANDOFF_POSITION_XYZ` directly (ADR-035:
+         staged via `_run_approach_with_staging` if it does not converge in
+         one shot). **ADR-036: no separate DESCEND waypoint follows this.**
+         Before ADR-036, `HANDOFF_POSITION_XYZ` sat at table height and this
+         APPROACH stopped at a hover `CLEARANCE_HEIGHT_M` above it, requiring
+         a second DESCEND waypoint down onto the table-height transfer point
+         -- exactly the waypoint whose final interpolation step collided
+         with `table_top` (ADR-035's finding). `HANDOFF_POSITION_XYZ` now
+         sits AT the old hover height (mid-air, not tabletop), so this single
+         APPROACH already ends at the real transfer point; a further DESCEND
+         would be a no-op (start == end) and has been removed rather than
+         left in as dead code that reports success without moving.
+      3. `to_arm` APPROACHes the receiving point directly (offset to the
+         opposite side of the transfer point via `HANDOFF_SIDE_OFFSET_M`,
+         same collision-avoidance rationale as before, ADR-024); ADR-035
+         staging applies here too -- this is usually the arm that actually
+         needs it, since it has not moved yet this call. **ADR-036: no
+         separate DESCEND follows this either, for the same reason as step 2.**
+      4. `to_arm` GRIPs -- closes and attempts weld attach every step
          (same mechanism as `run_pick`'s GRIP), until it attaches or
          `GRIP_HOLD_FRAMES` runs out.
-      6a. **ADR-030's transfer-safety gate**, new in this commit:
-          `weld.is_holding(to_arm) == body_name` is checked EXPLICITLY here,
-          BEFORE `from_arm` is ever asked to release. If it does not hold
-          (attach never engaged, or something released it in between), the
-          skill fails immediately with `handoff_transfer_failed` and
-          `from_arm`'s weld is left untouched -- the object stays with
-          `from_arm` rather than ending up held by neither arm.
-      7. `from_arm` RELEASEs -- `weld.release(from_arm)` is called BEFORE
+      4a. **ADR-030's transfer-safety gate**: `weld.is_holding(to_arm) ==
+          body_name` is checked EXPLICITLY here, BEFORE `from_arm` is ever
+          asked to release. If it does not hold (attach never engaged, or
+          something released it in between), the skill fails immediately
+          with `handoff_transfer_failed` and `from_arm`'s weld is left
+          untouched -- the object stays with `from_arm` rather than ending
+          up held by neither arm.
+      5. `from_arm` RELEASEs -- `weld.release(from_arm)` is called BEFORE
          the jaw is commanded open (same ordering rationale as `place`'s
-         RELEASE), only after step 6a has confirmed the transfer.
-      8. Both RETREAT, STAGGERED: `from_arm` retreats first, THEN `to_arm`
-         retreats -- sequential, not concurrent, so the two arms do not
-         cross paths on the way out while both are still near the transfer
-         point.
+         RELEASE), only after step 4a has confirmed the transfer.
+      6. Both RETREAT, STAGGERED, lifting `CLEARANCE_HEIGHT_M` further above
+         the (now mid-air) transfer/receiving point: `from_arm` retreats
+         first, THEN `to_arm` retreats -- sequential, not concurrent, so the
+         two arms do not cross paths on the way out while both are still
+         near the transfer point. **ADR-036 flag:** this retreat height
+         (`HANDOFF_POSITION_XYZ`'s new z=0.43 plus `CLEARANCE_HEIGHT_M`=0.08,
+         i.e. 0.51) has never been tested for reachability before this
+         change -- verified empirically as part of this task, not assumed;
+         see DECISIONS.md ADR-036 for the measured per-waypoint outcome.
 
     `weld=None` (the default) reproduces this module's pre-Commit-2
     behavior throughout (no attach attempts, no transfer gate, no release
@@ -1842,62 +1863,33 @@ def run_handoff(
     side = -1.0 if to_arm == "A" else 1.0  # arm A base at y=-0.25, arm B at y=+0.25
     receiving_point = transfer_point + np.array([0.0, side * HANDOFF_SIDE_OFFSET_M, 0.0])
 
-    # Waypoint 1: from_arm APPROACH -- above the transfer point at clearance
-    # height, still holding the object. ADR-035: staged if from_arm's HOME
-    # (or wherever it currently is) does not converge to this in one shot.
-    from_hover = transfer_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    # Waypoint 1: from_arm APPROACH -- drives directly to transfer_point
+    # (ADR-036: transfer_point now sits at the old hover height, mid-air,
+    # not table height, so no separate DESCEND follows -- see run_handoff's
+    # docstring). ADR-035: staged if from_arm's HOME (or wherever it
+    # currently is) does not converge to this in one shot.
     ok, used, reason = _run_approach_with_staging(
-        env, from_arm, from_hover, close_frac, remaining, baseline, target_object=target_object,
+        env, from_arm, transfer_point, close_frac, remaining, baseline, target_object=target_object,
     )
     frames += used
     remaining -= used
     if not ok:
         return SkillResult(False, f"waypoint 1 (from_arm approach) failed [{reason}]", frames)
 
-    # Waypoint 2: from_arm DESCEND -- to the transfer point exactly. ADR-035:
-    # interpolated in HANDOFF_INTERP_STEP_M hops from the live pose waypoint
-    # 1 just converged to (captured ONCE, here, before the loop -- not
-    # re-read inside it, which would be the Zeno bug the corrected brief
-    # flagged).
-    from_arm_site = _site_id(env.model, ik.gripperframe_site_name(from_arm))
-    descend_start = np.array(env.data.site_xpos[from_arm_site], dtype=np.float64, copy=True)
-    ok, used, reason = _run_interpolated_waypoint(
-        env, from_arm, descend_start, transfer_point, close_frac, remaining, baseline,
-        target_object=target_object,
-    )
-    frames += used
-    remaining -= used
-    if not ok:
-        return SkillResult(False, f"waypoint 2 (from_arm descend) failed [{reason}]", frames)
-
-    # Waypoint 3: to_arm APPROACH -- above the transfer point, offset to its
-    # own side, gripper open. ADR-035: staged exactly like waypoint 1 -- this
-    # is the arm that has not moved yet this call (usually still at HOME),
-    # and is the one the diagnostic found actually needs it.
-    to_hover = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
+    # Waypoint 2: to_arm APPROACH -- drives directly to receiving_point,
+    # offset to its own side, gripper open (ADR-036: same no-DESCEND
+    # reasoning as waypoint 1). ADR-035: staged exactly like waypoint 1 --
+    # this is the arm that has not moved yet this call (usually still at
+    # HOME), and is the one the diagnostic found actually needs it.
     ok, used, reason = _run_approach_with_staging(
-        env, to_arm, to_hover, open_frac, remaining, baseline, target_object=target_object,
+        env, to_arm, receiving_point, open_frac, remaining, baseline, target_object=target_object,
     )
     frames += used
     remaining -= used
     if not ok:
-        return SkillResult(False, f"waypoint 3 (to_arm approach) failed [{reason}]", frames)
+        return SkillResult(False, f"waypoint 2 (to_arm approach) failed [{reason}]", frames)
 
-    # Waypoint 4: to_arm DESCEND -- to the receiving point. ADR-035:
-    # interpolated the same way as waypoint 2, start captured once from
-    # to_arm's live pose right after waypoint 3 converged.
-    to_arm_site = _site_id(env.model, ik.gripperframe_site_name(to_arm))
-    descend_start_to = np.array(env.data.site_xpos[to_arm_site], dtype=np.float64, copy=True)
-    ok, used, reason = _run_interpolated_waypoint(
-        env, to_arm, descend_start_to, receiving_point, open_frac, remaining, baseline,
-        target_object=target_object,
-    )
-    frames += used
-    remaining -= used
-    if not ok:
-        return SkillResult(False, f"waypoint 4 (to_arm descend) failed [{reason}]", frames)
-
-    # Waypoint 5: to_arm GRIP -- close and, if a WeldGrasp was supplied,
+    # Waypoint 3: to_arm GRIP -- close and, if a WeldGrasp was supplied,
     # attempt attach every step until it engages or GRIP_HOLD_FRAMES runs
     # out (ADR-030, same mechanism as run_pick's GRIP).
     grip_start_frames = frames
@@ -1915,11 +1907,11 @@ def run_handoff(
         )
     if not ok:
         return SkillResult(
-            False, f"waypoint 5 (to_arm grip) failed [{reason}]", frames,
+            False, f"waypoint 3 (to_arm grip) failed [{reason}]", frames,
             weld_attach_frame=attach_frame, weld_active_at_end=False,
         )
 
-    # Waypoint 5a (ADR-030's transfer-safety gate): verify to_arm actually
+    # Waypoint 3a (ADR-030's transfer-safety gate): verify to_arm actually
     # holds the object, via the weld state itself, BEFORE from_arm is ever
     # asked to release. If this does not hold, fail immediately and leave
     # from_arm's weld untouched -- the object stays with from_arm rather
@@ -1930,9 +1922,9 @@ def run_handoff(
             weld_attach_frame=attach_frame, weld_active_at_end=False,
         )
 
-    # Waypoint 6: from_arm RELEASE. ADR-030: release the weld BEFORE
+    # Waypoint 4: from_arm RELEASE. ADR-030: release the weld BEFORE
     # commanding the jaw open (same ordering rationale as `place`), only
-    # reached once waypoint 5a above has confirmed to_arm holds the object.
+    # reached once waypoint 3a above has confirmed to_arm holds the object.
     if weld is not None:
         weld.release(from_arm)
     ok, used, reason, _ = _run_dwell(
@@ -1943,14 +1935,18 @@ def run_handoff(
     remaining -= used
     if not ok:
         return SkillResult(
-            False, f"waypoint 6 (from_arm release) failed [{reason}]", frames,
+            False, f"waypoint 4 (from_arm release) failed [{reason}]", frames,
             weld_attach_frame=attach_frame,
             weld_active_at_end=(weld.is_holding(to_arm) == body_name if weld is not None else False),
         )
 
-    # Waypoint 7: from_arm RETREAT -- goes FIRST (staggered), back to
-    # clearance height above the transfer point.
-    from_retreat = from_hover
+    # Waypoint 5: from_arm RETREAT -- goes FIRST (staggered), lifting
+    # CLEARANCE_HEIGHT_M further above the (now mid-air) transfer point.
+    # ADR-036 flag: 0.43 + 0.08 = 0.51 m has never been tested for
+    # reachability before this change; this is verified empirically by
+    # actually running the skill, not assumed to work because the arm
+    # already converged nearby.
+    from_retreat = transfer_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
     ok7, used, reason7 = _run_waypoint(
         env, from_arm, from_retreat, open_frac, min(APPROACH_DESCENT_STEPS, remaining), baseline,
         target_object=target_object,
@@ -1959,13 +1955,14 @@ def run_handoff(
     remaining -= used
     if not ok7:
         return SkillResult(
-            False, f"waypoint 7 (from_arm retreat) failed [{reason7}]", frames,
+            False, f"waypoint 5 (from_arm retreat) failed [{reason7}]", frames,
             weld_attach_frame=attach_frame,
             weld_active_at_end=(weld.is_holding(to_arm) == body_name if weld is not None else False),
         )
 
-    # Waypoint 8: to_arm RETREAT -- goes SECOND (staggered), lifting the
-    # object away from the transfer point.
+    # Waypoint 6: to_arm RETREAT -- goes SECOND (staggered), lifting the
+    # object away from the receiving point. Same ADR-036 untested-height flag
+    # as waypoint 5.
     to_lift = receiving_point + np.array([0.0, 0.0, CLEARANCE_HEIGHT_M])
     # target_object=target_object (M06a Fix B): to_arm is now LIFTING the
     # object it just gripped -- same rationale as pick's RETREAT above.
@@ -1999,7 +1996,7 @@ def run_handoff(
     )
     if not ok8:
         return SkillResult(
-            False, f"waypoint 8 (to_arm retreat) failed [{reason8}]; {measured}", frames,
+            False, f"waypoint 6 (to_arm retreat) failed [{reason8}]; {measured}", frames,
             weld_attach_frame=attach_frame, weld_active_at_end=weld_to_holding,
         )
     if weld is not None:
