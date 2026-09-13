@@ -138,6 +138,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"skill={args.skill} arm={args.arm} object={target_object} params={params} seed={args.seed}")
     print(f"result: success={result.success} frames_used={result.frames_used}")
     print(f"reason: {result.reason}")
+    # M06 Phase 2 Commit 2 (ADR-030): report the weld's own bookkeeping
+    # explicitly, not just buried inside `reason` -- a Tester needs "weld
+    # attached at frame N" visible even when the overall skill fails.
+    print(f"weld: attach_frame={result.weld_attach_frame} active_at_end={result.weld_active_at_end}")
 
     if body_name is not None and initial_z is not None:
         body_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, body_name)

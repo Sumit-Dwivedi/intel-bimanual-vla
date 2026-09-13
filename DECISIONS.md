@@ -11,6 +11,157 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-030 — Weld wiring into scripted skills (Phase 2 Commit 2)
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-029 (weld mechanism verified, Phase 1),
+M06 Phase 2 Commit 1 (ctrl-hold decision + measured drift gap).
+
+**Context.** ADR-029 built and verified `WeldGrasp` in isolation
+(`scripts/probe_weld_grasp.py`, `docs/hardware/m06-weld-verification.md`) but left it
+unwired: "deliberately NOT wired into `pick`/`place`/`handoff` or `executor.py`". This
+commit does that wiring and nothing else -- `ik.py`, `grasp.py` and `scenes/so101/` are
+untouched.
+
+**Decision.** `ScriptedSkillExecutor` constructs one `WeldGrasp` (`self.weld`), threaded
+into `skills_scripted.run_pick`/`run_place`/`run_handoff` as a `weld` parameter:
+- **`pick`'s GRIP** commands jaw closure, then calls `weld.attempt_grasp(arm, body_name)`
+  every step until it returns `True` (frame recorded) or `GRIP_HOLD_FRAMES` (300) is
+  exhausted, in which case the skill fails with the specific reason
+  `weld_attach_failed_after_N_frames` -- distinguishable from an ordinary
+  waypoint/collision failure.
+- **`place`'s RELEASE** calls `weld.release(arm)` BEFORE commanding the jaw open, so the
+  object is not kicked by the opening jaw's own moving collision geometry.
+- **`handoff`** grips-and-attaches on `to_arm` the same way as `pick`, then adds a new
+  gate BEFORE `from_arm` is ever released: `weld.is_holding(to_arm) == body_name` is
+  checked explicitly; if false, the skill fails immediately with `handoff_transfer_failed`
+  and `from_arm`'s weld is left untouched (object stays with `from_arm`, never ends up
+  held by neither arm). Only past that gate does `from_arm` release (again,
+  weld-then-jaws ordering) and the staggered retreat (`from_arm` first) proceed.
+- **`SkillResult`** gained `weld_attach_frame: int | None` (the whole-skill-call frame at
+  which `attempt_grasp` first returned `True`, or `None` if it never did) and
+  `weld_active_at_end: bool` (`weld.is_holding` re-checked at return time), both with
+  defaults so every pre-existing positional `SkillResult(...)` construction is unaffected.
+- **`pick`'s success bar changes when `weld` is supplied**: `final_z > TABLE_SURFACE_Z +
+  0.02` (a new constant, `WELD_PICK_SUCCESS_MARGIN_M`) AND `weld.is_holding(arm) ==
+  body_name` -- an absolute-height-from-table-surface bar, per this task's own
+  instructions, kept SEPARATE from the older initial-z-relative `PICK_LIFT_MARGIN_M`
+  (0.03) that `run_pick` still uses when `weld=None`. `handoff`'s success similarly gains
+  `weld.is_holding(to_arm) == body_name AND weld.is_holding(from_arm) is None` alongside
+  its existing distance/lift check.
+
+**Disclosed deviation: `ScriptedSkillExecutor.__init__` cannot construct `WeldGrasp`
+eagerly.** The instruction as given was "`__init__` constructs it as `self.weld`" --
+`WeldGrasp.__init__` requires a compiled `env` (it resolves equality-constraint/joint/
+body ids against `env.model`), and `ScriptedSkillExecutor.__init__` takes no `env`
+argument, matching every existing call site (`tests/test_skills.py`'s `executor()`
+fixture, `scripts/run_skill.py`) which construct `ScriptedSkillExecutor()` bare and
+supply `env` only later, per call, to `execute()`. `self.weld` therefore starts `None`
+and is built lazily the first time `execute()` sees an `env` (`_ensure_weld`), rebuilt
+only if a genuinely different `env` instance is later passed in. This is a correction to
+the literal instruction, not a silent substitution -- recorded here per this task's own
+"if the instructed text does not match what happened, correct it" rule.
+
+**Verification (bm-ptl, `C:\Users\devcloud\project\ov_env\Scripts\python.exe`).**
+
+- `pytest tests/test_skills.py`, BEFORE this commit's changes: **4 passed / 4 failed**
+  (`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+  `test_place_plate_returns_to_table_rest`, `test_handoff_mug_ends_held_by_arm_b` fail;
+  the other four pass) -- identical to Commit 1's own reported baseline.
+- `pytest tests/test_skills.py`, AFTER: **4 passed / 4 failed, same four tests.** The
+  drawer/mug-reach failures are byte-identical (kinematic reach limits this commit does
+  not touch). The plate pick/place failures changed REASON, not outcome: previously
+  `"did not lift plate: ... final_z=0.3523"`; now `weld_attach_failed_after_300_frames`
+  (`final_z=0.3524`) -- the weld mechanism now engages and is exercised, and still does
+  not attach for the plate's own rim-offset grasp point (see finding below); both are
+  failures, so no regression.
+- Isolated logic checks (FakeWeld stub, not the real `WeldGrasp` -- that mechanism's own
+  correctness is ADR-029's job, already verified): confirmed `_dwell` breaks early at the
+  exact step `attempt_grasp` first returns `True` and reports that step as `attach_frame`
+  (`attach_on_call=7` -> `steps_taken=7, attach_frame=7`, `attempt_grasp` never called an
+  8th time), reports `attach_frame=None` when it never attaches within budget, and that
+  `run_pick`'s cumulative frame offset is correct (`grip_start_frames + local_index`
+  measured as `1001` for a weld that attaches on its very first GRIP-dwell step, matching
+  independently observed APPROACH+DESCEND frame counts from the real run below).
+
+**New finding, measured directly, not assumed: for props whose grasp point IS reachable
+(fork, water_bottle), `pick`'s GRIP now runs to completion but `WeldGrasp`'s own
+proximity gate (`distance_threshold_m=0.05`, unmodified default) is missed by the time
+the closure gate opens.** `pick(A, fork)` and `pick(A, water_bottle)` both return
+`weld_attach_failed_after_300_frames` (frames_used=1300; GRIP_HOLD_FRAMES=300 exhausted).
+A direct instrumented replay of `pick(A, fork)`'s GRIP dwell (`armA_gripper` BODY-to-fork
+BODY distance, `armA_gripper` JOINT qpos, sampled every 20 steps) found:
+
+| step | gripper qpos | body-to-body distance |
+|---|---|---|
+| 0 (jaw still open) | 1.7449 | 0.0299 m |
+| 100 | 0.8876 | 0.0464 m |
+| 120 | 0.6697 | 0.0501 m |
+| 140 | 0.4506 | 0.0537 m |
+| 160 | 0.2309 (closure gate now open, <0.3) | 0.0574 m |
+| 299 (fully closed) | -0.1745 | 0.0795 m |
+
+The distance grows monotonically, from 0.0299 m (well inside the 0.05 m gate, jaw fully
+open) to 0.0795 m (jaw fully closed) -- and it crosses above 0.05 m (between step 120 and
+140) BEFORE the closure gate opens (between step 140 and 160). The two gates' passing
+windows do not overlap at these thresholds for this prop: by the time the jaw is closed
+enough to attempt attach, the fixed-jaw body has already drifted too far from the object
+to pass the proximity gate. **Root cause, not merely observed:** `ik.solve_position_ik`
+(unmodified, out of scope) targets the `armX_gripperframe` SITE (the pinch point), not
+the `armX_gripper` BODY `WeldGrasp`'s proximity gate reads (the naming-trap distinction
+`grasp.py`'s own docstring names). As the jaw closes, the redundant 5-DOF solve keeps the
+pinch-point SITE pinned at the grasp target by rotating the wrist -- and that same wrist
+rotation carries the fixed-jaw BODY away from the site (and therefore away from the
+object) at roughly 1.7 mm per closure step. This is the SAME site-vs-body divergence
+ADR-029's own docstring already documents for a different maneuver (driving the pinch
+point upward during LIFT); here it shows up during jaw CLOSURE instead. `pick(A, mug)`
+fails earlier and for an unrelated, already-documented reason (`waypoint 1 (approach)
+failed [convergence]` -- the pre-existing kinematic reach limit ADR-024/ADR-027 recorded).
+`handoff(A, B, fork)` and `place(A, fork, table)` both fail as a direct, expected
+consequence of the nested `pick` failing the same way (`weld_attach_failed_after_300_frames`
+surfaces through `"handoff aborted: pick by arm A failed (...)"` /
+`"place aborted: pick failed (...)"`), never reaching their own weld-specific gates
+(`handoff`'s transfer check, `place`'s release-before-open ordering) in this run.
+
+**Per this task's own instruction, this gap was NOT closed by loosening
+`attempt_grasp`'s gates.** `distance_threshold_m`/`closure_threshold` were left at
+`WeldGrasp`'s own defaults (0.05 m / 0.3 rad) exactly as ADR-029 designed and verified
+them; `scripts/probe_weld_grasp.py`'s own positive-path verification of the fork used a
+DIFFERENT technique (`_drive_gripper_body_to_target`, driving the gripper BODY directly)
+than `skills_scripted.py`'s site-targeting `ik.solve_position_ik` path -- the divergence
+between the mechanism's own verified test harness and the skill layer's actual IK-driving
+pattern is this commit's real finding, not a wiring defect to be patched around by
+loosening a threshold.
+
+**`_hold_ctrl` drift (Commit 1) remains an open, compounding risk specifically for
+`handoff`, not newly measured this session:** because no attach ever completed in this
+run, `handoff`'s from-arm-idle-while-to-arm-moves window (where the drift matters most,
+per Commit 1's own entry) was never actually reached with an object held. The risk stands
+exactly as Commit 1 recorded it -- not re-measured, not resolved.
+
+**Renders.** `docs/images/m06-phase2-fork-lifted.png` (after `pick(A, fork)`) and
+`docs/images/m06-phase2-handoff-complete.png` (after `handoff(A, B, fork)`), both front
+camera, 1280x720, both produced. **Neither shows what its filename claims, reported
+plainly rather than implied:** both renders are visually near-identical -- arm A hovering
+at clearance height above the STILL-RESTING fork (RETREAT ran after a failed GRIP, per
+`run_pick`'s structure), arm B still at its rest pose off to the side (`handoff` aborted
+inside the nested `from_arm` pick, before arm B's own APPROACH waypoint ever ran). At this
+camera's distance the fork itself is a few pixels and not reliably distinguishable from
+the tabletop by eye in either image -- this is stated here rather than left to imply a
+visual confirmation neither render actually provides.
+
+**Consequences.** Physical grasping stays abstracted (ADR-029) and, per ADR-015, the
+README must disclose it -- **not done in this commit**: `README.md` is currently a
+placeholder status doc owned by docs-writer per the agent assignment model
+(`PLAN.md` section 2), and updating it is out of Builder's role; flagged here so it is
+not silently dropped. `pick`/`place`/`handoff` are now wired end-to-end through the weld
+abstraction and will complete successfully for a prop whose grasp geometry keeps the two
+`WeldGrasp` gates' passing windows overlapping -- fork and water_bottle, as wired and
+measured this session, do not; whether any prop's grasp offset can be retargeted to
+produce an overlapping window (without touching `ik.py`/`grasp.py`) is an open follow-up,
+not attempted here (out of this commit's scope: wiring, not re-tuning grasp geometry).
+
+---
+
 ## M06 Phase 2 Commit 1 — safety scaffolding: `_hold_ctrl` kept (not replaced), APPROACH clearance reduction tried and reverted (follows ADR-010, ADR-027; per `docs/hardware/m06-phase2-prerequisites.md`)
 
 **Recorded:** Sept 13, 2026. **Scope:** scaffolding only, no weld wiring (Phase 2 Commit 2 is separate).

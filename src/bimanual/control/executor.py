@@ -14,6 +14,25 @@ exactly one concrete implementation today.
 it here returns a clearly-labelled failed `SkillResult` rather than raising,
 so a caller iterating a `TaskPlan` that happens to include `pour` gets a
 readable "not implemented yet" instead of a crash.
+
+**M06 Phase 2 Commit 2 (ADR-030): `WeldGrasp` wiring.** `pick`, `place` and
+`handoff` now attach/release props via `bimanual.sim.grasp.WeldGrasp`
+(ADR-029's mechanism), threaded through from here. `WeldGrasp.__init__`
+needs a compiled `env` (it resolves equality-constraint/joint/body ids
+against `env.model`, see `grasp.py`) which this class's own `__init__` does
+not receive -- every caller in this repo (`tests/test_skills.py`'s
+`executor()` fixture, `scripts/run_skill.py`) constructs
+`ScriptedSkillExecutor()` with no arguments and only supplies `env` later,
+per call, to `execute()`. So `self.weld` starts `None` in `__init__` and is
+lazily constructed the first time `execute()` sees an `env` -- rebuilt if a
+DIFFERENT `env` instance ever comes through the same executor (a fresh
+`WeldGrasp` per compiled model), but reused across repeated calls against
+the SAME `env` (e.g. a `TaskPlan` with several skills run one after
+another), since `reset()` does not recompile the model and the resolved
+ids stay valid. This is a deliberate, disclosed departure from a literal
+reading of "`__init__` constructs it as `self.weld`" -- constructing it
+eagerly in `__init__` is not possible without an `env` argument this class
+has never taken, and adding one would break every existing call site.
 """
 
 from __future__ import annotations
@@ -25,6 +44,7 @@ from bimanual.control import skills_scripted as skills
 from bimanual.control.skills_scripted import SkillResult
 from bimanual.language.grounder import UngroundedCommandError
 from bimanual.language.skills import SkillCall
+from bimanual.sim.grasp import WeldGrasp
 
 
 class SkillExecutor(ABC):
@@ -54,6 +74,19 @@ _SUPPORTED_SKILLS = ("open_drawer", "pick", "place", "handoff")
 class ScriptedSkillExecutor(SkillExecutor):
     """IK-driven scripted skills -- the shipped policy under ADR-023."""
 
+    def __init__(self) -> None:
+        # See this module's docstring (ADR-030) for why this cannot be a
+        # constructed `WeldGrasp` yet: no `env` exists at this point.
+        self.weld: WeldGrasp | None = None
+
+    def _ensure_weld(self, env) -> WeldGrasp:
+        """Return `self.weld`, constructing (or reconstructing, if `env`
+        is a different instance than last time) it on demand.
+        """
+        if self.weld is None or self.weld.env is not env:
+            self.weld = WeldGrasp(env)
+        return self.weld
+
     def execute(self, skill_call: SkillCall, env, step_budget: int = ik.DEFAULT_STEP_BUDGET) -> SkillResult:
         # Vision-based skills out of scope per ADR-023. All skills execute
         # state-only for ~0.20ms/step budget.
@@ -69,8 +102,9 @@ class ScriptedSkillExecutor(SkillExecutor):
             "this executor reads only privileged state and never renders."
         )
 
+        weld = self._ensure_weld(env)
         try:
-            return self._dispatch(skill_call, env, step_budget)
+            return self._dispatch(skill_call, env, step_budget, weld)
         except UngroundedCommandError:
             # This layer never calls the Grounder, so UngroundedCommandError
             # cannot legitimately originate here today -- but it subclasses
@@ -86,17 +120,24 @@ class ScriptedSkillExecutor(SkillExecutor):
             return SkillResult(False, f"ValueError: {exc}", 0)
 
     @staticmethod
-    def _dispatch(skill_call: SkillCall, env, step_budget: int) -> SkillResult:
+    def _dispatch(skill_call: SkillCall, env, step_budget: int, weld: WeldGrasp) -> SkillResult:
+        # `weld` (ADR-030): threaded to every skill that grasps. `open_drawer`
+        # does not take one -- the drawer is not a `WeldGrasp.GRASPABLE_OBJECTS`
+        # prop (slide joint, not free joint, ADR-029) -- so it is left exactly
+        # as M06a built it.
         if skill_call.skill == "open_drawer":
             return skills.run_open_drawer(env, arm=skill_call.arm, step_budget=step_budget)
 
         if skill_call.skill == "pick":
-            return skills.run_pick(env, skill_call.arm, skill_call.target_object, step_budget=step_budget)
+            return skills.run_pick(
+                env, skill_call.arm, skill_call.target_object, step_budget=step_budget, weld=weld
+            )
 
         if skill_call.skill == "place":
             destination = skill_call.params.get("destination", "table")
             return skills.run_place(
-                env, skill_call.arm, skill_call.target_object, destination=destination, step_budget=step_budget
+                env, skill_call.arm, skill_call.target_object, destination=destination, step_budget=step_budget,
+                weld=weld,
             )
 
         if skill_call.skill == "handoff":
@@ -109,6 +150,7 @@ class ScriptedSkillExecutor(SkillExecutor):
                 from_arm=from_arm,
                 target_object=skill_call.target_object,
                 step_budget=step_budget,
+                weld=weld,
             )
 
         return SkillResult(

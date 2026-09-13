@@ -148,6 +148,7 @@ import mujoco
 import numpy as np
 
 from bimanual.control import ik
+from bimanual.sim.grasp import WeldGrasp
 
 logger = logging.getLogger(__name__)
 
@@ -169,11 +170,29 @@ class SkillResult:
             skill. This is the step-BUDGET unit (PLAN.md M06 done-when 3),
             not a wall-clock duration -- comparable across runs and
             machines regardless of host speed.
+        weld_attach_frame: M06 Phase 2 Commit 2 (ADR-030). The GLOBAL
+            (whole-skill-call, not phase-local) `frames_used` count at the
+            instant `WeldGrasp.attempt_grasp` first returned True for this
+            skill's own grasp, or `None` if it never attached (either
+            because the skill never reached a GRIP waypoint, or it reached
+            one and exhausted `GRIP_HOLD_FRAMES` without attaching). This is
+            what makes "attached late" and "never attached" distinguishable
+            from a plain `success=False` -- see this module's `_dwell`/
+            `_run_dwell` docstrings for how it is measured.
+        weld_active_at_end: M06 Phase 2 Commit 2. Whether the relevant arm
+            (the acting arm for `pick`, the RECEIVING arm for `handoff`)
+            still holds the object via an active weld at the moment this
+            `SkillResult` is returned -- i.e. `weld.is_holding(arm) ==
+            object_name`, re-checked at return time rather than inferred
+            from `weld_attach_frame` alone (a later RELEASE, or a transfer
+            failure, can make the two disagree).
     """
 
     success: bool
     reason: str
     frames_used: int
+    weld_attach_frame: int | None = None
+    weld_active_at_end: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -682,14 +701,17 @@ def _dwell(
     gripper_fraction: float,
     n_steps: int,
     target_object: str | None = None,
-) -> tuple[int, dict]:
+    weld: WeldGrasp | None = None,
+    weld_object_name: str | None = None,
+) -> tuple[int, dict, int | None]:
     """Hold `arm`'s gripperframe near `hold_pos` for `n_steps`, commanding
     `gripper_fraction` on the jaw throughout. Used to let a grasp/release
     settle (contact + PD) without asking the arm to travel anywhere.
-    Returns `(steps_taken, prop_violations)`; `steps_taken` may be less than
-    `n_steps` if the caller is out of step budget (callers pass
-    `min(N, remaining)`) or if a prop violation (ADR-027 Step 5, checked
-    every step -- see `_drive_to_target`'s docstring) cuts the dwell short.
+    Returns `(steps_taken, prop_violations, attach_frame)`; `steps_taken`
+    may be less than `n_steps` if the caller is out of step budget (callers
+    pass `min(N, remaining)`), if a prop violation (ADR-027 Step 5, checked
+    every step -- see `_drive_to_target`'s docstring) cuts the dwell short,
+    or (M06 Phase 2 Commit 2) if `weld.attempt_grasp` attaches.
 
     `target_object` names the skill's OWN current target (e.g. `"plate"`
     during `pick`'s GRIP dwell) so that dwell's deliberate, expected contact
@@ -699,6 +721,20 @@ def _dwell(
     deep enough to indicate crushing rather than grasping is still a
     failure. `None` (the default, used by `open_drawer`, whose target is
     not a free-joint prop) applies the tight bar to every prop.
+
+    `weld`/`weld_object_name` (M06 Phase 2 Commit 2, ADR-030): if both are
+    given, every step (after `env.step()`, so it sees the jaw's
+    just-commanded closure) calls `weld.attempt_grasp(arm, weld_object_name)`.
+    The FIRST step this returns True, the dwell stops immediately (a
+    successful grasp does not need to keep dwelling) and the 1-based,
+    dwell-LOCAL step index is returned as `attach_frame` (the caller adds
+    its own frame offset to make this a whole-skill-call count, per
+    `SkillResult.weld_attach_frame`'s docstring). If `n_steps` is exhausted
+    without attaching, `attach_frame` is `None` -- the caller reports this
+    as a `weld_attach_failed_after_N_frames` failure, not a generic one.
+    `weld=None` (the default -- every RELEASE dwell, and `open_drawer`'s
+    GRIP/RELEASE dwells, which have no weld concept) leaves this function's
+    behavior identical to before this commit.
     """
     gripper_ctrl = _gripper_ctrl(env.model, arm, gripper_fraction)
     target = np.asarray(hold_pos, dtype=np.float64).reshape(3)
@@ -709,6 +745,10 @@ def _dwell(
         ctrl = _hold_ctrl(env)
         _write_arm_ctrl(ctrl, env.model, arm, solution.joint_angles, gripper_ctrl)
         env.step(ctrl)
+
+        if weld is not None and weld_object_name is not None:
+            if weld.attempt_grasp(arm, weld_object_name):
+                return i + 1, {}, i + 1
 
         # ADR-027 Step 5 / M06a Fix B: a GRIP/RELEASE dwell is EXPECTED to
         # contact the skill's own current target object (that is the whole
@@ -722,8 +762,8 @@ def _dwell(
         violations = _prop_collision_violations(env, target_body=target_body)
         confirmed = _debounce_prop_violations(consecutive, violations)
         if confirmed:
-            return i + 1, confirmed
-    return n_steps, {}
+            return i + 1, confirmed, None
+    return n_steps, {}, None
 
 
 # ---------------------------------------------------------------------------
@@ -1020,17 +1060,30 @@ def _run_dwell(
     n_steps: int,
     baseline: dict,
     target_object: str | None = None,
-) -> tuple[bool, int, str | None]:
+    weld: WeldGrasp | None = None,
+    weld_object_name: str | None = None,
+) -> tuple[bool, int, str | None, int | None]:
     """Dwell at `hold_pos` (a GRIP or RELEASE waypoint, ADR-027) while
     opening/closing the jaw, then validate exactly like `_run_waypoint`.
+    Returns `(ok, frames_used, reason, attach_frame)` -- the extra
+    `attach_frame` element (M06 Phase 2 Commit 2, ADR-030) is `_dwell`'s own
+    dwell-LOCAL attach index, unchanged here (the caller adds its own
+    running frame offset to report a whole-skill-call frame number).
 
     `target_object` is threaded to both `_dwell` (in-loop exemption) and
     `_validate_against_baseline` (post-hoc exemption) so this dwell's own
     deliberate contact with the object it is picking/placing/handing off is
     never itself reported as a violation (ADR-027 Step 5) -- an UNEXPECTED
     prop (or the target at a genuinely violent depth mid-dwell) still is.
+
+    `weld`/`weld_object_name` (M06 Phase 2 Commit 2): passed straight
+    through to `_dwell`; `None` (the default) leaves this function's
+    behavior identical to before this commit.
     """
-    steps, in_loop_violations = _dwell(env, arm, hold_pos, gripper_fraction, n_steps, target_object=target_object)
+    steps, in_loop_violations, attach_frame = _dwell(
+        env, arm, hold_pos, gripper_fraction, n_steps, target_object=target_object,
+        weld=weld, weld_object_name=weld_object_name,
+    )
     if in_loop_violations:
         named = ", ".join(
             f"{name} (dist={depth:.4f} m)" for name, depth in sorted(in_loop_violations.items())
@@ -1040,15 +1093,15 @@ def _run_dwell(
             "dwell arm=%s target=%s frames_used=%d ok=False reason=%s",
             arm, np.round(np.asarray(hold_pos, dtype=np.float64), 4).tolist(), steps, reason,
         )
-        return False, steps, reason
+        return False, steps, reason, attach_frame
 
     ok, reason, residual = _validate_against_baseline(env, arm, hold_pos, baseline, target_object=target_object)
     logger.info(
-        "dwell arm=%s target=%s frames_used=%d ik_residual=%.4f ok=%s%s",
+        "dwell arm=%s target=%s frames_used=%d ik_residual=%.4f ok=%s%s attach_frame=%s",
         arm, np.round(np.asarray(hold_pos, dtype=np.float64), 4).tolist(), steps, residual, ok,
-        "" if ok else f" reason={reason}",
+        "" if ok else f" reason={reason}", attach_frame,
     )
-    return ok, steps, reason
+    return ok, steps, reason, attach_frame
 
 
 # ---------------------------------------------------------------------------
@@ -1056,16 +1109,56 @@ def _run_dwell(
 # ---------------------------------------------------------------------------
 
 
-def run_pick(env, arm: str, target_object: str, step_budget: int = ik.DEFAULT_STEP_BUDGET) -> SkillResult:
+#: M06 Phase 2 Commit 2 (ADR-030). How far above `TABLE_SURFACE_Z` the
+#: object's final z must sit for `pick` to count as a physical lift, once a
+#: weld is wired in. Deliberately a SEPARATE constant from the older,
+#: initial-z-relative `PICK_LIFT_MARGIN_M`: this commit's task instructions
+#: specify the pick success bar as an ABSOLUTE height above the table
+#: surface ("object z > table_surface + 0.02"), not a margin above whatever
+#: height this particular prop happened to rest at. The two are close in
+#: practice (every prop rests within about 4 mm of the table surface) but
+#: are not the same formula, so both constants are kept, each doing the job
+#: it was specified for. See `m06-ik-lift-diagnostic.md`/
+#: `m06-weld-verification.md` (referenced in DECISIONS.md's ADR-029/Phase 2
+#: entries) for why even this 0.02 m bar is expected to be hard to clear
+#: under the incremental IK regime `_drive_to_target`/`_dwell` both use.
+WELD_PICK_SUCCESS_MARGIN_M = 0.02
+
+
+def run_pick(
+    env,
+    arm: str,
+    target_object: str,
+    step_budget: int = ik.DEFAULT_STEP_BUDGET,
+    weld: WeldGrasp | None = None,
+) -> SkillResult:
     """pick(object, arm): APPROACH (clearance above the grasp point) ->
-    DESCEND (onto it) -> GRIP (close + hold) -> RETREAT (back to clearance
-    height) (ADR-027, tutor note 06's approach/grip/retreat pattern).
+    DESCEND (onto it) -> GRIP (close + attempt weld attach) -> RETREAT (back
+    to clearance height) (ADR-027, tutor note 06's approach/grip/retreat
+    pattern; weld attach is M06 Phase 2 Commit 2, ADR-030).
 
     Targets the object body named in `OBJECT_BODY_NAME`, offset by
     `GRASP_POINT_OFFSET_M` to a small graspable feature (see module
-    docstring). Success: the object's world z rises at least
-    `PICK_LIFT_MARGIN_M` above its own height measured at the start of
-    this call, AND every waypoint below cleared both validation bars.
+    docstring).
+
+    `weld` (ADR-030): if given, GRIP repeatedly calls
+    `weld.attempt_grasp(arm, body_name)` (every step, after commanding jaw
+    closure) until it attaches or `GRIP_HOLD_FRAMES` is exhausted. Failing
+    to attach is reported as its own distinguishable reason,
+    `weld_attach_failed_after_N_frames`, rather than folded into a generic
+    "grip failed" -- a Tester needs to tell "the weld mechanism never
+    engaged" apart from "an arm-motion/collision failure happened first".
+    `weld=None` (the default, e.g. a caller with no `WeldGrasp` instance)
+    reproduces this module's pre-Commit-2 behavior: GRIP is a plain
+    close-and-dwell with no attach attempt, and `success` falls back to a
+    lift-only check.
+
+    Success (with `weld` given): the object's world z ends above
+    `TABLE_SURFACE_Z + WELD_PICK_SUCCESS_MARGIN_M` AND
+    `weld.is_holding(arm) == body_name` -- i.e. it is both physically lifted
+    and still confirmed held, not merely "was welded at some earlier frame".
+    Success (with `weld=None`): the older initial-z-relative
+    `PICK_LIFT_MARGIN_M` check, unchanged from before this commit.
     """
     frames = 0
     body_name = OBJECT_BODY_NAME.get(target_object)
@@ -1101,15 +1194,30 @@ def run_pick(env, arm: str, target_object: str, step_budget: int = ik.DEFAULT_ST
     if not ok:
         return SkillResult(False, f"waypoint 2 (descend) failed [{reason}]", frames)
 
-    # Waypoint 3: GRIP -- close the jaw and hold so contact/friction settles
-    # before the arm is asked to move again.
-    ok, used, reason = _run_dwell(
-        env, arm, grasp_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline, target_object=target_object
+    # Waypoint 3: GRIP -- close the jaw and, if a WeldGrasp was supplied,
+    # attempt attach every step until it engages or GRIP_HOLD_FRAMES runs
+    # out (ADR-030). `grip_start_frames` lets the local dwell-index
+    # `_run_dwell` returns be turned into a whole-skill-call frame number,
+    # matching `SkillResult.weld_attach_frame`'s documented meaning.
+    grip_start_frames = frames
+    ok, used, reason, attach_frame_local = _run_dwell(
+        env, arm, grasp_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,
+        target_object=target_object, weld=weld, weld_object_name=body_name if weld is not None else None,
     )
     frames += used
     remaining -= used
+    attach_frame = grip_start_frames + attach_frame_local if attach_frame_local is not None else None
+    if weld is not None and attach_frame is None:
+        # Distinguishable from a plain waypoint/collision failure per the
+        # task instructions -- the weld mechanism itself never engaged.
+        return SkillResult(
+            False, f"weld_attach_failed_after_{used}_frames", frames, weld_attach_frame=None, weld_active_at_end=False
+        )
     if not ok:
-        return SkillResult(False, f"waypoint 3 (grip) failed [{reason}]", frames)
+        return SkillResult(
+            False, f"waypoint 3 (grip) failed [{reason}]", frames,
+            weld_attach_frame=attach_frame, weld_active_at_end=False,
+        )
 
     # Waypoint 4: RETREAT -- back to clearance height, gripper held closed.
     # This also doubles as the physical lift the success check below reads.
@@ -1124,16 +1232,31 @@ def run_pick(env, arm: str, target_object: str, step_budget: int = ik.DEFAULT_ST
     remaining -= used
 
     final_z = float(env.data.xpos[body_id][2])
-    lifted = final_z >= initial_z + PICK_LIFT_MARGIN_M
-    measured = (
-        f"{'lifted' if lifted else 'did not lift'} {target_object}: "
-        f"initial_z={initial_z:.4f} final_z={final_z:.4f} margin_required={PICK_LIFT_MARGIN_M}"
-    )
+    weld_holding = weld.is_holding(arm) == body_name if weld is not None else False
+
+    if weld is not None:
+        lifted = final_z > TABLE_SURFACE_Z + WELD_PICK_SUCCESS_MARGIN_M
+        measured = (
+            f"{'lifted' if lifted else 'did not lift'} {target_object}: initial_z={initial_z:.4f} "
+            f"final_z={final_z:.4f} table_surface_z={TABLE_SURFACE_Z} "
+            f"success_threshold_z={TABLE_SURFACE_Z + WELD_PICK_SUCCESS_MARGIN_M:.4f} "
+            f"weld_attach_frame={attach_frame} weld_active_at_end={weld_holding}"
+        )
+        success = lifted and weld_holding
+    else:
+        lifted = final_z >= initial_z + PICK_LIFT_MARGIN_M
+        measured = (
+            f"{'lifted' if lifted else 'did not lift'} {target_object}: "
+            f"initial_z={initial_z:.4f} final_z={final_z:.4f} margin_required={PICK_LIFT_MARGIN_M}"
+        )
+        success = lifted
+
     if not ok:
-        return SkillResult(False, f"waypoint 4 (retreat) failed [{reason}]; {measured}", frames)
-    if lifted:
-        return SkillResult(True, measured, frames)
-    return SkillResult(False, measured, frames)
+        return SkillResult(
+            False, f"waypoint 4 (retreat) failed [{reason}]; {measured}", frames,
+            weld_attach_frame=attach_frame, weld_active_at_end=weld_holding,
+        )
+    return SkillResult(success, measured, frames, weld_attach_frame=attach_frame, weld_active_at_end=weld_holding)
 
 
 def run_place(
@@ -1142,11 +1265,21 @@ def run_place(
     target_object: str,
     destination: str = "table",
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
+    weld: WeldGrasp | None = None,
 ) -> SkillResult:
     """place(object, target=table, arm): pick the object up (if not already
     held), then APPROACH above the destination at clearance height ->
     DESCEND to destination + a small vertical offset for gentle release ->
-    RELEASE (open + hold) -> RETREAT to clearance height (ADR-027).
+    RELEASE (weld.release(arm) BEFORE opening the jaw, then open + hold) ->
+    RETREAT to clearance height (ADR-027; the weld-release-before-jaws-open
+    ordering is M06 Phase 2 Commit 2, ADR-030 -- releasing first means the
+    object is not kicked by the opening jaw's own collision geometry while
+    still welded rigidly to it).
+
+    `weld` (ADR-030) is threaded straight into the nested `run_pick` call
+    below, so `place`'s own internal grasp attaches exactly like a
+    standalone `pick` would. `weld=None` (the default) reproduces this
+    module's pre-Commit-2 behavior throughout.
 
     Success: the object ends resting on the table (z within a plausible
     resting band) and within the tabletop's xy bounds -- not fallen through
@@ -1170,10 +1303,13 @@ def run_place(
     # propagated as-is on failure, so a failure inside the grasp still
     # localises to its exact stage.
     pick_budget = max(1, step_budget // 2)
-    pick_result = run_pick(env, arm, target_object, step_budget=pick_budget)
+    pick_result = run_pick(env, arm, target_object, step_budget=pick_budget, weld=weld)
     frames += pick_result.frames_used
     if not pick_result.success:
-        return SkillResult(False, f"place aborted: pick failed ({pick_result.reason})", frames)
+        return SkillResult(
+            False, f"place aborted: pick failed ({pick_result.reason})", frames,
+            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=pick_result.weld_active_at_end,
+        )
 
     remaining = step_budget - frames
     if remaining <= 0:
@@ -1214,14 +1350,23 @@ def run_place(
     if not ok:
         return SkillResult(False, f"waypoint 2 (descend to destination) failed [{reason}]", frames)
 
-    # Waypoint 3: RELEASE -- open the jaw and hold so the object settles.
-    ok, used, reason = _run_dwell(
+    # Waypoint 3: RELEASE. ADR-030: release the weld BEFORE commanding the
+    # jaw open, so the object is set free of the rigid attach first and is
+    # not kicked by the opening jaw's own moving collision geometry -- then
+    # open + hold so the object settles under gravity/contact as before.
+    if weld is not None:
+        weld.release(arm)
+    ok, used, reason, _ = _run_dwell(
         env, arm, lower_target, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline, target_object=target_object
     )
     frames += used
     remaining -= used
+    weld_holding = weld.is_holding(arm) == body_name if weld is not None else False
     if not ok:
-        return SkillResult(False, f"waypoint 3 (release) failed [{reason}]", frames)
+        return SkillResult(
+            False, f"waypoint 3 (release) failed [{reason}]", frames,
+            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=weld_holding,
+        )
 
     # Waypoint 4: RETREAT -- back up to clearance height so the arm does not
     # drag the object off the table as it withdraws.
@@ -1239,13 +1384,22 @@ def run_place(
     on_table_xy = -0.40 <= float(final_pos[0]) <= 0.40 and -0.25 <= float(final_pos[1]) <= 0.25
     measured = (
         f"final position of {target_object}: x={final_pos[0]:.4f} y={final_pos[1]:.4f} "
-        f"z={final_z:.4f} (table surface z={TABLE_SURFACE_Z})"
+        f"z={final_z:.4f} (table surface z={TABLE_SURFACE_Z}) weld_active_at_end={weld_holding}"
     )
     if not ok:
-        return SkillResult(False, f"waypoint 4 (retreat) failed [{reason}]; {measured}", frames)
+        return SkillResult(
+            False, f"waypoint 4 (retreat) failed [{reason}]; {measured}", frames,
+            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=weld_holding,
+        )
     if on_table_height and on_table_xy:
-        return SkillResult(True, measured, frames)
-    return SkillResult(False, f"object not resting on the table after place; {measured}", frames)
+        return SkillResult(
+            True, measured, frames,
+            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=weld_holding,
+        )
+    return SkillResult(
+        False, f"object not resting on the table after place; {measured}", frames,
+        weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=weld_holding,
+    )
 
 
 def run_handoff(
@@ -1254,28 +1408,48 @@ def run_handoff(
     from_arm: str,
     target_object: str,
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
+    weld: WeldGrasp | None = None,
 ) -> SkillResult:
     """handoff(object, from_arm, to_arm) (ADR-010's grip-state sequence,
-    staged per ADR-027):
+    staged per ADR-027; weld wiring is M06 Phase 2 Commit 2, ADR-030):
 
-      1. `from_arm` picks the object up (nested `run_pick`).
+      1. `from_arm` picks the object up (nested `run_pick`, `weld` threaded
+         through so `from_arm`'s own initial grasp attaches exactly like a
+         standalone `pick`).
       2. `from_arm` APPROACHes above `HANDOFF_POSITION_XYZ` at clearance.
       3. `from_arm` DESCENDs to `HANDOFF_POSITION_XYZ`.
       4. `to_arm` APPROACHes above it, offset to the opposite side
          (`HANDOFF_SIDE_OFFSET_M`) so the two jaws are not asked to occupy
          the same point (ADR-024's handoff consequence).
       5. `to_arm` DESCENDs.
-      6. `to_arm` GRIPs (closes).
-      7. `from_arm` RELEASEs (opens).
+      6. `to_arm` GRIPs -- closes and attempts weld attach every step
+         (same mechanism as `run_pick`'s GRIP), until it attaches or
+         `GRIP_HOLD_FRAMES` runs out.
+      6a. **ADR-030's transfer-safety gate**, new in this commit:
+          `weld.is_holding(to_arm) == body_name` is checked EXPLICITLY here,
+          BEFORE `from_arm` is ever asked to release. If it does not hold
+          (attach never engaged, or something released it in between), the
+          skill fails immediately with `handoff_transfer_failed` and
+          `from_arm`'s weld is left untouched -- the object stays with
+          `from_arm` rather than ending up held by neither arm.
+      7. `from_arm` RELEASEs -- `weld.release(from_arm)` is called BEFORE
+         the jaw is commanded open (same ordering rationale as `place`'s
+         RELEASE), only after step 6a has confirmed the transfer.
       8. Both RETREAT, STAGGERED: `from_arm` retreats first, THEN `to_arm`
          retreats -- sequential, not concurrent, so the two arms do not
          cross paths on the way out while both are still near the transfer
          point.
 
-    Success: the object ends measurably closer to `to_arm`'s gripperframe
-    site than to `from_arm`'s, and has been lifted since the handoff began
-    (the same lift-margin check `run_pick` uses), confirming `to_arm` is now
-    the one actually holding it.
+    `weld=None` (the default) reproduces this module's pre-Commit-2
+    behavior throughout (no attach attempts, no transfer gate, no release
+    calls) -- the old lift-margin/distance-only success check below.
+
+    Success (with `weld` given): the object ends measurably closer to
+    `to_arm`'s gripperframe site than `from_arm`'s, has been lifted since
+    the handoff began, AND `weld.is_holding(to_arm) == body_name` while
+    `weld.is_holding(from_arm)` is not -- i.e. the transfer is confirmed by
+    the weld state itself, not merely by which gripper is geometrically
+    closer. Success (with `weld=None`): the older distance+lift-only check.
     """
     frames = 0
     if to_arm == from_arm:
@@ -1289,10 +1463,13 @@ def run_handoff(
     baseline = _contact_counts(env)
 
     pick_budget = max(1, step_budget // 2)
-    pick_result = run_pick(env, from_arm, target_object, step_budget=pick_budget)
+    pick_result = run_pick(env, from_arm, target_object, step_budget=pick_budget, weld=weld)
     frames += pick_result.frames_used
     if not pick_result.success:
-        return SkillResult(False, f"handoff aborted: pick by arm {from_arm} failed ({pick_result.reason})", frames)
+        return SkillResult(
+            False, f"handoff aborted: pick by arm {from_arm} failed ({pick_result.reason})", frames,
+            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=False,
+        )
 
     remaining = step_budget - frames
     if remaining <= 0:
@@ -1348,25 +1525,56 @@ def run_handoff(
     if not ok:
         return SkillResult(False, f"waypoint 4 (to_arm descend) failed [{reason}]", frames)
 
-    # Waypoint 5: to_arm GRIP -- close and hold.
-    ok, used, reason = _run_dwell(
+    # Waypoint 5: to_arm GRIP -- close and, if a WeldGrasp was supplied,
+    # attempt attach every step until it engages or GRIP_HOLD_FRAMES runs
+    # out (ADR-030, same mechanism as run_pick's GRIP).
+    grip_start_frames = frames
+    ok, used, reason, attach_frame_local = _run_dwell(
         env, to_arm, receiving_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,
-        target_object=target_object,
+        target_object=target_object, weld=weld, weld_object_name=body_name if weld is not None else None,
     )
     frames += used
     remaining -= used
+    attach_frame = grip_start_frames + attach_frame_local if attach_frame_local is not None else None
+    if weld is not None and attach_frame is None:
+        return SkillResult(
+            False, f"weld_attach_failed_after_{used}_frames", frames,
+            weld_attach_frame=None, weld_active_at_end=False,
+        )
     if not ok:
-        return SkillResult(False, f"waypoint 5 (to_arm grip) failed [{reason}]", frames)
+        return SkillResult(
+            False, f"waypoint 5 (to_arm grip) failed [{reason}]", frames,
+            weld_attach_frame=attach_frame, weld_active_at_end=False,
+        )
 
-    # Waypoint 6: from_arm RELEASE -- open and hold.
-    ok, used, reason = _run_dwell(
+    # Waypoint 5a (ADR-030's transfer-safety gate): verify to_arm actually
+    # holds the object, via the weld state itself, BEFORE from_arm is ever
+    # asked to release. If this does not hold, fail immediately and leave
+    # from_arm's weld untouched -- the object stays with from_arm rather
+    # than risking a state where neither arm holds it.
+    if weld is not None and weld.is_holding(to_arm) != body_name:
+        return SkillResult(
+            False, "handoff_transfer_failed", frames,
+            weld_attach_frame=attach_frame, weld_active_at_end=False,
+        )
+
+    # Waypoint 6: from_arm RELEASE. ADR-030: release the weld BEFORE
+    # commanding the jaw open (same ordering rationale as `place`), only
+    # reached once waypoint 5a above has confirmed to_arm holds the object.
+    if weld is not None:
+        weld.release(from_arm)
+    ok, used, reason, _ = _run_dwell(
         env, from_arm, transfer_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,
         target_object=target_object,
     )
     frames += used
     remaining -= used
     if not ok:
-        return SkillResult(False, f"waypoint 6 (from_arm release) failed [{reason}]", frames)
+        return SkillResult(
+            False, f"waypoint 6 (from_arm release) failed [{reason}]", frames,
+            weld_attach_frame=attach_frame,
+            weld_active_at_end=(weld.is_holding(to_arm) == body_name if weld is not None else False),
+        )
 
     # Waypoint 7: from_arm RETREAT -- goes FIRST (staggered), back to
     # clearance height above the transfer point.
@@ -1378,7 +1586,11 @@ def run_handoff(
     frames += used
     remaining -= used
     if not ok7:
-        return SkillResult(False, f"waypoint 7 (from_arm retreat) failed [{reason7}]", frames)
+        return SkillResult(
+            False, f"waypoint 7 (from_arm retreat) failed [{reason7}]", frames,
+            weld_attach_frame=attach_frame,
+            weld_active_at_end=(weld.is_holding(to_arm) == body_name if weld is not None else False),
+        )
 
     # Waypoint 8: to_arm RETREAT -- goes SECOND (staggered), lifting the
     # object away from the transfer point.
@@ -1401,15 +1613,36 @@ def run_handoff(
     closer_to_to_arm = dist_b < dist_a if to_arm == "B" else dist_a < dist_b
     lifted = final_z >= initial_z + PICK_LIFT_MARGIN_M
 
+    # ADR-030: fold the weld's own held-object bookkeeping into the success
+    # check, not just distance/lift -- "the object ends held by to_arm and
+    # NOT by from_arm" is exactly what `is_holding` on both arms answers
+    # directly, rather than inferring it from gripperframe proximity alone.
+    weld_to_holding = weld.is_holding(to_arm) == body_name if weld is not None else False
+    weld_from_holding = weld.is_holding(from_arm) == body_name if weld is not None else False
+
     measured = (
         f"z={final_z:.4f} (initial {initial_z:.4f}) dist_to_armA={dist_a:.4f} "
-        f"dist_to_armB={dist_b:.4f} (to_arm={to_arm})"
+        f"dist_to_armB={dist_b:.4f} (to_arm={to_arm}) weld_holding_to_arm={weld_to_holding} "
+        f"weld_holding_from_arm={weld_from_holding}"
     )
     if not ok8:
-        return SkillResult(False, f"waypoint 8 (to_arm retreat) failed [{reason8}]; {measured}", frames)
-    if lifted and closer_to_to_arm:
-        return SkillResult(True, f"held by arm {to_arm}: {measured}", frames)
-    return SkillResult(False, f"object not confirmed held by arm {to_arm}: {measured}", frames)
+        return SkillResult(
+            False, f"waypoint 8 (to_arm retreat) failed [{reason8}]; {measured}", frames,
+            weld_attach_frame=attach_frame, weld_active_at_end=weld_to_holding,
+        )
+    if weld is not None:
+        success = lifted and closer_to_to_arm and weld_to_holding and not weld_from_holding
+    else:
+        success = lifted and closer_to_to_arm
+    if success:
+        return SkillResult(
+            True, f"held by arm {to_arm}: {measured}", frames,
+            weld_attach_frame=attach_frame, weld_active_at_end=weld_to_holding,
+        )
+    return SkillResult(
+        False, f"object not confirmed held by arm {to_arm}: {measured}", frames,
+        weld_attach_frame=attach_frame, weld_active_at_end=weld_to_holding,
+    )
 
 
 def run_open_drawer(env, arm: str = "A", step_budget: int = ik.DEFAULT_STEP_BUDGET) -> SkillResult:
@@ -1505,8 +1738,11 @@ def run_open_drawer(env, arm: str = "A", step_budget: int = ik.DEFAULT_STEP_BUDG
     if not ok:
         return SkillResult(False, f"waypoint 2 (insert) failed [{reason}]; {_final_reason()}", frames)
 
-    # Waypoint 3: GRIP -- close against the drawer's front face.
-    ok, used, reason = _run_dwell(env, arm, handle_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    # Waypoint 3: GRIP -- close against the drawer's front face. No `weld`
+    # concept here (the drawer is not one of `WeldGrasp`'s `GRASPABLE_OBJECTS`
+    # -- it has a slide joint, not a free joint, ADR-029), so this call
+    # never passes `weld`/`weld_object_name` and behaves exactly as before.
+    ok, used, reason, _ = _run_dwell(env, arm, handle_point, close_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
     frames += used
     remaining -= used
     if not ok:
@@ -1520,7 +1756,7 @@ def run_open_drawer(env, arm: str = "A", step_budget: int = ik.DEFAULT_STEP_BUDG
         return SkillResult(False, f"waypoint 4 (pull) failed [{reason}]; {_final_reason()}", frames)
 
     # Waypoint 5: RELEASE -- open and hold.
-    ok, used, reason = _run_dwell(env, arm, pulled_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
+    ok, used, reason, _ = _run_dwell(env, arm, pulled_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline)
     frames += used
     remaining -= used
     if not ok:
