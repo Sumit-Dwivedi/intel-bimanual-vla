@@ -103,6 +103,45 @@ receiver-first. An A→B handoff is `run_handoff(env, "B", "A", "fork")`.
 ### Addendum, Sept 14 2026 (same day, follow-up pass) — Fix 4 corrected; a
 ### measurement discrepancy flagged; independent re-verification
 
+**ORCHESTRATOR CORRECTION (supersedes the two items below).**
+
+*On provenance — there is no anomaly.* `cc1a329` was made by the orchestrator
+session, not an unknown process. The builder agent working these fixes appeared
+to have died (its log had been silent for ~100 minutes after SSH rate-limiting
+on the jump host), so the orchestrator took the work over, found that agent's
+in-progress edits in the shared working tree, corrected the retreat value from
+0.15 to 0.10 on the basis of a measured sweep, verified all four skills, and
+committed the result. The agent then resumed and correctly observed its own
+prose inside an already-made commit. Its report of the facts was accurate; only
+the framing as a provenance irregularity was wrong. Two agents editing one
+working tree while the orchestrator commits it is the actual mechanism, and the
+attribution line on `cc1a329` is this project's standard one.
+
+*On the 0.1946 m vs 0.0983 m discrepancy — both figures are correct; they
+measure different reference points.* Re-measured directly on bm-ptl in a single
+run reporting both:
+
+| reference | lateral (y) | vertical (z) | 3D |
+|---|---:|---:|---:|
+| pinch point — midpoint of `armX_gripper` and `armX_moving_jaw_so101_v1` | **0.1946 m** | 0.0046 m | 0.1946 m |
+| `armX_gripperframe` site (`data.site_xpos`) | 0.0983 m | 0.1508 m | 0.1818 m |
+
+The site-to-pinch-point offset measures **0.0888 m on each arm** — precisely the
+~8 cm ADR-025 recorded when it retargeted IK away from the site for exactly this
+reason. Fix 2's table uses the **pinch point**, which is what actually holds the
+object and what ADR-025 established as this project's reference; the addendum
+used the site. Nothing is unreproducible: the 3D separations (0.1946 vs 0.1818)
+are close, and the two references distribute that distance differently between
+y and z because the site sits along each gripper's own axis. Fix 2's figure
+stands as written, now with its reference stated explicitly.
+
+*Fix 4's correction below is accepted and verified.* The orchestrator inspected
+the regenerated `m06-handoff-sequence.png`: the fixed camera holds a stable
+frame, both arms are visible and separated in all four panels, and the red fork
+is legible in the final panel. The azimuth=90 occlusion diagnosis is correct —
+both arms sit near x≈0 and differ only in y, so that viewing ray puts one
+behind the other. The strip is now usable as evidence.
+
 **Provenance note, reported for transparency.** This addendum was written in
 a session that found the four fixes above (red fork, 0.10 m lateral retreat,
 full revert of prop repositioning) ALREADY present and already committed in
