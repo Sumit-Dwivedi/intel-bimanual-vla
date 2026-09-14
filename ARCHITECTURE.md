@@ -2779,6 +2779,1188 @@ descend), reported not patched.").
 
 ---
 
+### ADR-036 — Raise `HANDOFF_POSITION_XYZ`'s z above the table (0.35 -> 0.43) to remove the ADR-035 arm-vs-table_top collision: the targeted collision is gone, but `handoff(A, B, fork)` now fails one waypoint EARLIER, at a NEW cross-arm collision — the fix relocated the failure rather than resolving it, reported honestly, not patched
+
+**Recorded:** Sept 13, 2026 · **Follows:** ADR-035 (target interpolation in
+the `handoff` traverse, commit `f521775`) · **Modifies:**
+`src/bimanual/control/skills_scripted.py` only, per task scope
+
+**Diagnosis given, verified before changing anything.** ADR-035's own trace
+showed waypoint 4 (`to_arm`'s DESCEND) failing its 2nd/3rd interpolation
+step at target z=0.351 with a new `armB`-vs-`table_top` contact past
+`TABLE_COLLISION_DEPTH_TOL_M`. `HANDOFF_POSITION_XYZ = (0.0, -0.01, 0.35)`
+and `TABLE_SURFACE_Z = 0.35` are indeed the same number, confirmed by
+re-reading both constants (`skills_scripted.py`) before making any change —
+the transfer point sat exactly at tabletop height, and DESCEND was asking
+`to_arm` to put its wrist there.
+
+**Fix applied.** `HANDOFF_POSITION_XYZ`'s z: 0.35 -> 0.43 (`TABLE_SURFACE_Z +
+CLEARANCE_HEIGHT_M`) — the same height ADR-035's own fresh sweep already
+found as a converged, joint-limit-clean staging cell for BOTH arms
+(`HANDOFF_STAGING_Y_M`'s docstring), and the height waypoints 1/3 (APPROACH)
+were already driving to as `transfer_point + CLEARANCE_HEIGHT_M` before this
+change. Chosen over a fresh number specifically so the APPROACH waypoints'
+numeric targets would not change at all — only the now-redundant DESCEND
+step down to table height (the one that collided) would be removed. Checked
+per the task's own warning before concluding anything: with the transfer
+point now AT the old hover height, the separate hover-clearance term used to
+compute each APPROACH's target is gone (transfer_point IS the hover height
+now), so the retreat waypoints (5/6, formerly 7/8) are the only ones now
+targeting a genuinely new, previously-untested height
+(`0.43 + CLEARANCE_HEIGHT_M = 0.51`) — flagged explicitly in the code
+comments, not assumed safe.
+
+**DESCEND waypoints removed, not left as no-ops.** With `HANDOFF_POSITION_XYZ`
+raised to the hover height, the old DESCEND targets (`transfer_point` /
+`receiving_point` at z=0.35) became numerically identical to the preceding
+APPROACH targets (z=0.43 both now) — i.e. start == end, zero distance to
+interpolate. Per this task's own instruction ("removing them is reasonable
+— but say plainly that you removed them and why, rather than leaving dead
+waypoints that report success without moving"), the two DESCEND calls
+(`_run_interpolated_waypoint` invocations, old waypoints 2 and 4) were
+deleted outright and the skill's remaining waypoints renumbered 1-6 (was
+1-8) throughout `run_handoff`'s docstring and its `SkillResult` failure
+messages.
+
+**Verification run: `handoff(A, B, fork)` (`to_arm=B, from_arm=A`), via
+`scripts/probe_handoff_fork.py` (new, read-only, same
+`ScriptedSkillExecutor`/`SkillCall` path `tests/test_skills.py` and
+`scripts/probe_place_bottle.py` use), bm-ptl, seed 0, BEFORE and AFTER this
+change:**
+
+| waypoint (renumbered after this change) | BEFORE this change (probe run) | AFTER this change (probe run) |
+|---|---|---|
+| `pick(A, fork)` (nested) | succeeds, weld attaches | succeeds, weld attaches (unaffected) |
+| 1: `from_arm` (A) APPROACH to transfer point | converges (same numeric target both runs — unaffected by this diff) | converges |
+| old waypoint 2: `from_arm` (A) DESCEND to table-height transfer point | ran and converged in this probe (table-height transfer point still existed) | *(removed outright — no longer exists; see above)* |
+| old waypoint 3 / **new waypoint 2: `to_arm` (B) APPROACH to receiving point** | direct shot fails (residual 0.0875), staged to y=-0.06 SUCCEEDS (residual 0.0032), interpolates onward, all steps converge | direct shot fails (residual 0.0875, identical — unaffected by this change), staging to y=-0.06 now **FAILS with a NEW `cross_arm` collision (contacts=1 vs baseline 0)** |
+| old waypoint 4: `to_arm` (B) DESCEND to receiving point | reaches this waypoint, fails there with the ADR-035 `armB`-vs-`table_top` collision this task set out to fix | *(never reached in this run — skill now fails earlier, at new waypoint 2)* |
+
+**Net result: the diagnosed arm-vs-table_top collision at the old waypoint 4
+is confirmed gone — but `handoff(A, B, fork)` still does not complete.** It
+now fails one waypoint EARLIER than before (at the renumbered waypoint 2,
+`to_arm`'s APPROACH/staging), with a DIFFERENT failure kind: not a
+convergence failure, not a table collision, but a `cross_arm` contact
+between the two arms' own collision geometry. Root cause, confirmed by
+comparing to ADR-035's own trace rather than assumed: before this change,
+`from_arm` (A) had already DESCENDED away from the shared 0.43 m hover band
+down to table height (0.35) by the time `to_arm` (B) staged into that band —
+the two arms were never in the same z-plane at the same time. This change
+removed that DESCEND, so `from_arm` now sits AT the transfer point (0.43)
+holding the fork for the entire remainder of the skill, including while
+`to_arm` drives its own staging move through the SAME 0.43 m plane at
+y=-0.06 — and the two arms' geometry now intersects. **This is exactly the
+"relocate the collision" outcome the task instructions warned to check for
+explicitly, and it is what happened**, not the table collision resolving
+cleanly.
+
+**Also confirmed, per the task's own instruction to check rather than
+assume:** the retreat waypoints' new height (0.51 m, `CLEARANCE_HEIGHT_M`
+above the raised transfer point) was never reached in this run — the skill
+fails at waypoint 2, three waypoints before retreat — so this change
+neither confirms nor refutes reachability at 0.51 m; that remains untested.
+
+**Regression check.** `pytest tests/test_skills.py`: 4 passed / 4 failed,
+identical split and identical failure reasons to the pre-change baseline
+(the one handoff test in the suite, `test_handoff_mug_ends_held_by_arm_b`,
+still fails at the SAME earlier point, inside the nested `pick(A, mug)` call,
+for the unrelated, already-documented reason ADR-035/the test file's own
+docstring records — untouched by this change, since `run_pick` is not
+modified here). No change to `grasp.py`, `ik.py`, `executor.py`,
+`gen_dual_scene.py`, `scenes/so101/`, or `ARCHITECTURE.md`.
+
+**Not patched further, per this task's hard time cap and explicit
+instruction to stop and report rather than iterate.** A candidate next fix
+(stagger `from_arm`'s retreat to happen BEFORE `to_arm`'s APPROACH, rather
+than after `to_arm`'s GRIP/RELEASE as the skill currently orders things) is
+visible from this trace but has not been attempted or verified — recording
+it here as an unverified idea, not a recommendation, since the corrected
+brief for THIS task specified raising `HANDOFF_POSITION_XYZ`, not
+reordering the traverse. `handoff(A, B, fork)` remains unverified working
+end to end after two consecutive fix attempts (ADR-035, ADR-036); no
+`docs/images/m06-handoff-complete.png` was generated, since the task's own
+render step was conditioned on success. `handoff(B, A, fork)` was not
+attempted, since the same to_arm-approach failure this table diagnoses is
+symmetric in `from_arm`/`to_arm` roles and not expected to behave
+differently, and the task did not require it when the primary direction
+fails.
+
+**Source commit:** `f92806e` (given).
+
+---
+
+### ADR-037 — `run_handoff` rewritten as sequential choreography (one arm moves at a time, the other genuinely frozen); the fix for the `_hold_ctrl` drift bug turned out to ALSO resolve the ADR-036/`f92806e` cross-arm collision — `handoff(A, B, fork)` now succeeds end to end, verified by direct measurement, not assumed
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-036 (`f92806e`, cross-arm
+collision at `to_arm`'s staging sweep) · **Modifies:**
+`src/bimanual/control/skills_scripted.py`, `scripts/requirements-bmptl.txt`,
+this file, per task scope · **References (user-supplied, cited as such --
+not fetched, not described beyond the quoted phrases the task itself gave):**
+Wan, Ramos, Yang, Garrett 2025 (NVIDIA), "Learning to Plan & Schedule with
+Reinforcement-Learned Bimanual Robot Skills",
+https://arxiv.org/html/2510.25634v1 -- "single-arm waiting skill that keeps
+one arm stationary"; and "Trajectory planning system for bimanual robots:
+Achieving efficient collision-free manipulation" (2025),
+https://www.sciencedirect.com/science/article/pii/S0921889025002155.
+
+### Part 0 -- reverting the mink probe's environment damage, gated first
+
+`9d0adde`'s mink probe silently bumped bm-ptl's shared `ov_env` from
+`mujoco==3.2.7` to `3.13.0` as a forced transitive consequence of
+`pip install mink==1.3.0`. mink was NOT adopted (that probe's own verdict:
+on the identical target from the identical "home" pose, mink's QP-based
+velocity IK converged to a 0.2233 m residual, stuck at a joint-limit local
+minimum, where this project's own `ik.solve_position_ik` (DLS) converges to
+0.00986 m; mink's `CollisionAvoidanceLimit` also allowed a measured ~5.5 cm
+arm-vs-table interpenetration during that same stuck solve). With mink not
+adopted, there was no remaining reason to carry its forced mujoco floor.
+
+**Actions taken, in order, each verified before proceeding:**
+1. `pip install mujoco==3.2.7` on bm-ptl (`ov_env`) -- confirmed via
+   `python -c "import mujoco; print(mujoco.__version__)"` -> `3.2.7`.
+2. `pip uninstall -y mink` -- confirmed removed via `pip show mink`
+   (raises "not found").
+3. `scripts/requirements-bmptl.txt` updated to match: `mujoco==3.2.7`
+   restored, the `mink==1.3.0` line removed, with a comment explaining the
+   revert and pointing at `docs/hardware/m06-mink-probe.md` for the
+   evaluation record.
+4. `pytest tests/test_skills.py` re-run under 3.2.7 BEFORE any code change
+   in this commit: **4 passed, 4 failed** -- identical split, identical
+   failure reasons, to every previously-documented baseline (ADR-036,
+   `m06-mink-probe.md`'s own 3.13.0 re-run). This is necessary but NOT
+   sufficient evidence (see point 5): no test in this suite exercises
+   `pick(A, fork)`, `place(A, fork, table)`, or `pick(A, water_bottle)` with
+   a real `WeldGrasp` -- that is exactly why the mink probe's "pytest
+   unchanged" claim did not, by itself, establish that reverting mujoco
+   would be safe either.
+5. **The three working skills re-run directly** (via the real
+   `ScriptedSkillExecutor` + `SkillCall` path, `WeldGrasp` attached, seed 0),
+   BEFORE any code change in this commit, and their measured numbers
+   compared byte-for-byte against the pre-mink-probe baselines already on
+   record (ADR-031, ADR-033/034):
+
+   | Skill | Measured under mujoco 3.2.7 (this commit) | Matches prior baseline? |
+   |---|---|---|
+   | `pick(A, fork)` | `success=True frames_used=1655 weld_attach_frame=1155 initial_z=0.3560 final_z=0.3989` | YES, identical (ADR-031) |
+   | `place(A, fork, table)` | `success=True frames_used=3455 weld_attach_frame=1155 final_xyz=[-0.0081, 0.0203, 0.3588]` | YES, identical (ADR-031) |
+   | `pick(A, water_bottle)` | `success=True frames_used=1655 weld_attach_frame=1155 initial_z=0.4400 final_z=0.6192` | YES, identical (ADR-034) |
+
+   No regression. Only after this did any change to `skills_scripted.py`
+   begin.
+
+### Part 1 -- the `_hold_ctrl` drift bug: measured, then fixed
+
+**Measured, per this task's correction, before touching anything:**
+`_hold_ctrl` rebuilt its ENTIRE returned ctrl vector from the idle arm's
+CURRENT qpos every single call, so it commanded zero position error at the
+instant of each read and supplied no restoring force against gravity
+between reads -- the idle arm's true setpoint ratchets away from its
+original pose. This was already flagged, unfixed, in the module's own
+docstring (measured previously at 0.04 rad by 100 steps, 0.546 rad
+saturation -- a joint hard-limit stop -- by ~1500 steps). A single `pick`
+alone runs ~655 frames (ADR-035's own trace), implying ~0.26 rad of drift
+before choreography is even involved -- 26x a naive 0.01 rad bar.
+
+**Fix.** `_hold_ctrl(env, frozen_base=None)`: if `frozen_base` is given, it
+is returned as a plain copy -- nothing is re-derived from live qpos. A
+caller doing a genuine long-duration idle hold captures a snapshot ONCE
+(a plain `_hold_ctrl(env)` call, no override -- this still reads live qpos,
+but only that one time) at the exact instant an arm becomes idle, and
+passes that SAME array back in as `frozen_base` on every subsequent step of
+the idle span, however many waypoint/dwell calls that span covers. This is
+the same insight as ADR-031's GRIP-dwell freeze, generalized from "freeze
+the ACTIVE arm for one dwell" to "freeze the IDLE arm for an entire
+choreography phase." `frozen_base` was threaded as a new, purely additive
+parameter through `_drive_to_target`, `_dwell`, `_run_waypoint`,
+`_run_dwell`, `_run_interpolated_waypoint`, `_run_approach_with_staging`,
+and `run_pick` (needed so `run_handoff`'s Phase 1 can freeze `to_arm` for
+the WHOLE nested pick call, not just one waypoint of it) -- every one of
+these defaults the new parameter to `None`, which reproduces the exact
+pre-ADR-037 behaviour. `run_place` and `run_open_drawer` were NOT given new
+call sites using this parameter (out of this task's scope; their own idle
+holds are unchanged).
+
+**Verification that this did not regress `pick`/`place` (which also use
+`_hold_ctrl`):** the same three-skill re-run from Part 0's step 5, re-run
+again AFTER this change (still with `hold_ctrl_base` left at its default
+`None` for these standalone calls): **byte-identical** to Part 0's
+just-recorded numbers (`pick(A,fork)`: 1655 frames, `weld_attach_frame=1155`,
+`final_z=0.3989`; `place`: 3455 frames, same weld frame, same final xyz;
+`pick(A,water_bottle)`: 1655 frames, `final_z=0.6192`). `pytest
+tests/test_skills.py`: unchanged, 4 passed / 4 failed, identical reasons.
+
+**Measured drift with the fix applied, over the actual choreography phases
+(not a synthetic long dwell) -- this is the evidence the test threshold
+below is based on**, via a real `handoff(A, B, fork)` run instrumented to
+read each frozen arm's joint qpos at phase boundaries:
+
+| Phase | Frozen arm | Frames this phase | Max joint drift from its frozen pose |
+|---|---|---|---|
+| 1 (`from_arm` picks) | `to_arm` (B), held at HOME | 1655 | **0.000774 rad** |
+| 2 (`from_arm` approaches transfer point) | `to_arm` (B), SAME snapshot as phase 1 | 500 | **0.000774 rad** (unchanged -- confirms the snapshot itself is not decaying) |
+| 3 (`to_arm` approaches receiving point) | `from_arm` (A), held at the transfer point | 3000 | **0.000237 rad** |
+
+Both are more than an order of magnitude under the task's own proposed
+0.01 rad bar, not merely under it -- so **0.01 rad is adopted as the test
+threshold**, now with real evidence behind it (this was NOT achievable
+under the OLD `_hold_ctrl`, where phase 1 alone would have implied ~0.26
+rad; it IS achievable under the fix, measured directly, with roughly 13-40x
+margin).
+
+### Part 2 -- the cross-arm collision (`f92806e`'s finding): investigated, NOT solved by new routing geometry, but resolved anyway as a side effect of Part 1
+
+**The brief's staging signs, corrected per measurement (unchanged from
+ADR-035):** `HANDOFF_STAGING_Y_M = {"A": 0.06, "B": -0.06}` -- each arm
+converges on the side OPPOSITE its own base, confirmed again this session,
+not re-guessed.
+
+**The hard part: applying those measured values puts `to_arm`'s (B's) own
+staging cell on the SAME side of the midline `from_arm` (A) occupies while
+parked at the transfer point.** Two routing alternatives from the task's
+own list were tried, measured, and NOT adopted:
+
+- **Elevated ("dodge") crossing** -- stage `to_arm` at a taller z, sweep
+  laterally clear of `from_arm`'s operating height, then descend.
+  Measured (`WeldGrasp`-backed, real closed-loop drives, not a one-shot IK
+  check): the lateral sweep at z=0.53 converges collision-free in some
+  runs, but sits on a reproducible JOINT-LIMIT KNIFE-EDGE (margin as small
+  as -0.000001 rad -- flips pass/fail on essentially no perturbation:
+  the SAME (0,-0.06,0.53)->(0,0.02,0.53) move measured `ok=True,
+  cross_arm=0` in one run and `ok=False` at joint-limit margin -0.000001 in
+  another run that differed only in `from_arm`'s parked height). The
+  DESCEND back down to any real receiving height also reliably hit a
+  genuine joint-limit wall around z~0.49-0.50 regardless of which elevated
+  height was dodged to (tested 0.48/0.50/0.53/0.55/0.60/0.65/0.70).
+  Rejected: not robust enough to ship in place of the one corridor already
+  proven kinematically solid (ADR-035's lateral crossing at z=0.43).
+- **Horizontal ("dodge-in-x") crossing** -- sweep `to_arm` out to
+  x=+-0.15/+-0.20 before crossing y, then back. Measured: every variant ran
+  out of step budget (500-1000 steps/hop, well past ordinary convergence
+  time) before finishing. Inconclusive, not adopted as a positive result.
+- **Retracting `from_arm`'s elbow while holding its pinch point fixed**
+  (the task's third suggested option) was not attempted: `ik.py` is
+  out of scope for this task, and its 5-DOF null-space is not otherwise
+  exposed to a caller in this module.
+
+**Given neither alternative was robust, Phase 3 uses the SAME
+`HANDOFF_STAGING_Y_M`/`_run_approach_with_staging` lateral corridor
+ADR-035 already verified -- i.e. this ADR did NOT change the routing
+geometry `f92806e` found colliding.** The expectation, going into
+verification, was therefore that Phase 3 would reproduce the SAME
+cross-arm collision `f92806e` measured.
+
+**That expectation was wrong, and the reason is instructive.** Verified
+directly: `_contact_counts(env)['cross_arm']` is **0 both immediately
+before and immediately after Phase 3's `to_arm` approach**, in the actual
+`run_handoff` call (not a hand-assembled replay). The likely explanation,
+consistent with Part 1's own measurement: under the OLD `_hold_ctrl`,
+`from_arm` was the IDLE arm throughout the entirety of Phase 3 (up to 3000
+frames in this run), and the OLD mechanism let it sag under gravity with NO
+restoring force -- at the measured rate (0.04 rad/100 steps, saturating at
+a hard joint limit by ~1500 steps), a 3000-frame idle span would have let
+`from_arm`'s actual, physically-simulated arm collapse toward a mechanical
+stop, unpredictably changing its real collision geometry from the clean,
+fully-extended pose it converged to. The NEW frozen hold keeps `from_arm`
+rigidly at exactly the pose it arrived at (holding the fork at the
+transfer point), which -- combined with the SAME staging geometry that
+previously collided -- turns out to be collision-free. **This is reported
+as a genuine, directly-measured finding, not assumed or extrapolated: the
+drift fix (Part 1) and the collision fix (Part 2) turned out to be the
+SAME fix**, which was not anticipated going in.
+
+### Part 3 -- simultaneous welds on one body during the transfer moment: tested explicitly
+
+**Concern (this task's own):** Phase 4 has `to_arm`'s weld attach and get
+verified BEFORE `from_arm`'s weld is released, so both
+`from_arm`-vs-`fork` and `to_arm`-vs-`fork` weld equalities could be
+active at once, forming a closed kinematic chain through the fork.
+
+**Measured directly** (a manual replay of `run_handoff`'s own Phase
+1-4 sequence, instrumented to inspect `env.data` at the exact frame attach
+flips true, BEFORE the shipped code's own `weld.release(from_arm)` call):
+at that instant, `weld.is_holding('A') == 'fork'` AND
+`weld.is_holding('B') == 'fork'` are BOTH true simultaneously --
+confirming the two-weld state is real, not merely theoretical.
+`qfrc_constraint` norm at that instant: **4.214480** (finite, not
+exploding). An EXPLORATORY extra physics step (deliberately run with BOTH
+welds still active, NOT part of the shipped code path) produced a max
+`|qpos delta|` of **0.010983** over that one step (small, not a jump/
+explosion), `qfrc_constraint` norm unchanged to 6 decimal places, and
+`env.data.warning.number` all zero (no MuJoCo warnings). **Conclusion:
+MuJoCo appears to handle this configuration without instability, at least
+for one step** -- but this is NOT relied upon: by code inspection, the
+shipped `run_handoff` calls `weld.release(from_arm)` immediately after the
+Phase 4a gate, with NO intervening `env.step()` call, so in the actual
+production path the two-weld state exists only within `WeldGrasp`'s own
+bookkeeping for a moment, never across an actual physics integration step.
+
+### VERIFY -- phase-isolated and full-handoff results
+
+All runs: seed 0, real `ScriptedSkillExecutor`-equivalent path
+(`run_pick`/`run_handoff` called directly with a real `WeldGrasp(env)`,
+matching what `ScriptedSkillExecutor._dispatch` does).
+
+| Check | Result |
+|---|---|
+| Phase 1 (`from_arm` picks fork; `to_arm` frozen at HOME) | `ok=True`, frames=1655, `to_arm` drift=0.000774 rad (< 0.01 rad) |
+| Phase 2 (`from_arm` approaches transfer point; `to_arm` still frozen) | `ok=True`, frames=500, `to_arm` drift=0.000774 rad (unchanged) |
+| Phase 3 (`to_arm` approaches receiving point; `from_arm` frozen at transfer point) | `ok=True`, frames=3000, `from_arm` drift=0.000237 rad (< 0.01 rad), **cross_arm contacts: 0 before, 0 after** |
+| Full `handoff(A, B, fork)` | **`success=True`**, `frames_used=6610`, `reason="held by arm B: z=0.4674 (initial 0.3560) dist_to_armA=0.0909 dist_to_armB=0.0582 (to_arm=B) weld_holding_to_arm=True weld_holding_from_arm=False from_arm_retreat_dist=0.1332 from_arm_clear=True"`, `weld_attach_frame=5310`, `is_holding('A')=None`, `is_holding('B')=='fork'` |
+| `handoff(B, A, fork)` (opportunistic mirror, reported per this task, NOT gated) | `success=False`, fails at Phase 1: `pick(B, fork)`'s own APPROACH does not converge (`IK residual=0.0954 m`) -- a PRE-EXISTING, already-documented kinematic reach limit of arm B's own base placement to this fork position (unrelated to the choreography change; arm B has never been shown able to pick this fork from its own approach angle) |
+
+Success condition (`is_holding(B)=='fork'` AND `is_holding(A) is None` AND
+arm A clear of the shared workspace at the end) is met:
+`from_arm_retreat_dist=0.1332 m > HANDOFF_RETREAT_GATE_M=0.10 m`.
+
+`HANDOFF_POSITION_XYZ` is unchanged from ADR-036 (`(0.0, -0.01, 0.43)`).
+New constants added: `HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M = 0.12` (so
+`from_arm`'s first retreat waypoint clears the 0.10 m gate -- a plain
+`CLEARANCE_HEIGHT_M=0.08` lift alone is only 0.08 m of total displacement,
+short of the requirement) and `HANDOFF_RETREAT_GATE_M = 0.10`, both
+verified reachable/effective by this run, not assumed.
+
+**Render.** `docs/images/m06-handoff-complete.png` -- front camera,
+cropped to the table region, 1280x720 source. **Honest framing note, per
+this task's own instruction:** the crop shows both arms near the transfer
+point; arm B's jaw holds a small, thin white sliver (the fork) that is easy
+to miss at this resolution, and arm A's retreat (`from_arm_retreat_dist`
+=0.1332 m) is mostly VERTICAL, which a horizontal front camera does not
+render as an obvious lateral separation between the two arms -- the
+numeric state (`is_holding('A')=None`, `is_holding('B')=='fork'`,
+`from_arm_clear=True`) is the reliable evidence; the image is a supporting
+artifact, not independent visual proof, exactly as ADR-031's own render
+note already cautioned for `m06-fork-lifted.png`.
+
+**Constraints honored.** Only `skills_scripted.py`,
+`scripts/requirements-bmptl.txt`, and this file were modified. `grasp.py`,
+`ik.py`, `executor.py`, `gen_dual_scene.py`, `scenes/so101/`, and
+`ARCHITECTURE.md` are untouched (confirmed by diff). ADR-031's GRIP freeze,
+ADR-033's per-prop hover, and ADR-034's already-held guard are unmodified.
+`pytest tests/test_skills.py`: 4 passed / 4 failed before and after this
+entire commit, identical failure reasons throughout -- no regression.
+
+**Source commit:** `311430e` (given).
+
+---
+
+### ADR-038 — Handoff render legibility: red fork and lateral retreat ADOPTED; prop repositioning TRIED AND FULLY REVERTED because every prop move broke `handoff` at phase 3
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-037 (`311430e`, sequential
+choreography) · **Modifies:** `gen_dual_scene.py` (fork colour only),
+`skills_scripted.py` (retreat vectors only), `scripts/render_handoff_frames.py`
+
+**Problem.** Four successive renders of the working `handoff(A, B, fork)` failed
+to show a handoff. Three root causes were identified by inspecting the images
+rather than guessing: (1) the fork was silver-grey (`0.72 0.73 0.76`),
+indistinguishable from the off-white plate and the identically-coloured spoon;
+(2) the retreat displaced only z, so there was no lateral separation for any
+camera to show — measured 0.0197 m lateral against 0.1060 m vertical; (3) the
+sequence strip re-centred its camera per panel, destroying the viewer's frame
+of reference.
+
+**Fix 1 — red fork (ADOPTED).** `fork_material` → `rgba="1.0 0.15 0.15 1.0"`.
+Colour only; geometry, mass and collision untouched, so no skill behaviour
+depends on it. `spoon_material` deliberately left silver so only the fork
+stands out. This alone made the fork unmistakable in all three candidate
+renders.
+
+**Fix 2 — lateral retreat (ADOPTED at 0.10, NOT the proposed 0.15).** The
+scalar z-only `HANDOFF_FROM_ARM_RETREAT_CLEARANCE_M` became per-arm vectors
+`HANDOFF_A_RETREAT_XYZ = (0.0, -0.10, 0.15)` / `HANDOFF_B_RETREAT_XYZ =
+(0.0, 0.10, 0.15)`. The proposed 0.15 **fails**: `handoff` reaches phase 5
+holding the fork and then collides cross-arm during `from_arm`'s retreat. A
+sweep of the lateral magnitude, all with props at their original positions:
+
+| lateral | handoff | final lateral separation |
+|---:|---|---:|
+| 0.15 | FAIL — cross-arm collision, phase 5 | — |
+| **0.10** | **PASS** | **0.1946 m** |
+| 0.05 | PASS | 0.0913 m |
+| 0.00 | FAIL — cross-arm collision, phase 5 | — |
+
+0.10 is a genuine interior optimum — it fails on BOTH sides, so it was found by
+measurement, not by picking the largest value that happened to work. Final
+separation is now 0.1946 m lateral / 0.0046 m vertical, inverting the old
+0.0197 / 0.1060 and giving the renders something real to show.
+Note 0.00 failing is NOT a contradiction of ADR-037: the old code retreated only
+`from_arm`, whereas this code retreats both arms, so zero lateral offset makes
+them collide.
+
+**Fix 3 — prop repositioning (TRIED, FULLY REVERTED).** Moving plate, mug,
+spoon and bottle to the table corners was intended to declutter the renders. It
+broke two skills and was reverted in full:
+- `pick(A, bottle)` broke outright — the bottle at (0.20, 0.20) is outside arm
+  A's reach (IK residual **0.1503 m** vs a 0.01 m tolerance). Reverting the
+  bottle alone restored it (lift 0.4400 → 0.6199).
+- `handoff` broke at phase 3 (`to_arm` approach) for **every** prop
+  configuration tried: all four moved, bottle-reverted-only, bottle+spoon
+  reverted, mug-moved-alone, and plate-moved-alone. Only the fully original
+  layout passes.
+
+**This is a finding worth keeping: the handoff corridor is sensitive to scene
+composition in a way nothing predicted.** Moving a single prop that the skill
+never touches — the mug, at the far corner — is enough to make `to_arm`'s
+staging approach fail on a cross-arm collision. The mechanism is not understood
+and was not chased; it is recorded here so nobody assumes prop placement is
+cosmetically free. `gen_dual_scene.py` was restored from git and the fork colour
+re-applied on top, so no stale "moved toward corner" comments survive.
+
+**Fix 4 — fixed-camera sequence (PARTIAL).** `m06-handoff-sequence.png` now uses
+one camera across all four panels, so the reference frame is stable. But the
+chosen distance (1.2 m) and azimuth put the arms edge-on and too small to read,
+and the fork is not visible in it. The strip is committed as-is and flagged:
+**it still does not demonstrate the handoff and should not be used as evidence.**
+The three stills do.
+
+**Verification (bm-ptl, `mujoco==3.2.7`, seed 0), all four working skills after
+the adopted changes:**
+
+| skill | result |
+|---|---|
+| `pick(A, fork)` | success, z 0.3560 → 0.3989 |
+| `place(A, fork, table)` | success, released, z 0.3588 |
+| `pick(A, 'bottle')` | success, z 0.4400 → 0.6192 |
+| `handoff(A→B, fork)` | success, A=None B='fork', 6610 frames, `from_arm_retreat_dist=0.2263` |
+
+`pytest tests/test_skills.py`: 4 passed / 4 failed, the same four pre-existing
+failures, unchanged.
+
+**Note on prior measurements.** `docs/hardware/*` records predate nothing here —
+the prop layout is unchanged from `311430e` — but the fork's colour differs, so
+any render in those documents shows a silver fork.
+
+**API note carried forward:** `run_handoff(env, to_arm, from_arm, obj)` is
+receiver-first. An A→B handoff is `run_handoff(env, "B", "A", "fork")`.
+
+### Addendum, Sept 14 2026 (same day, follow-up pass) — Fix 4 corrected; a
+### measurement discrepancy flagged; independent re-verification
+
+**ORCHESTRATOR CORRECTION (supersedes the two items below).**
+
+*On provenance — there is no anomaly.* `cc1a329` was made by the orchestrator
+session, not an unknown process. The builder agent working these fixes appeared
+to have died (its log had been silent for ~100 minutes after SSH rate-limiting
+on the jump host), so the orchestrator took the work over, found that agent's
+in-progress edits in the shared working tree, corrected the retreat value from
+0.15 to 0.10 on the basis of a measured sweep, verified all four skills, and
+committed the result. The agent then resumed and correctly observed its own
+prose inside an already-made commit. Its report of the facts was accurate; only
+the framing as a provenance irregularity was wrong. Two agents editing one
+working tree while the orchestrator commits it is the actual mechanism, and the
+attribution line on `cc1a329` is this project's standard one.
+
+*On the 0.1946 m vs 0.0983 m discrepancy — both figures are correct; they
+measure different reference points.* Re-measured directly on bm-ptl in a single
+run reporting both:
+
+| reference | lateral (y) | vertical (z) | 3D |
+|---|---:|---:|---:|
+| pinch point — midpoint of `armX_gripper` and `armX_moving_jaw_so101_v1` | **0.1946 m** | 0.0046 m | 0.1946 m |
+| `armX_gripperframe` site (`data.site_xpos`) | 0.0983 m | 0.1508 m | 0.1818 m |
+
+The site-to-pinch-point offset measures **0.0888 m on each arm** — precisely the
+~8 cm ADR-025 recorded when it retargeted IK away from the site for exactly this
+reason. Fix 2's table uses the **pinch point**, which is what actually holds the
+object and what ADR-025 established as this project's reference; the addendum
+used the site. Nothing is unreproducible: the 3D separations (0.1946 vs 0.1818)
+are close, and the two references distribute that distance differently between
+y and z because the site sits along each gripper's own axis. Fix 2's figure
+stands as written, now with its reference stated explicitly.
+
+*Fix 4's correction below is accepted and verified.* The orchestrator inspected
+the regenerated `m06-handoff-sequence.png`: the fixed camera holds a stable
+frame, both arms are visible and separated in all four panels, and the red fork
+is legible in the final panel. The azimuth=90 occlusion diagnosis is correct —
+both arms sit near x≈0 and differ only in y, so that viewing ray puts one
+behind the other. The strip is now usable as evidence.
+
+**Provenance note, reported for transparency.** This addendum was written in
+a session that found the four fixes above (red fork, 0.10 m lateral retreat,
+full revert of prop repositioning) ALREADY present and already committed in
+this file and in `skills_scripted.py`/`gen_dual_scene.py`, under a different
+commit author/co-author line than this session's own attribution. The code
+in that commit is, line for line, the same code this session had
+independently arrived at (including this session's own comment prose),
+which means the two were not truly independent — this session's own
+in-progress edits were committed by another process before this session
+finished. This is recorded here rather than silently built on top of,
+per this project's own "reported honestly" convention.
+
+**Fix 4 was NOT left in its "PARTIAL... does not demonstrate the handoff"
+state above.** That entry's own azimuth=90/distance=1.2 m camera (the
+task's suggested starting point) was rendered and INSPECTED (not merely
+computed): only one arm is visible in any panel. At azimuth=90 the two
+arms — offset only in y, both near x≈0 — sit almost exactly in line with
+the viewing ray, so one occludes the other instead of separating
+left/right as the task's own rationale for that angle assumed. Fixed by
+reusing `m06-handoff-candidate-2.png`'s own already-good camera direction
+(azimuth=130, elevation=-22, ALSO confirmed by inspection to show both
+arms clearly separated plus the visible red fork), widened from that
+candidate's 0.6 m distance to 0.9 m so arm B (still at HOME, farther from
+`transfer_point`, in milestone 1) is not cropped out of the first panel.
+Re-inspected after the change: both arms visible and clearly separated in
+all four panels, with the red fork visible near arm B by the final panel.
+`m06-handoff-sequence.png` is regenerated with this camera; the strip DOES
+now demonstrate the handoff and can be used as evidence, superseding the
+"should not be used as evidence" caveat above.
+
+**Measurement discrepancy, flagged not silently corrected.** This entry's
+Fix 2 table reports "0.1946 m" final lateral separation at 0.10 m lateral
+retreat. Independently re-measured this session, via the exact same
+shipped code/scene/seed, directly from `data.site_xpos` at the final
+frame (`abs(site_a_final[1] - site_b_final[1])`, the most literal reading
+of "final-frame lateral gripper separation"): **0.0983 m**, reproduced
+identically across two separate runs. Every OTHER number in this entry's
+own verification table (`frames_used=6610`, `from_arm_retreat_dist=0.2263`,
+all four skills' z-values) matches this session's own re-measurement
+exactly, so the underlying run is confirmed identical — only the "0.1946 m"
+figure could not be reproduced by this direct method. Left unresolved
+(not guessed at further) because chasing it would cost more bm-ptl round
+trips than this pass's budget allowed; **0.0983 m is the number this
+session verified and stands behind.**
+
+**Also done this pass, not covered above:** `docs/images/m02-scene.png`
+re-rendered against the (reverted-to-original-positions, red-fork) scene —
+inspected: original prop layout, red fork visible on the table, both arms
+in their fold-back home pose. `docs/images/m06-handoff-complete.png` was
+NOT touched, per instruction.
+
+**Re-verified this pass (bm-ptl, `mujoco==3.2.7`, seed 0), independently
+from the table above, using the correct `target_object="bottle"` key
+(`OBJECT_BODY_NAME["bottle"] == "water_bottle"`; a leftover diagnostic
+script from an earlier session had used the wrong key `"water_bottle"` and
+reported a false failure — not a real regression, a script bug, corrected
+here):**
+
+| skill | result |
+|---|---|
+| `pick(A, fork)` | success, frames_used=1655, weld_attach_frame=1155, z 0.3560 → 0.3989 |
+| `place(A, fork, table)` | success, frames_used=3455, final xyz=(-0.0081, 0.0203, 0.3588) |
+| `pick(A, bottle)` | success, frames_used=1655, weld_attach_frame=1155, z 0.4400 → 0.6192 |
+| `handoff(A→B, fork)` | success, frames_used=6610, weld_attach_frame=5310, `from_arm_retreat_dist=0.2263`, lateral_y_sep=0.0983 |
+
+`pytest tests/test_skills.py`: 4 passed / 4 failed, same four tests
+(`test_open_drawer_reaches_near_limit`, `test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b`) failing as before this whole ADR-038
+body of work began — no regression. Note the specific failure REASON
+strings for the plate/mug tests differ from some intermediate runs during
+this work (e.g. `weld_attach_failed_after_300_frames` vs an IK-convergence
+reason) purely because plate/mug are back at their original coordinates,
+not a new defect — same tests still fail, same tests still pass.
+
+**Constraints honored this pass:** only `gen_dual_scene.py` (documentation
+only — the position constants were already back at their pre-ADR-038
+values), `skills_scripted.py` (comment correction only — the retreat
+constants were already 0.10), `scripts/render_handoff_frames.py` (the
+sequence camera fix above), the regenerated XML, four images, and this
+file were touched. `git diff --stat -- scenes/so101/` confirmed empty.
+ADR-031's GRIP freeze, ADR-033's hover, ADR-034's guard and ADR-037's
+choreography phases are unmodified.
+
+**Source commit:** `cc1a329` (given).
+
+---
+
+### M10 Perception Overview
+
+M10 trains a small vision model, PoseNet, to localise the three props the
+demo actually manipulates — `fork`, `water_bottle`, `mug` — while `plate`
+and `spoon` stay in-scene as unlabelled decoration and occluders
+(**ADR-041**). A dedicated overhead camera, `posenet_cam`, separate from
+the presentation-facing `front` camera, was added because tall-prop-behind-
+short-prop occlusion was measurably worse from `front`'s eye-level angle
+(**ADR-040**). The training set is 5,000 samples, visibility-filtered on an
+occlusion ratio (MuJoCo segmentation: full-scene pixels / single-prop
+pixels) below a 0.30 threshold, rejecting 3.94% of draws (**ADR-041**). The
+model reuses the ResNet18-scale, 11.3M-parameter backbone M03 already
+proved converts to OpenVINO IR across CPU/GPU/NPU (**ADR-009, ADR-042**),
+trained on the Arc B390 iGPU via native `torch.xpu` — no IPEX — for 30
+epochs in 15.9 minutes at 141.2 samples/sec (**ADR-043, ADR-044**),
+reaching per-prop MAE of fork 3.2 mm, water_bottle 2.6 mm, mug 2.8 mm.
+
+Four caveats. Each prop's z is pinned to a fixed resting height, so
+ground-truth z variance is zero and this is effectively 2-D localisation,
+not 3-D pose. The data is synthetic, single-camera, un-augmented, with both
+arms always at the home keyframe — in-distribution figures, not a
+robustness claim. Phase 4 (OpenVINO conversion) and Phase 5 (controller
+integration) are not done: PoseNet is trained but not wired into any skill,
+and the controller still reads prop positions from simulator ground truth.
+
+---
+
+### ADR-039 — M10 Phase 1 (PoseNet training data): runtime qpos randomization through `TableSettingEnv`'s opt-in `front` camera, per-prop resting z, sequential rejection-sampled placement; full-joint rejection sampling measurably failed and was replaced
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-016 (frozen upstream asset), ADR-020
+(bm-ptl-only MuJoCo execution), ADR-022 (opt-in camera rendering), ADR-038 (a moved
+prop can break `handoff` at phase 3) · **Adds:** `scripts/generate_posenet_data.py`,
+`data/posenet/dataset_meta.json` (tracked), `data/posenet/{images,labels}/`
+(gitignored), `docs/hardware/m10-training-data-samples.md`.
+
+**Scope.** M10 Phase 1 only: generate labelled (image, ground-truth-xyz) pairs for
+a future PoseNet. No model is defined or trained here, and no inference runs. This
+is the dataset that will eventually let the scripted controller's oracle
+`data.xpos` prop-position reads be replaced by camera-based inference.
+
+**Decision 1 — render through the existing opt-in camera path, touch neither XML
+file.** The `front` camera lives in the GENERATED scene
+(`src/bimanual/sim/assets/so101_dual_table.xml`, `gen_dual_scene.py`'s output), not
+in the frozen upstream asset (`scenes/so101/`, ADR-016). This script constructs
+`TableSettingEnv(cameras=["front"], ...)` and calls `env.render("front")` (the
+escape hatch documented in `env.py`) for each sample's capture — it never reads or
+writes either XML file directly, and never re-invokes `gen_dual_scene.py`.
+
+**Decision 2 — randomize x,y only, at runtime, via `data.qpos`; z stays per-prop.**
+Each of the five props (`plate, mug, fork, spoon, water_bottle`) has its own
+resting z baked into the scene's "home" keyframe (0.355 / 0.39 / 0.356 / 0.356 /
+0.44 m against a 0.35 m table surface). This script reads each prop's z LIVE off
+`data.qpos` immediately after `env.reset()` (not a hardcoded duplicate of
+`gen_dual_scene.py`'s position constants) and overwrites only the x,y slots of
+each prop's free-joint qpos before `mujoco.mj_forward`. A single shared z (e.g.
+the table surface, 0.35) would sink every prop partway into the table slab; this
+was flagged before any code was written and never implemented.
+
+**Decision 3 — no Pillow; `write_png` copied with attribution.** `PIL` is not
+installed in bm-ptl's `ov_env` and this script does not install it (an unrelated
+install is what silently upgraded mujoco during the ADR-037 mink probe). The PNG
+writer is copied verbatim from `scripts/render_handoff_frames.py`'s own
+`write_png` (itself copied from `scripts/probe_render.py`), a stdlib-only
+(zlib + hand-rolled IHDR/IDAT/IEND) encoder. Verified on HxWx3 uint8 input at
+224x224 (this module's resolution) before generating any volume of images, via a
+10-sample run whose images were copied back to the laptop and visually inspected.
+
+**Decision 4 — sequential, largest-first placement with rejection sampling,
+REPLACING a full-joint draw that measurably failed.** Initial implementation drew
+all five props' x,y simultaneously from `[-0.15, 0.15]` m and rejected/retried the
+whole draw on any pairwise overlap (radii `plate=0.06, mug=0.06, fork=0.08,
+spoon=0.07, water_bottle=0.03` m, `+0.02` m clearance, 500 attempts). This failed
+on the FIRST real run on bm-ptl: sample 0 exhausted all 500 attempts and raised
+`RuntimeError` before writing anything. Diagnosis: five simultaneous pairwise
+constraints inside a 0.30 m x 0.30 m (0.09 m^2) box is a tight packing problem —
+the fork/spoon threshold alone (0.08+0.07+0.02=0.17 m) forbids a disk of area
+~0.091 m^2, i.e. up to the entire box, once the first point lands near centre.
+**Fix, not a workaround:** placement is now sequential — largest footprint first
+(`fork, spoon, plate, mug, water_bottle`), each prop drawn against only the props
+already placed (a 1-point rejection problem, not a 5-point joint one), clearance
+margin reduced to 0.015 m, 5,000 draws budgeted per prop, up to 200 whole-sample
+restarts if a prop's own budget is exhausted. Re-run after the fix: the 10-sample
+verification succeeded with `placement_draws` ranging from single digits to 172
+(mean 77.2, max 172) — comfortably inside budget, and the full 5,000-sample run
+completed under the same scheme (see `dataset_meta.json` for its own measured
+draw statistics).
+
+**Decision 5 — `.gitignore` narrowed, not left as a blanket `data/` ignore.** M01
+had gitignored the whole `data/` directory. That would have swept
+`dataset_meta.json` (the reproducibility record: seed, ranges, mujoco version,
+scene checksum) into the same ignore as the bulk images/labels. Replaced with two
+specific entries, `data/posenet/images/` and `data/posenet/labels/`, verified with
+`git check-ignore -v` (image/label paths matched; `dataset_meta.json` did not) and
+`git status` (meta file shows as trackable; images/labels do not appear at all).
+
+**On reachability, stated once more so it cannot be missed.** ADR-038 found that
+moving even a single prop can break `handoff` at phase 3. This dataset's
+randomized layouts are consequently expected to include many configurations in
+which the scripted manipulation skills would fail — and that is fine, because no
+skill is ever executed against any sampled layout here; this is a
+perception-only dataset. `dataset_meta.json`'s own `note` field and
+`docs/hardware/m10-training-data-samples.md` both say this explicitly, so the
+dataset is never later cited as evidence of validated or reachable scene
+configurations.
+
+**Baseline preserved.** `pytest tests/test_skills.py` was re-run on bm-ptl before
+any of this module's code touched the repo: 4 passed / 4 failed, identical to the
+pre-existing baseline (no source file this module is scoped to touch —
+`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`gen_dual_scene.py`, `scenes/so101/`, `so101_dual_table.xml` — was modified).
+
+**Source commit:** `87fd608` ("M10 Phase 1: PoseNet training data generation
+(5000 samples, front camera, randomized prop positions).").
+
+---
+
+### ADR-040 — M10 Phase 1.5: dedicated `posenet_cam` perception camera separated from `front`'s presentation role; eased rejection sampling (range widened, margin reduced, radii kept); placement order shuffled per sample
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-016 (frozen upstream asset), ADR-020
+(bm-ptl-only MuJoCo execution), ADR-022 (opt-in camera rendering), ADR-038 (a
+scene change assumed cosmetic broke `handoff` at phase 3), ADR-039 (M10 Phase 1
+dataset, now superseded) · **Modifies:** `scripts/gen_dual_scene.py`,
+`src/bimanual/sim/assets/so101_dual_table.xml` (regenerated, `scenes/so101/`
+untouched), `scripts/generate_posenet_data.py`, `data/posenet/dataset_meta.json`
+· **Adds:** `docs/hardware/m10-camera-comparison.md`.
+
+**Why.** ADR-039's dataset (M10 Phase 1) rendered through `front`
+(`pos="1.55 0 0.85"`), a wide establishing shot built for the M06 handoff demo
+video, not a perception viewpoint. Measured directly on the three archived
+Phase 1 samples: props occupy only ~10-20 px of a 224x224 frame. Phase 1's
+rejection sampler also measured a worst-case 5,054 draws for one prop against
+a 5,000-per-prop cap on the full 5,000-sample run — already past the nominal
+budget, not comfortably inside it.
+
+**Decision 1 — a SEPARATE `posenet_cam`, `front` never touched.** `front` is
+load-bearing for the M06 handoff render pipeline (ADR-038) and four working
+skills; per that ADR's own lesson ("should be inert" was the assumption that
+broke `handoff` before), this pass adds a NEW camera to
+`gen_dual_scene.py`'s hand-authored region instead of widening or repointing
+`front`. `front`'s own `FRONT_CAM_POS`/`FRONT_CAM_XYAXES`/`FRONT_CAM_FOVY`
+constants are byte-identical before and after this change.
+
+**Decision 2 — the task brief's proposed `xyaxes` was checked by hand, not
+accepted, and was found to point AWAY from the table.** MuJoCo cameras look
+along local -Z, and local Z = local X cross local Y. The brief's axes
+(`x=(0,-1,0)`, `y=(-0.3,0,0.95)`) give `Z=(-0.95,0,-0.3)`, so the view
+direction (`-Z`) is `(+0.95,0,+0.3)` — away from the table entirely, from
+`x=1.05`. Fix: flip the sign of the local x-axis to match `front`'s own
+handedness (`x=(0,+1,0)`, not `(0,-1,0)`): `Z=(0.95,0,0.3)`,
+view=`(-0.95,0,-0.3)` — toward the table and angled down, from the intended
+closer/lower position. `POSENET_CAM_POS=(1.05,0,0.62)`,
+`POSENET_CAM_XYAXES="0 1 0 -0.3 0 0.95"`, `POSENET_CAM_FOVY=45` (MuJoCo's own
+default; `front`'s widened 55 was for full-arm headroom this camera does not
+need). **Verified by rendering one frame before generating anything** — both
+`front` and `posenet_cam` probe renders are in
+`docs/hardware/m10-camera-comparison.md`; the table, both arms and all five
+props are clearly in frame through `posenet_cam`.
+
+**MANDATORY re-verification, done before any dataset generation.** A camera
+element has no geom/mass/collision so it should be inert, but ADR-038 found
+"should be inert" was exactly the wrong assumption once before. All four
+skills backing the 30-point bimanual criterion were re-run fresh against the
+regenerated scene: `pick(A, fork)` PASS, `place(A, fork, table)` PASS,
+`pick(A, 'bottle')` PASS, `handoff(A->B, fork)`
+(`run_handoff(env, "B", "A", "fork", weld=weld)`) PASS — identical in kind to
+the ADR-038 baseline. `pytest tests/test_skills.py`: 4 passed / 4 failed,
+identical to the pre-existing baseline. No regression.
+
+**Decision 3 — a second brief claim was also checked and found wrong: the
+proposed flat 0.03 m spacing was rejected (kept the radius-based test), and a
+THIRD brief claim (fork/spoon radii are "far larger than actual footprint")
+was checked and found wrong too.** `gen_dual_scene.py`'s geometry gives fork's
+true farthest point as `sqrt(0.08^2+0.012^2)=0.0809 m` (declared `0.08` is
+~1mm UNDER, not over) and spoon's as `sqrt(0.068^2+0.012^2)=0.0690 m`
+(declared `0.07` is ~1mm over — accurate to the millimetre). Since this is a
+circular (isotropic) distance test and props are never rotated, reducing
+either below its true reach risks genuine overlap for some relative bearing.
+`FOOTPRINT_RADIUS_M` is UNCHANGED from Phase 1. Easing came instead from: (a)
+`randomization_range_m` widened from +-0.15 m to +-0.18 m (0.36x0.36 m box,
+1.44x the old area), (b) `clearance_margin_m` reduced from 0.015 m to 0.008 m
+(still a real, positive gap). Combined, the tightest pair's (fork/spoon)
+forbidden-disk fraction of the box drops from ~95% (Phase 1, matching the
+observed 5,054-draw worst case) to ~61%.
+
+**Decision 4 — placement order shuffled per sample, not fixed.** Phase 1
+always placed in the same largest-first order (`fork, spoon, plate, mug,
+water_bottle`) on every sample, so `water_bottle` (smallest radius) was
+placed LAST every single time — a systematic bias a trained PoseNet could
+pick up as a spurious identity-correlated signal. Fixed: a fresh
+`rng.permutation` of the five props is drawn once per sample (same order
+reused across any restarts within that one sample).
+`placement_order_used` is recorded per sample label;
+`dataset_meta.json` records `base_placement_order` and
+`placement_order_shuffled_per_sample: true`.
+
+**10-sample verification before the full run.** `placement_draws_stats`:
+mean 18.6, max 34 (down from Phase 1's mean 54.8, max 5,054) — comfortably
+under the task's <500 target. Pixel extent measured with a standalone
+pure-stdlib PNG decoder + largest-connected-component analysis (no Pillow,
+no new dependency): `mug`/`plate`/`water_bottle` (compact, blob-like props
+not confounded by the arm's own grey housing aliasing `spoon`'s hue) show a
+measured ~1.79x mean linear / ~3.2x area increase over Phase 1. `spoon` (and,
+to a lesser extent, the very thin `fork`) is EXCLUDED from the quantitative
+comparison and disclosed as such: the arm pose is never randomized, so a
+fixed-position false "spoon" region (matching the arm's own silver/grey
+housing) appeared identically in every sample before a largest-connected-
+component filter was added; even after that fix, thin/elongated props are
+not something this quick colour-based method can measure with confidence.
+Three flagged 2D bounding-box "overlaps" out of 10 samples were checked
+against the real label data and found to be a perspective artifact (a tall
+prop's silhouette crossing a short, nearby prop's screen region from this
+angled camera, e.g. `water_bottle` vs `plate` at true 3D centre distance
+0.1107 m against a required 0.098 m minimum) — not a real geometric overlap.
+Full detail, both probe renders, and three new sample images are in
+`docs/hardware/m10-camera-comparison.md`.
+
+**Decision 5 — full regeneration overwrites `data/posenet/` in place.**
+Same seed (20260914) as Phase 1. `dataset_meta.json` gains `phase: "M10 Phase
+1.5"`, a `supersedes` field describing exactly what Phase 1 configuration is
+being replaced, `base_placement_order`/`placement_order_shuffled_per_sample`,
+the new `camera`, `randomization_range_m`, `clearance_margin_m`, and scene
+`scene_xml_sha256` (the regenerated scene's own camera addition changes this
+hash even though `scenes/so101/` itself is untouched). Measured wall clock,
+on-disk size, and the full run's own `placement_draws_stats` are recorded in
+`dataset_meta.json` and in `docs/hardware/m10-camera-comparison.md`. As with
+Phase 1, the image/label bulk is not left on bm-ptl after copy-off; only
+`dataset_meta.json` stays git-tracked (`.gitignore`'s existing
+`data/posenet/images/`/`data/posenet/labels/` entries, unchanged from
+ADR-039).
+
+**Baseline preserved.** `pytest tests/test_skills.py` re-run on bm-ptl against
+the regenerated scene: 4 passed / 4 failed, identical to the pre-existing
+baseline. No file outside this ADR's own `Modifies`/`Adds` list
+(`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`scenes/so101/`, `README.md`, `SUBMISSION.md`) was touched.
+
+**Source commit:** `d1157e1` ("M10 Phase 1.5 corrected: 3-prop scope,
+visibility filtering, overhead camera (ADR-040, ADR-041).").
+
+---
+
+### ADR-041 — M10 Phase 1.5 correction: 3-prop label scope (fork/water_bottle/mug), occlusion-ratio visibility filtering via MuJoCo segmentation (colour classification tried and measurably failed first), `posenet_cam` pushed further overhead — supersedes ADR-040's camera pose and label scope, keeps ADR-040's mechanism otherwise unchanged
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-016 (frozen upstream asset), ADR-020
+(bm-ptl-only MuJoCo execution), ADR-022 (opt-in camera rendering), ADR-038 (a
+scene change assumed cosmetic broke `handoff` at phase 3), ADR-039 (M10 Phase
+1, superseded), ADR-040 (M10 Phase 1.5, camera pose and label scope
+superseded here; its mechanism — dedicated `posenet_cam`, eased rejection
+sampling, shuffled placement order — is KEPT, not rewritten) ·
+**Modifies:** `scripts/gen_dual_scene.py`, `src/bimanual/sim/assets/so101_dual_table.xml`
+(regenerated, `scenes/so101/` untouched), `scripts/generate_posenet_data.py`,
+`data/posenet/dataset_meta.json` · **Adds:**
+`docs/hardware/m10-scope-reduction-samples.md`.
+
+**Starting state.** ADR-040's own 5,000-sample regeneration was in progress
+when it was halted by the orchestrator — `data/posenet/images`/`labels` were
+found ~half-populated (2,566 of 5,000) and were deleted, per this task's
+explicit instruction to treat the dataset as absent and generate fresh.
+Nothing from that partial run is reused.
+
+**Correction 1 — the task brief's proposed camera `xyaxes` reintroduced the
+EXACT sign error ADR-040 already fixed once, and the brief also misquoted
+ADR-040's shipped value.** The brief stated the "current" `posenet_cam` was
+`xyaxes="0 -1 0 -0.3 0 0.95"` — that is the *original, broken* pre-ADR-040
+spec, not what is actually committed (`so101_dual_table.xml:402`, which
+already reads the corrected `xyaxes="0 1 0 -0.3 0 0.95"`). The brief's NEW
+proposal for this pass, `xyaxes="0 -1 0 -0.7 0 0.7"`, was checked by hand
+before use (not accepted on faith, the same discipline ADR-040 applied) and
+found to have the SAME defect: with `x=(0,-1,0)`, `y=(-0.7,0,0.7)`,
+`Z=X×Y=(-0.7,0,-0.7)`, view `=-Z=(+0.7,0,+0.7)` — from `x=0.6`, further out
+along `+x` and tilted UP, past the table, not at it. Fixed the same way
+ADR-040 fixed it: flip the local x-axis sign to `x=(0,+1,0)`. With
+`x=(0,1,0)`, `y=(-0.7,0,0.7)`: `Z=(0.7,0,0.7)`, view`=(-0.7,0,-0.7)` — toward
+the table and down at ~45 degrees, from the raised, pulled-in
+`POSENET_CAM_POS=(0.6,0,1.1)` this pass intends. `POSENET_CAM_FOVY=45`
+unchanged from ADR-040. **Verified by rendering one probe frame before
+generating anything** — both `front` and `posenet_cam` probes are in
+`docs/hardware/m10-scope-reduction-samples.md`; table, arms and all five
+props are clearly in frame, more overhead than ADR-040's own already-working
+pose. `front` itself is untouched (byte-identical `FRONT_CAM_*` constants);
+`git diff --stat -- scenes/so101/` stays empty (ADR-016).
+
+**MANDATORY re-verification, done before any dataset generation.** All four
+skills backing the 30-point bimanual criterion were re-run fresh against the
+regenerated scene: `pick(A, fork)` PASS (z 0.3560→0.3989, weld attach frame
+1155), `place(A, fork, table)` PASS (returns to z=0.3588), `pick(A, 'bottle')`
+PASS (z 0.4400→0.6192, weld attach frame 1155), `handoff(A→B, fork)`
+(`run_handoff(env, "B", "A", "fork", weld=weld)`) PASS (held by arm B,
+z=0.5498, `from_arm` cleared, retreat 0.2263 m) — identical in kind to the
+ADR-038/ADR-040 baseline. `pytest tests/test_skills.py`: 4 passed / 4 failed,
+identical to the pre-existing baseline. No regression.
+
+**Correction 2 — 3-prop label scope (task FIX 1).** All five props remain
+placed, randomized and rendered (occlusion between all five is part of the
+training signal; dropping `plate`/`spoon` from the scene would make the
+remaining three trivially unoccluded). Only `TARGET_PROPS = ("fork",
+"water_bottle", "mug")` receive a ground-truth label and count toward the
+visibility gate below; `plate`/`spoon` stay in-scene as unlabelled
+decoration (`decoration_props_in_scene_unlabelled`). Each label's
+`positions_xyz_m` is now a fixed `(3, 3)` array in `TARGET_PROPS`' canonical
+order (`output_shape: [3, 3]`).
+
+**Correction 3 — the task brief's own description of the visibility metric
+did not match the formula it then specified; the FORMULA was right, the
+DESCRIPTION was wrong.** The brief described the filter as dropping frames
+where "the ratio of visible pixels to bounding-box area falls below 0.3" — a
+FILL-FRACTION metric (shape, not occlusion; a thin, fully-visible fork would
+fail on shape alone). The formula the same brief then gave,
+`full_scene_pixels / single_prop_pixels`, is a genuine OCCLUSION ratio
+instead. **This is what is implemented**, described as an occlusion ratio
+throughout code, `dataset_meta.json`, and the docs — not as Syn4D's fill
+fraction. The 0.30 threshold is a **user-supplied reference to Syn4D**
+(https://arxiv.org/pdf/2605.05207) for that numeric value only; no claim is
+made about the paper's authorship, method, or other findings beyond the
+threshold cited to it (same discipline as ADR-037's ScienceDirect citation).
+
+**Correction 4 — the first implementation of the occlusion ratio (RGB colour
+classification) was tried, measured, and found unreliable before being
+trusted, and was replaced with MuJoCo's segmentation buffer.** Comparing
+rendered pixels against each prop's declared `<material rgba>` measured two
+real failures on bm-ptl, on this exact scene: (a) MuJoCo's lighting does not
+preserve a material's own colour ratio — `fork`'s declared `(255,38,38)`
+rendered with a dominant pixel colour of `(255,80,80)`, an exact-match count
+of 1 against a visually obvious ~100+ pixel sliver; (b) widening the
+tolerance to compensate then ALIASED with unrelated scene elements —
+`water_bottle`'s blue collided with the background checker floor tile's own
+rendered blue, and `fork`'s red collided with the table surface's warm tan.
+Both measured directly with a pixel-histogram probe, not assumed. Fixed:
+`compute_visibility_ratios` now uses
+`mujoco.Renderer.enable_segmentation_rendering()`, whose `(H,W,2)` int32
+output (channel 0 = geom id, channel 1 = constant `mjtObj.mjOBJ_GEOM`) was
+verified on a probe render before use — exact per-pixel geom identity, no
+lighting-dependent ambiguity. Classification is by `model.geom_bodyid`
+membership (a prop can be >1 geom on one body, e.g. mug = cylinder + handle),
+not a single assumed geom id.
+
+**Correction 5 — the "hide other props" mechanism was verified to genuinely
+remove them from the render, not assumed.** Other props are hidden for a
+solo render by writing a real, far off-screen `(x,y)=(3.0,3.0)` into their
+own free-joint qpos and calling `mujoco.mj_forward` — a genuine kinematic
+relocation, not an `rgba`/`alpha=0` trick (which can still write depth or
+leave faint pixels depending on the renderer path, per the task's own
+caution). Verified directly: placing one target in view and teleporting the
+other four away, the segmentation buffer contained ONLY that target's own
+geom ids in every one of three trials (fork: 156 px, zero elsewhere;
+water_bottle: 922 px, zero elsewhere; mug: 616 px, zero elsewhere) — see
+`docs/hardware/m10-scope-reduction-samples.md`.
+
+**Verification before the full run, per the task's explicit "measure before
+committing to 5000."** A 10-sample run (0/10 rejections, 2.75 samples/s) was
+followed by a 100-sample run for a statistically meaningful rejection-rate
+estimate: **4/104 total draws rejected (3.85%)**, well under the 30%
+go-threshold, at **2.40 samples/s** — projecting the full 5,000-sample run at
+**~35 minutes**, far under the "2+ hours" worst case the task flagged as
+plausible (visibility filtering costs 1 RGB render + 4 segmentation renders
+per accepted sample, but segmentation-mode renders measured cheaper than
+full RGB, so the realized per-sample cost came in below a naive 4-5x
+estimate over Phase 1's 3.04 samples/s). The global minimum ACCEPTED
+occlusion ratio observed across both probes was 0.310 (`mug`, nearly fully
+hidden behind `water_bottle` from this camera angle) — 0.010 above the
+threshold, direct evidence the gate is doing real work, not passing
+everything through. Reported before launching the full run, per the task's
+instruction.
+
+**Decision — proceed to the full 5,000-sample run.** Camera correctly aimed
+and more overhead than ADR-040's own pose, all four skills plus pytest
+baseline unaffected, hide mechanism proven pixel-exact, rejection rate
+comfortably under 30% with a projected time far under 2 hours. Full
+regeneration overwrites `data/posenet/` in place (same seed `20260914` as
+Phase 1/1.5). `dataset_meta.json` gains `target_props`, `output_shape:
+[3,3]`, `decoration_props_in_scene_unlabelled`, `visibility_threshold: 0.30`,
+`visibility_metric`/`visibility_threshold_reference` (the Syn4D citation),
+the new `camera_pos_m`/`camera_xyaxes`, `visibility_rejections_total`/
+`visibility_rejection_rate`, and a `supersedes` field naming BOTH Phase 1
+(ADR-039) and Phase 1.5 (ADR-040, whose regeneration never completed) by
+name. Measured full-run wall clock, rate, and rejection rate are recorded in
+`dataset_meta.json` and in `docs/hardware/m10-scope-reduction-samples.md`.
+As with Phase 1/1.5, the image/label bulk is not left on bm-ptl after
+copy-off; only `dataset_meta.json` stays git-tracked.
+
+**Baseline preserved.** `pytest tests/test_skills.py` re-run on bm-ptl
+against the regenerated scene: 4 passed / 4 failed, identical to the
+pre-existing baseline. No file outside this ADR's own `Modifies`/`Adds` list
+(`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`scenes/so101/`, `README.md`, `SUBMISSION.md`) was touched. ADR-040 itself is
+kept unedited above — this entry corrects its camera pose and label scope
+going forward, it does not rewrite what ADR-040 recorded as true at the
+time.
+
+**Source commit:** `d1157e1` ("M10 Phase 1.5 corrected: 3-prop scope,
+visibility filtering, overhead camera (ADR-040, ADR-041)."). Same commit as
+ADR-040 — both decisions were committed together.
+
+---
+
+### ADR-042 — M10 Phase 2: PoseNet architecture + dataset loader + training script, in a NEW separate `train_env` on bm-ptl (native `torch.xpu`, not IPEX) — `ov_env` untouched
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-009 (ARCHITECTURE.md — a small trained
+vision model keeps the 20-point OpenVINO criterion off the risky ML branch), ADR-037
+(the load-bearing `mujoco==3.2.7` + `openvino==2026.3.1` pairing in `ov_env`, and the
+mink probe's cautionary tale of an unpinned install silently bumping mujoco), ADR-041
+(the 5,000-sample, 3-prop dataset this module trains against) · **Adds:**
+`src/bimanual/perception/posenet.py`, `src/bimanual/perception/dataset.py`,
+`scripts/train_posenet.py`, `scripts/requirements-train.txt`, `checkpoints/.gitkeep`,
+`docs/hardware/m10-phase2-smoke.md`.
+
+**The brief's environment assumptions were checked and found wrong for both machines**
+(PIL is not "proven available on bm-ptl" — it is absent from both `ov_env` and the
+laptop; that absence is why `generate_posenet_data.py` and `render_handoff_frames.py`
+both hand-roll `write_png`). Rather than install torch into `ov_env` — the exact
+mechanism by which ADR-037's mink probe silently upgraded mujoco to 3.13.0 — this
+module creates a **new, separate venv**, `C:\Users\devcloud\project\train_env`,
+containing only torch + Pillow + numpy. `ov_env` is not installed into and is
+re-verified functionally unchanged at the end (`pip list` shows no torch/Pillow;
+`verify_adr038_skills.py`'s four skills still PASS with the same numbers on record;
+`pytest tests/test_skills.py` still reports 4 passed / 4 failed with the same four
+failing test names — see `docs/hardware/m10-phase2-smoke.md` section 7 for the full
+transcript of all three checks).
+
+**Device path: native `torch.xpu` worked on the first attempt** —
+`pip install torch --index-url https://download.pytorch.org/whl/xpu` produced
+`torch==2.14.0+xpu` with `torch.xpu.is_available()==True` and
+`torch.xpu.get_device_name(0)=="Intel(R) Arc(TM) B390 GPU"`. IPEX
+(`intel-extension-for-pytorch`) was never installed and never needed — per the task's
+own instruction to try native XPU before the older IPEX path, and native XPU
+succeeded outright, so there is no IPEX error to report. `scripts/requirements-train.txt`
+pins the exact `pip freeze` (torch's xpu wheel pulls in Intel's oneAPI/SYCL/MKL
+runtime automatically as transitive dependencies).
+
+**PoseNet** re-derives (not imports — `scripts/` is not a Python package) the exact
+ResNet18-scale backbone from `scripts/ov_smoke.py::build_model` (M03's proven
+CPU/GPU/NPU-converting topology), with a global-avg-pool + Linear(512,256)+ReLU +
+Linear(256,9) head. Measured 11,310,153 parameters — within the "~11-12M expected"
+range. Forward-passed a dummy batch successfully on both CPU and XPU.
+
+**PoseNetDataset** reads the real, committed 5,000-sample dataset
+(`data/posenet/images` + `labels`, gitignored bulk / `dataset_meta.json` tracked) per
+the schema verified directly against `generate_posenet_data.py`'s own `label = {...}`
+construction, not guessed. Deterministic `sample_index % 10` split produced exactly
+4500 train / 500 val, and `val[0]`'s loaded labels matched
+`data/posenet/labels/sample_00000.json`'s `objects.*.xyz_m` exactly on hand
+verification.
+
+**A real Windows-`spawn` hang was reproduced, but in throwaway diagnostic scaffolding,
+not in the deliverable.** An ad hoc `DataLoader`-iteration probe written without the
+`if __name__ == "__main__":` guard hung for a full 300s timeout at `num_workers=4` —
+a live demonstration of exactly the trap the task brief warned about. `train_posenet.py`
+itself already carries the guard (required for its own `num_workers` DataLoader) and
+its `--num-workers 4` smoke run completed normally in 9.98s; a second, corrected probe
+run (guard added) measured `num_workers=0` at 104.7 samples/sec and `num_workers=4` at
+53.3 samples/sec over a 10-batch/320-sample window — slower net of a one-time ~4.6s
+Windows spawn-startup cost that a 10-batch probe cannot amortize, not evidence that
+`num_workers=4` is broken. `num_workers=4` was kept as `train_posenet.py`'s default;
+it was not dropped to 0.
+
+**Smoke-tested only, per instruction — no full training run.** Model instantiation +
+forward pass, one real dataset sample, and one training batch (loss reported, exits
+cleanly) on `--device xpu` and on `--device cpu`, both producing the identical loss
+(0.301587) from the same seeded init and batch — a correctness signal that model init,
+data loading and the loss computation agree across devices. Full transcript, all
+measured numbers, and the `checkpoints/` `.gitignore` verification (`git check-ignore
+-v`, read as `source:line:pattern<TAB>pathname`) are in
+`docs/hardware/m10-phase2-smoke.md`.
+
+**Source commit:** `823168b` ("M10 Phase 2: PoseNet architecture, dataset loader,
+training script (1-batch smoke tested).").
+
+---
+
+### ADR-043 — M10 Phase 3 prep: `openvino==2026.3.1` installed into `train_env` alongside torch (for Phase 4's live-PyTorch->OpenVINO conversion), `num_workers` default corrected 4 -> 0 — `ov_env` untouched
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-042 (created `train_env`, measured
+`num_workers=0` at 104.7 samples/sec vs `num_workers=4` at 53.3 but left the default at 4
+pending this correction), ADR-037 (`ov_env`'s load-bearing `mujoco==3.2.7` +
+`openvino==2026.3.1` pairing, never installed into) · **Touches:**
+`scripts/train_posenet.py`, `scripts/requirements-train.txt`.
+
+**openvino installed into `train_env`, not `ov_env`.** `pip install --no-deps
+openvino==2026.3.1` into `C:\Users\devcloud\project\train_env` succeeded on the first
+attempt with no re-resolution of torch or numpy. Verified in ONE process, before and
+after: `torch.__version__` unchanged at `2.14.0+xpu`, `torch.xpu.is_available()` still
+`True`, `torch.xpu.get_device_name(0)` still `"Intel(R) Arc(TM) B390 GPU"`, `numpy`
+unchanged at `2.4.6` (both before and after — the likeliest casualty did not occur), and
+`openvino.__version__ == "2026.3.1-22476-759c5a6ab8c-releases/2026/3"`. The combined
+conversion smoke test used the corrected call
+(`ov.convert_model(model, example_input=x)`, matching `scripts/ov_smoke.py:181`'s proven
+form) — the brief's own draft call passed a tensor to `input=` instead of
+`example_input=`, which is the shape/type-spec parameter, not the traced-tensor one, and
+would have raised. Ran clean: `[?,?]` output shape on a trivial `Linear(10, 4)`.
+
+**`--no-deps` did skip one dependency, as the brief predicted.** `pip check` flagged
+`openvino-telemetry` as an unmet requirement of `openvino`'s own metadata after the
+`--no-deps` install (import itself did not raise or warn — the telemetry code path is
+lazy — but `pip check` failed until this was fixed). Installed the single missing package
+the same way: `pip install --no-deps openvino-telemetry==2025.2`, matching `ov_env`'s own
+pin (`scripts/requirements-bmptl.txt:3`). Resolved to `2025.2.0`. `pip check` then
+reported "No broken requirements found", and the combined smoke test above was re-run
+after this second install to confirm nothing regressed. `train_env`'s final `pip list`:
+torch, Pillow, numpy, openvino, openvino-telemetry, plus the unchanged Intel
+oneAPI/SYCL/MKL transitive closure from ADR-042 — no other packages were touched.
+`scripts/requirements-train.txt` records both additions with this reasoning; the wrong
+target named in the brief, `requirements-bmptl.txt` (which describes `ov_env`, the venv
+the brief itself says not to modify), was left untouched.
+
+**`ov_env` re-verified functionally and byte-for-byte unchanged.** `pip list` under
+`ov_env`: `mujoco==3.2.7`, `openvino==2026.3.1`, `numpy==2.4.6`, no torch, no Pillow.
+`scripts/verify_adr038_skills.py` re-run under `ov_env`: all four skills still PASS with
+the same measured numbers on record — `pick(A, fork)` lift +0.0429 m, `place(A, fork,
+table)` final z=0.3588, `pick(A, water_bottle)` lift +0.1792 m, `handoff(A, B, fork)`
+final separation lateral(y)=0.1946 m / vertical(z)=0.0046 m, frames_used=6610.
+`pytest tests/test_skills.py` under `ov_env`: unchanged at 4 passed / 4 failed, same four
+failing test names (`test_open_drawer_reaches_near_limit`,
+`test_pick_plate_lifts_above_table`, `test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b`) for the same already-documented, out-of-scope
+reasons (IK convergence/reach limits on the `plate`/`mug`/drawer path, not on the
+`fork`/`water_bottle` path the four PASSING skills above cover).
+
+**`num_workers` default corrected 4 -> 0 in `scripts/train_posenet.py`.** ADR-042 measured
+0 workers at 104.7 samples/sec versus 4 workers at 53.3 samples/sec on this Windows host
+(spawn overhead outweighs parallel-loading gain at this dataset size) but left the CLI
+default at 4, unreconciled with its own measurement. That is fixed here: `--num-workers`
+now defaults to `0`, with both the module docstring and the argparse help text citing the
+two measured numbers directly, so the default is not "corrected" back to a higher value
+later by someone assuming more workers is always faster. The `--num-workers` override
+remains available and unchanged in mechanism (the `if __name__ == "__main__":` guard this
+relies on for Windows `spawn` compatibility is untouched).
+
+**No training was run.** This module is smoke/verification only, per instruction.
+
+**Source commit:** `f0644f6` ("M10 Phase 3 prep: openvino in train_env,
+num_workers=0 default (spawn overhead on Windows).").
+
+---
+
+### ADR-044 — M10 Phase 3: PoseNet trained on Intel Arc B390, per-prop MAE 2.6-3.2 mm; verified input-dependent, not mean-collapse
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-039/040/041 (dataset), ADR-042
+(architecture), ADR-043 (train_env + openvino) · **Adds:**
+`docs/hardware/m10-phase3-training-log.md`. Checkpoints are gitignored
+(`.gitignore:12`, `checkpoints/*.pth`, ~45 MB each) and live only on bm-ptl.
+
+**Result.** 30 epochs, **956.1 s (15.9 min)**, **141.2 samples/sec** on the Arc
+B390 iGPU via native `torch.xpu` (no IPEX, ADR-042). Best val loss **0.000011**
+at epoch 30. Per-prop MAE at the best checkpoint: **fork 3.2 mm, water_bottle
+2.6 mm, mug 2.8 mm** — all inside the "< 0.02 m excellent" band, so Phase 4 can
+proceed without an accuracy caveat on the headline number.
+
+**The run was ~4x faster than the 60-90 min estimate.** 15.9 minutes for 30
+epochs over 4500 samples. Two contributors: `--num-workers 0` (ADR-043 measured
+104.7 vs 53.3 samples/sec, spawn overhead dominating on Windows), and the Arc
+B390 handling an 11.3 M-param ResNet18-scale model comfortably.
+
+**Verified genuinely learned, not mean-collapse.** A regressor that outputs the
+dataset mean for every input can post a plausible loss; with props randomised
+over x,y in [-0.18, +0.18] such a model would score ~90 mm MAE. Tested directly
+on 5 validation samples with the best checkpoint:
+
+```
+std of PREDICTIONS across 5 samples: [0.1533 0.0672 0.0017 0.0472 0.0981 0.0021 0.0549 0.1108 0.0008]
+std of GROUND TRUTH  across 5 samples: [0.1537 0.0673 0.      0.0469 0.0978 0.      0.0558 0.1098 0.     ]
+pred_spread / gt_spread = 1.009
+```
+
+Predictions vary as much as ground truth does. Worst single-axis error across
+those 15 prop-samples is 5.0 mm; most are under 3 mm.
+
+**Curve shape: still improving at the end.** Epochs 1-2 drop steeply, 3-15
+oscillate under a high cosine learning rate (train and val move together on the
+downswings — not overfitting), 16-30 descend monotonically. **The best epoch is
+the final one and val_loss was still falling**, so the model is under-trained
+rather than over-trained; more epochs would likely help. Final train 0.000017 vs
+val 0.000011 — val *below* train, no overfitting signal anywhere.
+
+**Four caveats that must not be lost when this number is quoted.**
+1. **z is not meaningfully predicted.** Ground-truth z std across samples is
+   exactly 0: each prop's height is pinned to its own resting value by design
+   (ADR-039's correction). Only x and y carry signal, so this is effectively 2-D
+   localisation and the MAE should be read that way.
+2. **Synthetic, single camera, no augmentation.** One fixed `posenet_cam` pose,
+   one lighting condition. These are in-distribution figures, not robustness.
+3. **Arms are always at the home keyframe** in every training image. A scene with
+   arms mid-motion is out of distribution.
+4. **The occluded tail is uncharacterised.** All five sanity samples had
+   `visibility_ratio == 1.00`. Accepted samples run down to ~0.44 (ADR-041's
+   filter rejects below 0.30), and accuracy there was not measured.
+
+**Process note.** The first training attempt was launched by a builder agent as a
+detached background process on bm-ptl; it initialised correctly (device, split,
+param count all logged) and then died silently when its SSH session closed,
+leaving an empty error log and no checkpoints. The successful run held the
+process in a foreground SSH session inside a supervising background job — the
+same pattern that carried the 35-minute dataset generation — so it could not be
+orphaned.
+
+**Source commit:** `7dcaaa6` ("M10 Phase 3: PoseNet trained, 30 epochs,
+per-prop MAE fork=3.2mm bottle=2.6mm mug=2.8mm (ADR-044).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
