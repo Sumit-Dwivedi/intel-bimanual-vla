@@ -145,6 +145,60 @@ FRONT_CAM_FOVY = 55
 DRAWER_HOUSING_Y = 0.08
 DRAWER_HOUSING_Z = 0.28
 
+# ---- M10 Phase 1.5 posenet_cam (ADR-041 correction) --------------------
+# Dedicated perception camera for scripts/generate_posenet_data.py. M10
+# Phase 1 rendered PoseNet training frames through `front`
+# (FRONT_CAM_POS=(1.55, 0, 0.85), a wide establishing shot framed for the
+# M06 handoff demo video -- both whole arms plus the table) and measured
+# props occupying only ~10-20 px of a 224x224 frame -- too small for a
+# useful pose regressor. `front` is DELIBERATELY NOT MODIFIED here: it is
+# load-bearing for the handoff render pipeline and (per ADR-038) even
+# scene-only changes have broken working skills before, so this is an
+# ADDITIONAL camera, not an edit to an existing one.
+#
+# **ADR-040's first cut (`pos=(1.05,0,0.62)`, `xyaxes="0 1 0 -0.3 0
+# 0.95"`) shipped and was verified working** (props ~1.8x linear zoom over
+# Phase 1, all four skills re-verified). **The ADR-041 task brief then
+# proposed a second `xyaxes` (`"0 -1 0 -0.7 0 0.7"`) to push the camera
+# further overhead, and that proposal was checked by hand BEFORE use, the
+# same way ADR-040's was -- and it reintroduces the identical sign defect
+# ADR-040 already fixed once.** MuJoCo cameras look along their own local
+# -Z axis, and a camera's local Z = local X cross local Y. With
+# x=(0,-1,0), y=(-0.7,0,0.7): Z = X x Y = (-1*0.7 - 0*0, 0*(-0.7) - 0*0.7,
+# 0*0 - (-1)*(-0.7)) = (-0.7, 0, -0.7), so the VIEW direction (-Z) is
+# (+0.7, 0, +0.7): from x=0.6 m, further out along +x and tilted UP --
+# past the table into open air, not at it. (The brief's description of
+# the "current" value as `xyaxes="0 -1 0 -0.3 0 0.95"` is also not what
+# shipped -- the committed ADR-040 value already has the corrected sign,
+# `x=(0,+1,0)`, see the git history for this file.)
+#
+# Fix, applied the same way ADR-040 fixed it: flip the sign of the local
+# x-axis to `x=(0,+1,0)` (matching `front`'s own handedness). With
+# x=(0,1,0), y=(-0.7,0,0.7): Z = X x Y = (1*0.7 - 0*0, 0*(-0.7) - 0*0.7,
+# 0*0 - 1*(-0.7)) = (0.7, 0, 0.7), view = -Z = (-0.7, 0, -0.7) -- toward
+# the table (-x) and DOWN (-z) at roughly a 45-degree overhead angle, from
+# the raised, pulled-in position (POSENET_CAM_POS=(0.6, 0, 1.1)) this pass
+# intends. Independently cross-checked with this file's own
+# `look_at_xyaxes()` helper: aiming POSENET_CAM_POS at a point on the
+# table surface (0, 0, 0.35) via look-at produces a right/up pair whose
+# sign pattern matches this corrected value (x positive, y's x-component
+# negative, y's z-component positive), confirming the sign flip -- not the
+# magnitude -- was again the defect. As with ADR-040, this arithmetic is
+# NOT trusted on its own: the corrected value must be verified by actually
+# rendering one probe frame and visually confirming the table and props
+# are in view BEFORE any dataset sample is generated
+# (docs/hardware/m10-scope-reduction-samples.md).
+POSENET_CAM_POS = (0.6, 0.0, 1.1)
+POSENET_CAM_XYAXES = "0 1 0 -0.7 0 0.7"
+# fovy left at MuJoCo's own default (45 deg, unlike front's widened 55 --
+# posenet_cam does not need full-arm headroom the way front's handoff
+# framing does); re-checked against the probe render for this raised,
+# more-overhead position (docs/hardware/m10-scope-reduction-samples.md) and
+# left unchanged -- the table and all three target props stayed in frame
+# at 45 degrees without needing to widen it.
+POSENET_CAM_FOVY = 45
+POSENET_CAM_POS_STR = "%.4f %.4f %.4f" % POSENET_CAM_POS
+
 DRAWER_CAM_POS = (0.0, -0.55, 0.15)
 # Drawer body world position at drawer_slide=0 (closed): the `drawer`
 # body sits at local pos (0,0,0) inside `drawer_housing`, which is placed
@@ -832,6 +886,9 @@ def main():
         front_cam_pos=FRONT_CAM_POS_STR,
         front_cam_xyaxes=FRONT_CAM_XYAXES,
         front_cam_fovy=FRONT_CAM_FOVY,
+        posenet_cam_pos=POSENET_CAM_POS_STR,
+        posenet_cam_xyaxes=POSENET_CAM_XYAXES,
+        posenet_cam_fovy=POSENET_CAM_FOVY,
         drawer_cam_pos="%.4f %.4f %.4f" % DRAWER_CAM_POS,
         drawer_cam_xyaxes=DRAWER_CAM_XYAXES,
         drawer_cam_fovy=DRAWER_CAM_FOVY,
@@ -1101,6 +1158,14 @@ TEMPLATE = """<?xml version="1.0"?>
          ~0.667m rest-pose arm height, with a widened fovy for headroom as
          arms move during a task. -->
     <camera name="front" pos="{front_cam_pos}" xyaxes="{front_cam_xyaxes}" fovy="{front_cam_fovy}"/>
+    <!-- posenet_cam: M10 Phase 1.5 dedicated perception camera (see
+         POSENET_CAM_* above for the corrected xyaxes derivation and why
+         `front` above is left untouched instead of reused/widened). Closer
+         to the table and angled down at the shared working area, not
+         framing the whole arms the way `front` does -- this camera exists
+         for `scripts/generate_posenet_data.py` only; no skill or demo
+         render path uses it. -->
+    <camera name="posenet_cam" pos="{posenet_cam_pos}" xyaxes="{posenet_cam_xyaxes}" fovy="{posenet_cam_fovy}"/>
     <!-- drawer_view: low, angled up, on the -y side past the open drawer's
          protrusion (see DRAWER_CAM_* comment above for the empirical
          reasoning). FIXED orientation via xyaxes (M02 drawer_view fix,

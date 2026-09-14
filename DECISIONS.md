@@ -11,6 +11,278 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-041 — M10 Phase 1.5 correction: 3-prop label scope (fork/water_bottle/mug), occlusion-ratio visibility filtering via MuJoCo segmentation (colour classification tried and measurably failed first), `posenet_cam` pushed further overhead — supersedes ADR-040's camera pose and label scope, keeps ADR-040's mechanism otherwise unchanged
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-016 (frozen upstream asset), ADR-020
+(bm-ptl-only MuJoCo execution), ADR-022 (opt-in camera rendering), ADR-038 (a
+scene change assumed cosmetic broke `handoff` at phase 3), ADR-039 (M10 Phase
+1, superseded), ADR-040 (M10 Phase 1.5, camera pose and label scope
+superseded here; its mechanism — dedicated `posenet_cam`, eased rejection
+sampling, shuffled placement order — is KEPT, not rewritten) ·
+**Modifies:** `scripts/gen_dual_scene.py`, `src/bimanual/sim/assets/so101_dual_table.xml`
+(regenerated, `scenes/so101/` untouched), `scripts/generate_posenet_data.py`,
+`data/posenet/dataset_meta.json` · **Adds:**
+`docs/hardware/m10-scope-reduction-samples.md`.
+
+**Starting state.** ADR-040's own 5,000-sample regeneration was in progress
+when it was halted by the orchestrator — `data/posenet/images`/`labels` were
+found ~half-populated (2,566 of 5,000) and were deleted, per this task's
+explicit instruction to treat the dataset as absent and generate fresh.
+Nothing from that partial run is reused.
+
+**Correction 1 — the task brief's proposed camera `xyaxes` reintroduced the
+EXACT sign error ADR-040 already fixed once, and the brief also misquoted
+ADR-040's shipped value.** The brief stated the "current" `posenet_cam` was
+`xyaxes="0 -1 0 -0.3 0 0.95"` — that is the *original, broken* pre-ADR-040
+spec, not what is actually committed (`so101_dual_table.xml:402`, which
+already reads the corrected `xyaxes="0 1 0 -0.3 0 0.95"`). The brief's NEW
+proposal for this pass, `xyaxes="0 -1 0 -0.7 0 0.7"`, was checked by hand
+before use (not accepted on faith, the same discipline ADR-040 applied) and
+found to have the SAME defect: with `x=(0,-1,0)`, `y=(-0.7,0,0.7)`,
+`Z=X×Y=(-0.7,0,-0.7)`, view `=-Z=(+0.7,0,+0.7)` — from `x=0.6`, further out
+along `+x` and tilted UP, past the table, not at it. Fixed the same way
+ADR-040 fixed it: flip the local x-axis sign to `x=(0,+1,0)`. With
+`x=(0,1,0)`, `y=(-0.7,0,0.7)`: `Z=(0.7,0,0.7)`, view`=(-0.7,0,-0.7)` — toward
+the table and down at ~45 degrees, from the raised, pulled-in
+`POSENET_CAM_POS=(0.6,0,1.1)` this pass intends. `POSENET_CAM_FOVY=45`
+unchanged from ADR-040. **Verified by rendering one probe frame before
+generating anything** — both `front` and `posenet_cam` probes are in
+`docs/hardware/m10-scope-reduction-samples.md`; table, arms and all five
+props are clearly in frame, more overhead than ADR-040's own already-working
+pose. `front` itself is untouched (byte-identical `FRONT_CAM_*` constants);
+`git diff --stat -- scenes/so101/` stays empty (ADR-016).
+
+**MANDATORY re-verification, done before any dataset generation.** All four
+skills backing the 30-point bimanual criterion were re-run fresh against the
+regenerated scene: `pick(A, fork)` PASS (z 0.3560→0.3989, weld attach frame
+1155), `place(A, fork, table)` PASS (returns to z=0.3588), `pick(A, 'bottle')`
+PASS (z 0.4400→0.6192, weld attach frame 1155), `handoff(A→B, fork)`
+(`run_handoff(env, "B", "A", "fork", weld=weld)`) PASS (held by arm B,
+z=0.5498, `from_arm` cleared, retreat 0.2263 m) — identical in kind to the
+ADR-038/ADR-040 baseline. `pytest tests/test_skills.py`: 4 passed / 4 failed,
+identical to the pre-existing baseline. No regression.
+
+**Correction 2 — 3-prop label scope (task FIX 1).** All five props remain
+placed, randomized and rendered (occlusion between all five is part of the
+training signal; dropping `plate`/`spoon` from the scene would make the
+remaining three trivially unoccluded). Only `TARGET_PROPS = ("fork",
+"water_bottle", "mug")` receive a ground-truth label and count toward the
+visibility gate below; `plate`/`spoon` stay in-scene as unlabelled
+decoration (`decoration_props_in_scene_unlabelled`). Each label's
+`positions_xyz_m` is now a fixed `(3, 3)` array in `TARGET_PROPS`' canonical
+order (`output_shape: [3, 3]`).
+
+**Correction 3 — the task brief's own description of the visibility metric
+did not match the formula it then specified; the FORMULA was right, the
+DESCRIPTION was wrong.** The brief described the filter as dropping frames
+where "the ratio of visible pixels to bounding-box area falls below 0.3" — a
+FILL-FRACTION metric (shape, not occlusion; a thin, fully-visible fork would
+fail on shape alone). The formula the same brief then gave,
+`full_scene_pixels / single_prop_pixels`, is a genuine OCCLUSION ratio
+instead. **This is what is implemented**, described as an occlusion ratio
+throughout code, `dataset_meta.json`, and the docs — not as Syn4D's fill
+fraction. The 0.30 threshold is a **user-supplied reference to Syn4D**
+(https://arxiv.org/pdf/2605.05207) for that numeric value only; no claim is
+made about the paper's authorship, method, or other findings beyond the
+threshold cited to it (same discipline as ADR-037's ScienceDirect citation).
+
+**Correction 4 — the first implementation of the occlusion ratio (RGB colour
+classification) was tried, measured, and found unreliable before being
+trusted, and was replaced with MuJoCo's segmentation buffer.** Comparing
+rendered pixels against each prop's declared `<material rgba>` measured two
+real failures on bm-ptl, on this exact scene: (a) MuJoCo's lighting does not
+preserve a material's own colour ratio — `fork`'s declared `(255,38,38)`
+rendered with a dominant pixel colour of `(255,80,80)`, an exact-match count
+of 1 against a visually obvious ~100+ pixel sliver; (b) widening the
+tolerance to compensate then ALIASED with unrelated scene elements —
+`water_bottle`'s blue collided with the background checker floor tile's own
+rendered blue, and `fork`'s red collided with the table surface's warm tan.
+Both measured directly with a pixel-histogram probe, not assumed. Fixed:
+`compute_visibility_ratios` now uses
+`mujoco.Renderer.enable_segmentation_rendering()`, whose `(H,W,2)` int32
+output (channel 0 = geom id, channel 1 = constant `mjtObj.mjOBJ_GEOM`) was
+verified on a probe render before use — exact per-pixel geom identity, no
+lighting-dependent ambiguity. Classification is by `model.geom_bodyid`
+membership (a prop can be >1 geom on one body, e.g. mug = cylinder + handle),
+not a single assumed geom id.
+
+**Correction 5 — the "hide other props" mechanism was verified to genuinely
+remove them from the render, not assumed.** Other props are hidden for a
+solo render by writing a real, far off-screen `(x,y)=(3.0,3.0)` into their
+own free-joint qpos and calling `mujoco.mj_forward` — a genuine kinematic
+relocation, not an `rgba`/`alpha=0` trick (which can still write depth or
+leave faint pixels depending on the renderer path, per the task's own
+caution). Verified directly: placing one target in view and teleporting the
+other four away, the segmentation buffer contained ONLY that target's own
+geom ids in every one of three trials (fork: 156 px, zero elsewhere;
+water_bottle: 922 px, zero elsewhere; mug: 616 px, zero elsewhere) — see
+`docs/hardware/m10-scope-reduction-samples.md`.
+
+**Verification before the full run, per the task's explicit "measure before
+committing to 5000."** A 10-sample run (0/10 rejections, 2.75 samples/s) was
+followed by a 100-sample run for a statistically meaningful rejection-rate
+estimate: **4/104 total draws rejected (3.85%)**, well under the 30%
+go-threshold, at **2.40 samples/s** — projecting the full 5,000-sample run at
+**~35 minutes**, far under the "2+ hours" worst case the task flagged as
+plausible (visibility filtering costs 1 RGB render + 4 segmentation renders
+per accepted sample, but segmentation-mode renders measured cheaper than
+full RGB, so the realized per-sample cost came in below a naive 4-5x
+estimate over Phase 1's 3.04 samples/s). The global minimum ACCEPTED
+occlusion ratio observed across both probes was 0.310 (`mug`, nearly fully
+hidden behind `water_bottle` from this camera angle) — 0.010 above the
+threshold, direct evidence the gate is doing real work, not passing
+everything through. Reported before launching the full run, per the task's
+instruction.
+
+**Decision — proceed to the full 5,000-sample run.** Camera correctly aimed
+and more overhead than ADR-040's own pose, all four skills plus pytest
+baseline unaffected, hide mechanism proven pixel-exact, rejection rate
+comfortably under 30% with a projected time far under 2 hours. Full
+regeneration overwrites `data/posenet/` in place (same seed `20260914` as
+Phase 1/1.5). `dataset_meta.json` gains `target_props`, `output_shape:
+[3,3]`, `decoration_props_in_scene_unlabelled`, `visibility_threshold: 0.30`,
+`visibility_metric`/`visibility_threshold_reference` (the Syn4D citation),
+the new `camera_pos_m`/`camera_xyaxes`, `visibility_rejections_total`/
+`visibility_rejection_rate`, and a `supersedes` field naming BOTH Phase 1
+(ADR-039) and Phase 1.5 (ADR-040, whose regeneration never completed) by
+name. Measured full-run wall clock, rate, and rejection rate are recorded in
+`dataset_meta.json` and in `docs/hardware/m10-scope-reduction-samples.md`.
+As with Phase 1/1.5, the image/label bulk is not left on bm-ptl after
+copy-off; only `dataset_meta.json` stays git-tracked.
+
+**Baseline preserved.** `pytest tests/test_skills.py` re-run on bm-ptl
+against the regenerated scene: 4 passed / 4 failed, identical to the
+pre-existing baseline. No file outside this ADR's own `Modifies`/`Adds` list
+(`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`scenes/so101/`, `README.md`, `SUBMISSION.md`) was touched. ADR-040 itself is
+kept unedited above — this entry corrects its camera pose and label scope
+going forward, it does not rewrite what ADR-040 recorded as true at the
+time.
+
+---
+
+## ADR-040 — M10 Phase 1.5: dedicated `posenet_cam` perception camera separated from `front`'s presentation role; eased rejection sampling (range widened, margin reduced, radii kept); placement order shuffled per sample
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-016 (frozen upstream asset), ADR-020
+(bm-ptl-only MuJoCo execution), ADR-022 (opt-in camera rendering), ADR-038 (a
+scene change assumed cosmetic broke `handoff` at phase 3), ADR-039 (M10 Phase 1
+dataset, now superseded) · **Modifies:** `scripts/gen_dual_scene.py`,
+`src/bimanual/sim/assets/so101_dual_table.xml` (regenerated, `scenes/so101/`
+untouched), `scripts/generate_posenet_data.py`, `data/posenet/dataset_meta.json`
+· **Adds:** `docs/hardware/m10-camera-comparison.md`.
+
+**Why.** ADR-039's dataset (M10 Phase 1) rendered through `front`
+(`pos="1.55 0 0.85"`), a wide establishing shot built for the M06 handoff demo
+video, not a perception viewpoint. Measured directly on the three archived
+Phase 1 samples: props occupy only ~10-20 px of a 224x224 frame. Phase 1's
+rejection sampler also measured a worst-case 5,054 draws for one prop against
+a 5,000-per-prop cap on the full 5,000-sample run — already past the nominal
+budget, not comfortably inside it.
+
+**Decision 1 — a SEPARATE `posenet_cam`, `front` never touched.** `front` is
+load-bearing for the M06 handoff render pipeline (ADR-038) and four working
+skills; per that ADR's own lesson ("should be inert" was the assumption that
+broke `handoff` before), this pass adds a NEW camera to
+`gen_dual_scene.py`'s hand-authored region instead of widening or repointing
+`front`. `front`'s own `FRONT_CAM_POS`/`FRONT_CAM_XYAXES`/`FRONT_CAM_FOVY`
+constants are byte-identical before and after this change.
+
+**Decision 2 — the task brief's proposed `xyaxes` was checked by hand, not
+accepted, and was found to point AWAY from the table.** MuJoCo cameras look
+along local -Z, and local Z = local X cross local Y. The brief's axes
+(`x=(0,-1,0)`, `y=(-0.3,0,0.95)`) give `Z=(-0.95,0,-0.3)`, so the view
+direction (`-Z`) is `(+0.95,0,+0.3)` — away from the table entirely, from
+`x=1.05`. Fix: flip the sign of the local x-axis to match `front`'s own
+handedness (`x=(0,+1,0)`, not `(0,-1,0)`): `Z=(0.95,0,0.3)`,
+view=`(-0.95,0,-0.3)` — toward the table and angled down, from the intended
+closer/lower position. `POSENET_CAM_POS=(1.05,0,0.62)`,
+`POSENET_CAM_XYAXES="0 1 0 -0.3 0 0.95"`, `POSENET_CAM_FOVY=45` (MuJoCo's own
+default; `front`'s widened 55 was for full-arm headroom this camera does not
+need). **Verified by rendering one frame before generating anything** — both
+`front` and `posenet_cam` probe renders are in
+`docs/hardware/m10-camera-comparison.md`; the table, both arms and all five
+props are clearly in frame through `posenet_cam`.
+
+**MANDATORY re-verification, done before any dataset generation.** A camera
+element has no geom/mass/collision so it should be inert, but ADR-038 found
+"should be inert" was exactly the wrong assumption once before. All four
+skills backing the 30-point bimanual criterion were re-run fresh against the
+regenerated scene: `pick(A, fork)` PASS, `place(A, fork, table)` PASS,
+`pick(A, 'bottle')` PASS, `handoff(A->B, fork)`
+(`run_handoff(env, "B", "A", "fork", weld=weld)`) PASS — identical in kind to
+the ADR-038 baseline. `pytest tests/test_skills.py`: 4 passed / 4 failed,
+identical to the pre-existing baseline. No regression.
+
+**Decision 3 — a second brief claim was also checked and found wrong: the
+proposed flat 0.03 m spacing was rejected (kept the radius-based test), and a
+THIRD brief claim (fork/spoon radii are "far larger than actual footprint")
+was checked and found wrong too.** `gen_dual_scene.py`'s geometry gives fork's
+true farthest point as `sqrt(0.08^2+0.012^2)=0.0809 m` (declared `0.08` is
+~1mm UNDER, not over) and spoon's as `sqrt(0.068^2+0.012^2)=0.0690 m`
+(declared `0.07` is ~1mm over — accurate to the millimetre). Since this is a
+circular (isotropic) distance test and props are never rotated, reducing
+either below its true reach risks genuine overlap for some relative bearing.
+`FOOTPRINT_RADIUS_M` is UNCHANGED from Phase 1. Easing came instead from: (a)
+`randomization_range_m` widened from +-0.15 m to +-0.18 m (0.36x0.36 m box,
+1.44x the old area), (b) `clearance_margin_m` reduced from 0.015 m to 0.008 m
+(still a real, positive gap). Combined, the tightest pair's (fork/spoon)
+forbidden-disk fraction of the box drops from ~95% (Phase 1, matching the
+observed 5,054-draw worst case) to ~61%.
+
+**Decision 4 — placement order shuffled per sample, not fixed.** Phase 1
+always placed in the same largest-first order (`fork, spoon, plate, mug,
+water_bottle`) on every sample, so `water_bottle` (smallest radius) was
+placed LAST every single time — a systematic bias a trained PoseNet could
+pick up as a spurious identity-correlated signal. Fixed: a fresh
+`rng.permutation` of the five props is drawn once per sample (same order
+reused across any restarts within that one sample).
+`placement_order_used` is recorded per sample label;
+`dataset_meta.json` records `base_placement_order` and
+`placement_order_shuffled_per_sample: true`.
+
+**10-sample verification before the full run.** `placement_draws_stats`:
+mean 18.6, max 34 (down from Phase 1's mean 54.8, max 5,054) — comfortably
+under the task's <500 target. Pixel extent measured with a standalone
+pure-stdlib PNG decoder + largest-connected-component analysis (no Pillow,
+no new dependency): `mug`/`plate`/`water_bottle` (compact, blob-like props
+not confounded by the arm's own grey housing aliasing `spoon`'s hue) show a
+measured ~1.79x mean linear / ~3.2x area increase over Phase 1. `spoon` (and,
+to a lesser extent, the very thin `fork`) is EXCLUDED from the quantitative
+comparison and disclosed as such: the arm pose is never randomized, so a
+fixed-position false "spoon" region (matching the arm's own silver/grey
+housing) appeared identically in every sample before a largest-connected-
+component filter was added; even after that fix, thin/elongated props are
+not something this quick colour-based method can measure with confidence.
+Three flagged 2D bounding-box "overlaps" out of 10 samples were checked
+against the real label data and found to be a perspective artifact (a tall
+prop's silhouette crossing a short, nearby prop's screen region from this
+angled camera, e.g. `water_bottle` vs `plate` at true 3D centre distance
+0.1107 m against a required 0.098 m minimum) — not a real geometric overlap.
+Full detail, both probe renders, and three new sample images are in
+`docs/hardware/m10-camera-comparison.md`.
+
+**Decision 5 — full regeneration overwrites `data/posenet/` in place.**
+Same seed (20260914) as Phase 1. `dataset_meta.json` gains `phase: "M10 Phase
+1.5"`, a `supersedes` field describing exactly what Phase 1 configuration is
+being replaced, `base_placement_order`/`placement_order_shuffled_per_sample`,
+the new `camera`, `randomization_range_m`, `clearance_margin_m`, and scene
+`scene_xml_sha256` (the regenerated scene's own camera addition changes this
+hash even though `scenes/so101/` itself is untouched). Measured wall clock,
+on-disk size, and the full run's own `placement_draws_stats` are recorded in
+`dataset_meta.json` and in `docs/hardware/m10-camera-comparison.md`. As with
+Phase 1, the image/label bulk is not left on bm-ptl after copy-off; only
+`dataset_meta.json` stays git-tracked (`.gitignore`'s existing
+`data/posenet/images/`/`data/posenet/labels/` entries, unchanged from
+ADR-039).
+
+**Baseline preserved.** `pytest tests/test_skills.py` re-run on bm-ptl against
+the regenerated scene: 4 passed / 4 failed, identical to the pre-existing
+baseline. No file outside this ADR's own `Modifies`/`Adds` list
+(`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`scenes/so101/`, `README.md`, `SUBMISSION.md`) was touched.
+
+---
+
 ## ADR-039 — M10 Phase 1 (PoseNet training data): runtime qpos randomization through `TableSettingEnv`'s opt-in `front` camera, per-prop resting z, sequential rejection-sampled placement; full-joint rejection sampling measurably failed and was replaced
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-016 (frozen upstream asset), ADR-020

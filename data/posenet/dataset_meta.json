@@ -4,17 +4,23 @@
     224,
     224
   ],
-  "camera": "front",
+  "camera": "posenet_cam",
+  "camera_pos_m": [
+    0.6,
+    0.0,
+    1.1
+  ],
+  "camera_xyaxes": "0 1 0 -0.7 0 0.7",
   "rng_seed": 20260914,
   "env_reset_seed": 0,
   "randomization_range_m": {
     "x": [
-      -0.15,
-      0.15
+      -0.18,
+      0.18
     ],
     "y": [
-      -0.15,
-      0.15
+      -0.18,
+      0.18
     ]
   },
   "props_randomized": [
@@ -24,6 +30,24 @@
     "spoon",
     "water_bottle"
   ],
+  "target_props": [
+    "fork",
+    "water_bottle",
+    "mug"
+  ],
+  "output_shape": [
+    3,
+    3
+  ],
+  "decoration_props_in_scene_unlabelled": [
+    "plate",
+    "spoon"
+  ],
+  "visibility_threshold": 0.3,
+  "visibility_metric": "occlusion ratio = full_scene_pixel_count / solo_unoccluded_pixel_count for the same prop at the same placement (NOT a fill-fraction / bounding-box-area metric -- see the module docstring / compute_visibility_ratios for the distinction). Both pixel counts are measured via mujoco.Renderer's segmentation buffer (exact per-pixel geom id), not RGB colour classification -- an initial colour-classification implementation was tried and measurably failed (table tan aliased fork red, floor-tile blue aliased water_bottle blue) before this pivot; see the module-level comment above _MJOBJ_GEOM.",
+  "visibility_threshold_reference": "0.30 threshold value is a user-supplied reference to Syn4D (https://arxiv.org/pdf/2605.05207); this repository cites only that numeric threshold from it and does not claim to have read or verified the paper's authorship, method, or other findings.",
+  "visibility_rejections_total": 205,
+  "visibility_rejection_rate": 0.0393852065321806,
   "resting_z_m": {
     "plate": 0.355,
     "mug": 0.39,
@@ -38,24 +62,27 @@
     "spoon": 0.07,
     "water_bottle": 0.03
   },
-  "clearance_margin_m": 0.015,
-  "placement_order": [
+  "clearance_margin_m": 0.008,
+  "base_placement_order": [
     "fork",
     "spoon",
     "plate",
     "mug",
     "water_bottle"
   ],
+  "placement_order_shuffled_per_sample": true,
   "per_prop_attempts": 5000,
   "max_sample_restarts": 200,
   "placement_draws_stats": {
-    "mean": 54.8096,
-    "max": 5054
+    "mean": 18.5336,
+    "max": 1335
   },
   "mujoco_version": "3.2.7",
   "scene_xml_path": "src/bimanual/sim/assets/so101_dual_table.xml",
-  "scene_xml_sha256": "22bb6d4181c68af1146f69f144931a5de50bbd0e30f41ea7aea7fec9b7847981",
-  "wall_clock_seconds": 1647.135363817215,
-  "samples_per_second": 3.03557321992806,
-  "note": "Object x,y positions are randomized independently per sample within randomization_range_m, subject to pairwise non-overlap rejection sampling (see footprint_radius_m / clearance_margin_m). z is held fixed per-prop at its own resting height (resting_z_m) -- never at one shared table-surface value. Randomized layouts are NOT validated or claimed as physically reachable/solvable scene configurations: ADR-038 found that moving even a single prop can break the handoff skill at phase 3. This dataset trains a perception model (PoseNet) only; no manipulation skill is ever executed against any sampled layout in this script."
+  "scene_xml_sha256": "8a675594f7cf2a3ec7fde28b5ba107ed43d3244856883e1e2a5a68d54d46242d",
+  "wall_clock_seconds": 2111.6201860904694,
+  "samples_per_second": 2.367850067420118,
+  "phase": "M10 Phase 1.5 correction (ADR-041)",
+  "supersedes": "M10 Phase 1 (ADR-039: camera='front', randomization_range_m=+-0.15, clearance_margin_m=0.015, fixed largest-first placement_order, placement_draws_stats.max=5054 against a 5000-per-prop cap, all five props labelled) AND M10 Phase 1.5 (ADR-040: posenet_cam at pos=(1.05,0,0.62)/xyaxes='0 1 0 -0.3 0 0.95', all five props labelled, no visibility filtering -- its 5000-sample regeneration was halted mid-run by the orchestrator and data/posenet/images+labels were deleted, so that dataset never completed). This run (ADR-041) is a fresh generation, not a merge: 3-prop label scope (fork/water_bottle/mug; plate/spoon stay in-scene as unlabelled decoration), an overhead posenet_cam pose (pos=(0.6,0,1.1)/xyaxes='0 1 0 -0.7 0 0.7'), and occlusion-ratio visibility filtering (threshold 0.30) are all new in this run -- see docs/hardware/m10-scope-reduction-samples.md.",
+  "note": "Object x,y positions are randomized independently per sample within randomization_range_m, subject to pairwise non-overlap rejection sampling (see footprint_radius_m / clearance_margin_m). Placement order is a fresh random permutation of base_placement_order per sample (see each label's placement_order_used), not a fixed order, so no prop is systematically placed last. z is held fixed per-prop at its own resting height (resting_z_m) -- never at one shared table-surface value. Rendered through posenet_cam (overhead pose, ADR-041), a dedicated perception camera separate from 'front'. All five props are placed and rendered, but only target_props (fork, water_bottle, mug) are labelled -- decoration_props_in_scene_unlabelled (plate, spoon) remain in-frame for visual realism and occlusion signal only. A sample is rejected and re-drawn (visibility_resamples in each label) if any target prop's occlusion ratio falls below visibility_threshold. Randomized layouts are NOT validated or claimed as physically reachable/solvable scene configurations: ADR-038 found that moving even a single prop can break the handoff skill at phase 3. This dataset trains a perception model (PoseNet) only; no manipulation skill is ever executed against any sampled layout in this script."
 }

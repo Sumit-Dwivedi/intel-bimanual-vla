@@ -392,6 +392,14 @@
          ~0.667m rest-pose arm height, with a widened fovy for headroom as
          arms move during a task. -->
     <camera name="front" pos="1.5500 0.0000 0.8500" xyaxes="0.0000 1.0000 -0.0000 -0.2203 0.0000 0.9754" fovy="55"/>
+    <!-- posenet_cam: M10 Phase 1.5 dedicated perception camera (see
+         POSENET_CAM_* above for the corrected xyaxes derivation and why
+         `front` above is left untouched instead of reused/widened). Closer
+         to the table and angled down at the shared working area, not
+         framing the whole arms the way `front` does -- this camera exists
+         for `scripts/generate_posenet_data.py` only; no skill or demo
+         render path uses it. -->
+    <camera name="posenet_cam" pos="0.6000 0.0000 1.1000" xyaxes="0 1 0 -0.7 0 0.7" fovy="45"/>
     <!-- drawer_view: low, angled up, on the -y side past the open drawer's
          protrusion (see DRAWER_CAM_* comment above for the empirical
          reasoning). FIXED orientation via xyaxes (M02 drawer_view fix,
