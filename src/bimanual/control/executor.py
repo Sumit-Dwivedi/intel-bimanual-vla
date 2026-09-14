@@ -109,6 +109,59 @@ class ScriptedSkillExecutor(SkillExecutor):
         self.inference = inference
         self._position_provider = None
 
+    def reset(self, env, seed: int = 0, cameras: list[str] | None = None) -> dict:
+        """Reset `env`'s physics AND this executor's `WeldGrasp` together (ADR-047).
+
+        **Why this exists.** `ScriptedSkillExecutor._ensure_weld` (above)
+        deliberately reuses one `WeldGrasp` across repeated calls against
+        the SAME `env` (ADR-030) -- correct for a `TaskPlan` running several
+        skills back-to-back through one executor. But `WeldGrasp` tracks
+        held objects in its own Python-side `active_welds` dict, which
+        `env.reset()` has no way to touch (see `WeldGrasp.reset()`'s
+        docstring in `bimanual/sim/grasp.py` for the full mechanism). A
+        caller that resets `env` directly while reusing this executor
+        across trials/seeds -- exactly the shape M08's `--seeds 0-9`
+        harness takes -- would silently desync `self.weld.active_welds`
+        from MuJoCo's own freshly-cleared `data.eq_active`, and the next
+        trial's first grasp for whichever (arm, object) pair was held at
+        reset time would be refused at `attempt_grasp`'s "already holds"
+        gate, surfacing as `weld_attach_failed_after_N_frames` --
+        indistinguishable from a genuine grasp failure.
+
+        Use THIS method instead of calling `env.reset(...)` directly
+        whenever this executor is reused across trials against the same
+        `env`.
+
+        Args:
+            env: The `TableSettingEnv` this executor drives. Must be the
+                same instance already (or about to be) passed to
+                `execute()` -- `self.weld` is only cleared if it is
+                currently bound to this exact `env` (see below); a `env`
+                this executor has never seen simply gets its own
+                `env.reset()` call, no `WeldGrasp` to clear yet.
+            seed: Forwarded verbatim to `env.reset(seed=seed)` -- same
+                semantics as `TableSettingEnv.reset()`'s own `seed` arg.
+            cameras: Forwarded verbatim to `env.reset(cameras=cameras)` --
+                same semantics as `TableSettingEnv.reset()`'s own `cameras`
+                arg (per-call override, instance default untouched).
+
+        Returns:
+            Exactly what `env.reset()` returns (the obs dict) -- this
+            method changes nothing about that contract, it only adds the
+            `WeldGrasp.reset()` call after it.
+        """
+        obs = env.reset(seed=seed, cameras=cameras)
+        # Only clear a WeldGrasp that is actually bound to THIS `env`. If
+        # `self.weld` is still `None` (no `execute()` call has happened yet
+        # on this executor) or is bound to a DIFFERENT `env` instance,
+        # there is no stale state to clear here: `_ensure_weld`'s own
+        # rebuild-on-different-`env` rule means the next `execute()` call
+        # will construct a fresh `WeldGrasp` against `env`, which already
+        # starts with `active_welds` all `None` (see `WeldGrasp.__init__`).
+        if self.weld is not None and self.weld.env is env:
+            self.weld.reset()
+        return obs
+
     def _ensure_weld(self, env) -> WeldGrasp:
         """Return `self.weld`, constructing (or reconstructing, if `env`
         is a different instance than last time) it on demand.

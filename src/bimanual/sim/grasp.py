@@ -447,3 +447,60 @@ class WeldGrasp:
         if arm not in ARMS:
             raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
         return self.active_welds[arm]
+
+    def reset(self) -> None:
+        """Clear this instance's held-object bookkeeping after `env.reset()`.
+
+        **The bug this method exists to fix (ADR-047).** `self.active_welds`
+        is a plain Python `dict` on THIS instance, set by a successful
+        `attempt_grasp` and cleared only by `release()` -- nothing else ever
+        touches it. `env.reset()` (`TableSettingEnv.reset()`,
+        `src/bimanual/sim/env.py`) calls `mujoco.mj_resetData` (and, if a
+        "home" keyframe exists, `mj_resetDataKeyframe`), which DOES reset
+        MuJoCo's own `data.eq_active` for every weld back to the compiled
+        model's inactive default -- but `mj_resetData` only ever touches the
+        `mujoco.MjData` buffer; it has no way to reach into a Python object
+        it does not know exists. So after `env.reset()`, MuJoCo believes
+        nothing is welded while `self.active_welds` still remembers whatever
+        was held the moment before reset. A caller that reuses one
+        `WeldGrasp` across repeated trials against the SAME `env` --
+        `ScriptedSkillExecutor._ensure_weld` does exactly this by design,
+        ADR-030 -- and calls `env.reset()` directly between trials (instead
+        of this method) hits `attempt_grasp`'s "already holds" refusal on
+        the very next grasp for that (arm, object) pair, which surfaces to a
+        caller as `weld_attach_failed_after_N_frames`: indistinguishable
+        from a genuine reachability/grasp failure, silently corrupting any
+        multi-trial evaluation (`docs/hardware/m10-pre-m07-audit.md`'s
+        zero-th finding; this is that finding's fix).
+
+        **What this clears, and what it deliberately does not touch.**
+        Resets `self.active_welds` to `{'A': None, 'B': None}` (this
+        instance's own bookkeeping) and, for every pre-declared weld this
+        instance resolved at construction (`self._eq_ids.values()`), sets
+        `self.data.eq_active[eq_id] = 0` -- belt-and-suspenders with
+        `env.reset()`'s own `mj_resetData`, which should already have zeroed
+        every one of these (this method does not assume that and clears
+        them itself regardless, in case a future scene ever carries
+        `eq_active` state in its "home" keyframe). Per this module's own
+        docstring, this class "only ever toggles `data.eq_active` and
+        rewrites `model.eq_data`" -- this method never writes
+        `model.eq_active0` (the model's COMPILED initial value, which would
+        persist across resets, a new and unwanted side effect) or
+        `model.eq_data` (no relative pose needs restating; the constraint is
+        simply inactive).
+
+        **Call this immediately after every `env.reset()` call against the
+        SAME `env` this `WeldGrasp` was constructed against** (this
+        instance's `self.env`/`self.model`/`self.data` are bound once, at
+        construction, to one compiled model -- see `__init__`'s docstring --
+        and are never rebound by this method). `ScriptedSkillExecutor.reset`
+        (`executor.py`, ADR-047) is the intended call site for ordinary
+        skill-execution code; this method is also safe to call directly
+        (e.g. from a probe script) when no executor is involved. A no-op,
+        safely, if nothing was held and no weld was active.
+        """
+        self.active_welds = {"A": None, "B": None}
+        for eq_id in self._eq_ids.values():
+            self.data.eq_active[eq_id] = 0
+        mujoco.mj_forward(self.model, self.data)
+        logger.info("WeldGrasp.reset: cleared active_welds and all eq_active constraints")

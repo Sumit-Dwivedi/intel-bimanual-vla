@@ -11,6 +11,87 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-047 — `WeldGrasp.reset()` / `ScriptedSkillExecutor.reset()` fix the cross-trial state-corruption bug the pre-M07/M08 audit found — regression gate (all four ADR-038 skill numbers, `pytest tests/test_skills.py`) reproduced byte-identical on bm-ptl
+
+**Ratified:** Sept 14, 2026 · **Closes:** the pre-M07/M08 audit's Zero-th finding
+(`docs/hardware/m10-pre-m07-audit.md`) · **Follows:** ADR-029 (weld mechanism),
+ADR-030 (weld wiring, `WeldGrasp` reused across calls against the same `env`)
+· **Adds:** `WeldGrasp.reset()` (`src/bimanual/sim/grasp.py`),
+`ScriptedSkillExecutor.reset()` (`src/bimanual/control/executor.py`),
+`scripts/probe_weld_reset.py`
+
+`WeldGrasp.active_welds` is Python-side bookkeeping the class owns; `env.reset()`
+resets MuJoCo's own `data.eq_active` (via `mj_resetData`) but has no way to reach
+a Python object it does not know exists, so `active_welds` survives a bare
+`env.reset()` untouched. Because `ScriptedSkillExecutor` deliberately reuses one
+`WeldGrasp` across repeated calls against the same `env` (ADR-030 — correct for
+a multi-skill `TaskPlan`), a caller that reuses the same executor across
+trials/seeds and resets `env` directly between them — exactly M08's planned
+`--seeds 0-9` shape — desyncs the two: MuJoCo believes nothing is welded while
+`WeldGrasp` still believes an arm holds something. The next grasp attempt for
+that (arm, object) pair is refused at `attempt_grasp`'s "already holds" gate and
+surfaces as `weld_attach_failed_after_N_frames` — indistinguishable from a
+genuine grasp failure. Left unfixed, this would have silently corrupted M08's
+entire 10-seed evaluation the first time any seed's grasp succeeded.
+
+**Decision.** `WeldGrasp.reset()` resets `self.active_welds` to
+`{'A': None, 'B': None}` and sets `self.data.eq_active[eq_id] = 0` for every
+pre-declared weld this instance resolved at construction — never
+`model.eq_active0` (the model's compiled initial value; writing it would mutate
+the compiled model and persist beyond a reset, a new side effect this module has
+never had). `ScriptedSkillExecutor.reset(env, seed=0, cameras=None)` calls
+`env.reset(seed=seed, cameras=cameras)` then, only if `self.weld` is bound to
+that same `env`, `self.weld.reset()` — `env.reset()`'s own signature and return
+value (the obs dict) are forwarded unchanged. Confirmed `self.data`
+(`WeldGrasp.__init__` caches `env.data` once) stays the live buffer across
+`env.reset()`: `TableSettingEnv.__init__` assigns `self.data` exactly once
+(`env.py:133`); `reset()` never rebinds it, only mutates it in place via
+`mj_resetData`. No stale-reference risk found.
+
+**Verification (bm-ptl, `ov_env`).** `scripts/probe_weld_reset.py`: `pick(A,
+fork)` succeeds (final_z=0.3989); calling `env.reset()` directly (skipping
+`weld.reset()`) reproduces the bug exactly as the audit described —
+`is_holding('A')` stays `'fork'` while `data.eq_active[fork_eq_id]` is already
+`0`, and a retried `pick(A, fork)` fails with
+`weld_attach_failed_after_300_frames`; `executor.reset(env, seed=0,
+cameras=None)` then clears it (`is_holding('A') is None`,
+`data.eq_active[fork_eq_id] == 0`), and a third `pick(A, fork)` through the SAME
+executor succeeds again with final_z bit-identical to the first run
+(0.398949 == 0.398949). **Regression gate, all reproduced byte-identical to the
+pre-fix ADR-038 baseline:** `pick(A, fork)` 0.3560→0.3989, `place(A, fork,
+table)` final z=0.3588, `pick(A, 'bottle')` 0.4400→0.6192, `handoff(A→B, fork)`
+lateral separation=0.1946 m; `pytest tests/test_skills.py` 4 passed / 4 failed,
+same four failure reasons. Both checks ran on bm-ptl before AND after the fix
+(fresh `env`+`WeldGrasp` per skill/test in both scripts, per their own design —
+neither exercises the reuse-across-reset path this fix addresses, so an exact
+match was the expected, and confirmed, outcome, not a coincidence).
+
+**A cross-machine finding, reported honestly, not silently absorbed.** The same
+two regression checks run on the Windows dev laptop (mujoco 3.2.7, same
+version) reproduce the SAME pass/fail structure but NOT the same floating-point
+digits (e.g. `pick(A, fork)` final_z=0.3987 vs bm-ptl's 0.3989, handoff lateral
+separation=0.1958 m vs 0.1946 m) — confirmed present on the laptop with the
+UNMODIFIED pre-fix code too, so it is a pre-existing cross-machine
+floating-point divergence (contact-solver iteration order over ~1000+ steps),
+not a consequence of this fix. The authoritative regression numbers in this
+ADR are bm-ptl's, matching the machine the original ADR-038 baseline was
+measured on.
+
+**Consequences.** M08's evaluation harness must call `executor.reset(env, ...)`
+instead of `env.reset(...)` directly whenever it reuses one executor across
+seeds/trials — this ADR makes that the documented, tested way to do it.
+`grasp.py`'s and `executor.py`'s existing methods (`attempt_grasp`, `release`,
+`is_holding`, `execute`, `_dispatch`) are unmodified; only new methods were
+added, which is why the regression gate could not have failed by construction
+for `verify_adr038_skills.py`/`test_skills.py` (neither reuses env/executor
+across a reset) — the real proof of the fix is `probe_weld_reset.py`, which
+specifically exercises the reuse-across-reset path.
+
+**Source:** this commit ("M08 prep: WeldGrasp.reset() fixes cross-trial state
+corruption (ADR-047).").
+
+---
+
 ## ADR-046 — M10 Phase 5: PoseNet wired into the controller via cached per-skill inference, opt-in, oracle default — 3 of 4 skills PASS with perception on, `handoff` FAILS and is reported not tuned; a per-step render-cost bug found and fixed along the way
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-045 (M10 Phase 4, OpenVINO IR +

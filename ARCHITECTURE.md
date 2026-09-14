@@ -4203,6 +4203,155 @@ cached per-skill inference (ADR-046, GPU FP16 runtime).").
 
 ---
 
+### ADR-047 — `WeldGrasp.reset()` / `ScriptedSkillExecutor.reset()` fix the cross-trial state-corruption bug the pre-M07/M08 audit found — regression gate (all four ADR-038 skill numbers, `pytest tests/test_skills.py`) reproduced byte-identical on bm-ptl
+
+**Context.** The pre-M07/M08 audit (`docs/hardware/m10-pre-m07-audit.md`,
+its Zero-th finding) found, diagnostic-only, that `WeldGrasp.active_welds`
+(`src/bimanual/sim/grasp.py:190`) is a plain Python `dict` on the
+`WeldGrasp` instance, set by a successful `attempt_grasp` and cleared only
+by `release()`. `TableSettingEnv.reset()` (`env.py`) calls
+`mujoco.mj_resetData` (and, when a "home" keyframe exists,
+`mj_resetDataKeyframe`), which DOES reset MuJoCo's own `data.eq_active` for
+every weld back to the compiled model's inactive default -- but
+`mj_resetData` only touches the `mujoco.MjData` buffer; it has no way to
+reach into a Python object it does not know exists, so `active_welds`
+survives a bare `env.reset()` untouched. `ScriptedSkillExecutor._ensure_weld`
+(ADR-030) deliberately reuses one `WeldGrasp` across repeated calls against
+the SAME `env` -- correct, and load-bearing, for a `TaskPlan` that runs
+several skills back-to-back without an intervening reset. But it means: a
+caller that reuses one executor across trials/seeds -- exactly the shape
+M08's planned `--seeds 0-9` evaluation harness takes -- and resets `env`
+directly between them (the "obvious" way to write a seed loop) will desync
+the two the first time any trial's grasp succeeds. MuJoCo believes nothing
+is welded; `WeldGrasp` still believes an arm holds something. The next
+`attempt_grasp` call for that (arm, object) pair is refused at the "already
+holds" gate, and the ensuing timeout surfaces to a caller as
+`weld_attach_failed_after_N_frames` -- indistinguishable from a genuine
+grasp/reachability failure. Left unfixed, this would have silently
+corrupted M08's entire 10-seed evaluation the first time it happened, with
+no error, exception, or loud signal of any kind -- just a lower success
+rate that reads as a real robotics limitation.
+
+**Options considered.**
+- (a) Fix it in a hypothetical M08 harness only: construct a fresh `env`
+  and `WeldGrasp`/executor per seed, never reuse across a reset. This is
+  what the audit's OWN diagnostic script did (out of necessity, since
+  production code was frozen for that task) and it does work -- but it
+  means every future caller that reuses an executor across a reset (not
+  just M08) must independently remember to do the same, with no code-level
+  guard against forgetting.
+- (b) Fix it at the source: give `WeldGrasp` a `reset()` method that clears
+  `active_welds` and the underlying `eq_active` constraints together, and
+  give `ScriptedSkillExecutor` a `reset()` that calls `env.reset()` then
+  `weld.reset()`, so ANY caller that uses `executor.reset(...)` instead of
+  `env.reset(...)` directly is correct by construction, including a future
+  M08 harness, without that harness needing its own workaround.
+
+**Decision.** (b). `WeldGrasp.reset()` sets `self.active_welds` back to
+`{'A': None, 'B': None}` and, for every pre-declared weld this instance
+resolved at construction (`self._eq_ids.values()`), sets
+`self.data.eq_active[eq_id] = 0` -- belt-and-suspenders with `env.reset()`'s
+own `mj_resetData`, which should already have zeroed every one of these,
+but this method clears them itself regardless rather than assuming it.
+Per this module's own docstring (`grasp.py`'s header), `WeldGrasp` "only
+ever toggles `data.eq_active` and rewrites `model.eq_data`" for constraints
+that already exist -- `reset()` preserves that invariant exactly: it never
+writes `model.eq_active0` (the model's COMPILED initial value, which would
+persist across every future reset -- a new, unwanted side effect this
+module has deliberately never had) and never touches `model.eq_data` (no
+relative pose needs restating; the constraint is simply inactive).
+`ScriptedSkillExecutor.reset(env, seed=0, cameras=None)` calls
+`env.reset(seed=seed, cameras=cameras)`, then, ONLY if `self.weld` is
+currently bound to that same `env` instance (mirroring `_ensure_weld`'s own
+rebuild-on-different-`env` rule), calls `self.weld.reset()`. `env.reset()`'s
+own signature and return value (the obs dict) are forwarded verbatim --
+this method adds nothing to that contract, it only adds the `WeldGrasp`
+clear-up after it.
+
+**A cached-reference risk, checked rather than assumed.** `WeldGrasp.__init__`
+caches `self.data = env.data` once, at construction (`grasp.py:186`), so
+`WeldGrasp.reset()`'s and `ScriptedSkillExecutor.reset()`'s correctness both
+depend on that cached reference staying the SAME live buffer `env.reset()`
+mutates. Checked directly: `TableSettingEnv.__init__` assigns `self.data =
+mujoco.MjData(self.model)` exactly once (`env.py:133`); `reset()` never
+reassigns `self.data` to a new object anywhere in its body, only mutates
+the existing buffer in place via `mujoco.mj_resetData` (and, conditionally,
+`mj_resetDataKeyframe`) followed by `mj_forward`. No rebind occurs, so the
+cached reference stays valid across every `env.reset()` call -- confirmed,
+not assumed, and reported here per the task's own instruction to check and
+report this specifically.
+
+**Verification (bm-ptl, `C:\Users\devcloud\project\ov_env\Scripts\python.exe`).**
+`scripts/probe_weld_reset.py`, one `TableSettingEnv` + one
+`ScriptedSkillExecutor` reused across resets (the exact reuse pattern that
+triggers the bug), in a single process:
+1. `pick(A, fork)` succeeds: `final_z=0.3989`.
+2. **Bug demonstrated**: `env.reset(seed=0, cameras=None)` called DIRECTLY
+   (bypassing `executor.reset()`, i.e. exactly what every pre-ADR-047
+   caller did) -- `weld.is_holding('A')` still reports `'fork'` (stale)
+   while `env.data.eq_active[fork_eq_id]` is already `0` (MuJoCo's own
+   reset, correctly cleared, independent of this fix). A retried `pick(A,
+   fork)` through the SAME executor then fails with
+   `weld_attach_failed_after_300_frames` -- the exact symptom the audit
+   described, reproduced on demand.
+3. **Fix demonstrated**: `executor.reset(env, seed=0, cameras=None)`
+   (ADR-047) instead -- `is_holding('A') is None`,
+   `data.eq_active[fork_eq_id] == 0`.
+4. `pick(A, fork)` re-run through the SAME executor succeeds again, with
+   `final_z` bit-identical to step 1's (`0.398949 == 0.398949`) -- the real
+   proof that the corruption is fully gone, not merely that a later call
+   happens to succeed.
+
+**Regression gate, all four numbers reproduced byte-identical to the
+pre-fix baseline, on bm-ptl.** `scripts/verify_adr038_skills.py`: `pick(A,
+fork)` 0.3560 -> 0.3989, `place(A, fork, table)` final z=0.3588, `pick(A,
+'bottle')` 0.4400 -> 0.6192, `handoff(A->B, fork)` lateral
+separation=0.1946 m -- every digit identical before and after this change.
+`pytest tests/test_skills.py`: 4 passed / 4 failed, before and after,
+same four failure reasons and residuals. This match was not a coincidence
+to be relieved about: both scripts construct a FRESH `env` (and, for
+`verify_adr038_skills.py`, a fresh `WeldGrasp`; for `test_skills.py`, a
+fresh `ScriptedSkillExecutor` per test via its own fixture) for every
+skill/test and never reuse one across a `reset()` call -- neither exercises
+the reuse-across-reset path this fix addresses at all, and `grasp.py`'s and
+`executor.py`'s pre-existing methods (`attempt_grasp`, `release`,
+`is_holding`, `execute`, `_dispatch`) were not modified, only new methods
+added. An exact match was therefore the correctly-predicted outcome of a
+purely additive change, confirmed rather than assumed.
+
+**A cross-machine floating-point finding, reported rather than silently
+absorbed.** The same two regression checks, run on the Windows dev laptop
+(`mujoco==3.2.7`, the same pinned version), reproduce the identical
+pass/fail STRUCTURE but not the identical floating-point digits -- e.g.
+`pick(A, fork)` final_z=0.3987 there vs bm-ptl's 0.3989, `handoff` lateral
+separation=0.1958 m there vs bm-ptl's 0.1946 m. Confirmed present on the
+laptop with the UNMODIFIED pre-fix code too (checked before making any
+edit), so this is a pre-existing, unrelated cross-machine floating-point
+divergence -- almost certainly contact-solver iteration-order drift
+compounding over the ~1000-6600 physics steps each skill takes on a
+different CPU -- not a consequence of this fix. The authoritative numbers
+cited above are bm-ptl's, matching the machine the original ADR-038
+baseline was measured on (`docs/hardware/m10-pre-m07-audit.md:15-18`
+records that all of that audit's live-execution measurement ran on bm-ptl
+for the same reason).
+
+**Consequences.** M08's evaluation harness (not yet built) must call
+`executor.reset(env, seed=..., cameras=...)` instead of `env.reset(...)`
+directly whenever it reuses one executor across seeds -- this ADR makes
+that the documented, tested, and now code-supported way to do it, closing
+the audit's own recommendation ("either construct a fresh `env`/executor
+per seed ... or have `WeldGrasp` itself clear `active_welds` on
+`env.reset()`") in favour of the second option, at the source, rather than
+requiring every future multi-trial caller to remember the first one
+independently. `CachedPropPositions`' (M10, ADR-046) own per-trial cache
+staleness, if any, is explicitly out of this ADR's scope -- untouched,
+unexamined here, and not claimed to be fixed.
+
+**Source:** this commit ("M08 prep: WeldGrasp.reset() fixes cross-trial
+state corruption (ADR-047).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
