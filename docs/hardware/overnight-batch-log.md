@@ -185,3 +185,87 @@ step 1 of 3, with the specific architectural blocker identified above.
 then synced via the standard pull-only PAT fetch (`git fetch ... master`
 then `git reset --hard FETCH_HEAD`) so laptop, origin and bm-ptl end this
 fix synced and clean, matching the state this fix started in.
+
+---
+
+## M06 handoff already_held guard — `run_handoff` Phase 1 fixed (ADR-054); chain now fails one phase later, at a NEW Phase 3 collision
+
+**What changed.** `src/bimanual/control/skills_scripted.py`, `run_handoff`
+Phase 1 only: added the same `already_held` guard ADR-034 already uses in
+`run_place` (`already_held = weld is not None and
+weld.is_holding(from_arm) == body_name`; skip the nested `run_pick` when
+true, guard every downstream `pick_result.<attr>` access). This is the
+exact bug Fix C's chained-demo attempt (above) found and explicitly left
+unpatched, since `skills_scripted.py` was off-limits for that batch. No
+other line in `run_handoff` changed; `run_pick`, `run_place`, and every
+other ADR-031/033/035/037/038 mechanism are untouched.
+
+**Findings that belong in `SUBMISSION.md`'s eventual robustness/bimanual
+section, once morning-user reviews this log:**
+
+1. **The pick→handoff re-pick bug is fixed, verified two ways.**
+   `scripts/verify_adr038_skills.py`, run before and after this code
+   change on BOTH bm-ptl and the laptop, reproduced byte-identical numbers
+   in every case (bm-ptl: `0.3989 / 0.3588 / 0.6192 / 0.1946 m /
+   frames_used=6610`; laptop: `0.3987 / 0.3588 / 0.6191 / 0.1958 m /
+   frames_used=6610` — the laptop-bm-ptl digit gap is the SAME
+   already-documented ADR-047 cross-machine floating-point divergence,
+   present identically before and after, not caused by this fix).
+   `pytest tests/test_skills.py`: 4 passed / 4 failed, same four tests and
+   residuals, both machines, before and after. None of the hard revert
+   conditions moved; the fix was kept.
+2. **The chain composes one phase further than before, but still does not
+   complete.** Re-running `scripts/chained_demo.py` (unmodified) on
+   bm-ptl: step 1 (`pick(A, fork)`) PASSES exactly as before. Step 2
+   (`handoff(A→B, fork)`) no longer hits the old bug — Phase 1 correctly
+   skips its nested pick (0 frames) and Phase 2 (`from_arm` → transfer
+   point) succeeds — but now FAILS at **Phase 3** (`to_arm` approaches the
+   receiving point): `"phase 3 (to_arm approach) failed [direct approach
+   failed [convergence (IK residual=0.0875 m >= 0.01 m)]; staging to
+   y=-0.06 also failed [collision (cross_arm contacts=1 vs baseline 0;
+   armB-vs-table_top contacts=0 vs baseline 0)]]"`, `frames_used=1500`.
+   Step 3 (`place(B, fork, table)`) was never reached.
+3. **This is a genuinely new failure mode, reasoned about but not chased
+   or patched**, per this fix's own instructions. The likely mechanism:
+   Phase 1 being skipped means `from_arm` carries over step 1's own
+   independent, full-budget `pick(A, fork)` final pose instead of a fresh
+   half-budget nested-pick RETREAT pose — a legitimately different
+   starting point for Phase 2's approach to `transfer_point`, which
+   apparently leaves `from_arm` close enough to `to_arm`'s staging
+   corridor to produce a real cross-arm collision. Not independently
+   re-measured with further instrumentation (out of scope for this fix).
+4. **Fallback `place(A, fork, table)` passed this time** (fork left at
+   `x=0.0835 y=-0.0585 z=0.3591`, `is_holding('A') is None`) — a different
+   outcome than Fix C's own fallback run (which hit a 0.1 mm arm-vs-mug
+   collision), because the fork was left in a different table position by
+   this run's further-progressed (but still failed) handoff attempt. Not
+   a contradiction, not adjusted to match either way.
+
+**ADR-054, ratified.** This is the first fix in this batch to fully close
+one of the conditionally-numbered slots (`docs/hardware/overnight-batch-log.md`'s
+own "ADR numbering" note above: C→054 was conditional on the chain's full
+success; that condition was never about THIS fix, which is a separate,
+later task scoped only to the Phase 1 guard). `DECISIONS.md` and
+`ARCHITECTURE.md` were updated together, in the same commit. Verified
+counts after the edit: `grep -c '^## ADR-' DECISIONS.md` = 39,
+`grep -c '^### ADR-' ARCHITECTURE.md` = 55, `grep -c '^: '` = 0 in both
+files.
+
+**No video rendered.** The chain did not fully succeed (fails at step 2,
+Phase 3), so `docs/videos/chained-demo.mp4` was not produced and none of
+`ffmpeg`/`scp`/PNG rendering was invoked for this fix, per this fix's own
+"if the full chain succeeds" condition.
+
+**`SUBMISSION.md` not modified.** Per the batch's standing rule; this
+finding is logged here for morning-user to fold in by hand.
+
+**Push/pull discipline.** The fixed `skills_scripted.py` was `scp`'d to
+bm-ptl as an uncommitted working-tree diff to verify the standalone
+regression gate and the chain attempt on the authoritative machine BEFORE
+committing (bm-ptl's own pre-fix baseline was independently re-measured
+first, matching this task's stated reference numbers exactly). After
+verification, the change was committed and pushed from the laptop only
+(bm-ptl's PAT remains pull-only); bm-ptl is synced afterward via the
+standard pull-only PAT fetch (`git fetch ... master` then `git reset
+--hard FETCH_HEAD`) so laptop, origin and bm-ptl end this fix synced and
+clean.

@@ -2133,16 +2133,45 @@ def run_handoff(
     # anything in this call has moved). ===
     to_arm_hold = _hold_ctrl(env)
     pick_budget = max(1, step_budget // 2)
-    pick_result = run_pick(
-        env, from_arm, target_object, step_budget=pick_budget, weld=weld, hold_ctrl_base=to_arm_hold,
-        position_provider=position_provider,
-    )
-    frames += pick_result.frames_used
-    if not pick_result.success:
-        return SkillResult(
-            False, f"phase 1 (from_arm pick) failed ({pick_result.reason})", frames,
-            weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=False,
+
+    # ADR-054 (mirrors ADR-034's run_place fix -- same convention, not a new
+    # one): only call the nested run_pick if from_arm is NOT already holding
+    # the object. Without this guard, chaining skills within one episode --
+    # e.g. pick(A, fork) immediately followed by handoff(A->B, fork), the
+    # exact composition a multi-step task plan produces -- sent Phase 1
+    # straight into re-picking an object from_arm already had welded to its
+    # gripper. `grasp.py`'s already-holds gate then correctly refuses every
+    # subsequent grasp attempt (an arm cannot re-grasp what it already
+    # holds), so the nested pick's GRIP waypoint burned its whole frame
+    # budget and failed with weld_attach_failed_after_300_frames before
+    # `handoff` ever reached Phase 2 (measured: scripts/chained_demo.py,
+    # docs/hardware/overnight-batch-log.md). When `weld is None` or the
+    # object is not already held -- true for every standalone `handoff`
+    # call, including verify_adr038_skills.py's and run_demo.py's -- this
+    # reproduces the exact prior behaviour: the nested run_pick call below
+    # is unchanged.
+    already_held = weld is not None and weld.is_holding(from_arm) == body_name
+    if already_held:
+        pick_result = None
+    else:
+        pick_result = run_pick(
+            env, from_arm, target_object, step_budget=pick_budget, weld=weld, hold_ctrl_base=to_arm_hold,
+            position_provider=position_provider,
         )
+
+    # pick_result is None when from_arm already held the object (the nested
+    # pick above was skipped) -- in that case Phase 1 contributes zero NEW
+    # frames and cannot itself have failed, so neither branch below is
+    # entered. This mirrors ADR-034's own care in run_place: guard every
+    # pick_result.<attr> access rather than let a skipped pick crash or
+    # misreport an earlier skill's own frame count.
+    if pick_result is not None:
+        frames += pick_result.frames_used
+        if not pick_result.success:
+            return SkillResult(
+                False, f"phase 1 (from_arm pick) failed ({pick_result.reason})", frames,
+                weld_attach_frame=pick_result.weld_attach_frame, weld_active_at_end=False,
+            )
 
     remaining = step_budget - frames
     if remaining <= 0:

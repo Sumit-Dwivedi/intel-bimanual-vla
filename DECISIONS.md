@@ -11,6 +11,60 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-054 — `run_handoff` Phase 1 `already_held` guard (mirrors ADR-034) — pick→handoff re-pick bug fixed, standalone regression gate byte-identical on laptop and bm-ptl before/after; the 3-skill chain still fails, now one phase later, at a NEW Phase 3 cross-arm collision
+
+**Ratified:** Sept 15, 2026 · **Follows:** ADR-034 (`run_place`'s
+already-held guard — the pattern copied here, not reinvented), ADR-037/038
+(handoff's sequential choreography, unmodified), Fix C's chained-demo
+attempt (found this bug, did not touch `skills_scripted.py`, left ADR-054
+unratified).
+
+`run_handoff`'s Phase 1 called its nested `run_pick` unconditionally, with
+no check for whether `from_arm` already held the object — the exact bug
+shape ADR-034 already fixed in `run_place`. In a chained episode
+(`pick(A, fork)` then `handoff(A→B, fork)` in the same episode, one
+`WeldGrasp`), Phase 1 tried to re-grasp a fork arm A already held;
+`grasp.py`'s already-holds gate refused every step, exhausting
+`GRIP_HOLD_FRAMES` with `weld_attach_failed_after_300_frames` before
+Phase 2 ever ran.
+
+**Fix:** the same `already_held = weld is not None and
+weld.is_holding(from_arm) == body_name` guard ADR-034 introduced, applied
+to Phase 1 only. When true, the nested pick is skipped (`pick_result =
+None`); every downstream `pick_result.<attr>` access is guarded so the
+skip cannot crash or misreport. When `weld is None` or the object is not
+already held — every standalone `handoff` call — behaviour is unchanged.
+
+**Regression gate, both machines, before and after, byte-identical:**
+bm-ptl — `pick(A, fork)` 0.3560→0.3989, `place` final z 0.3588,
+`pick(A,'bottle')` 0.4400→0.6192, `handoff` lateral sep 0.1946 m,
+`frames_used=6610`. Laptop — same shape at 0.3987/0.3588/0.6191/0.1958 m
+(the same pre-existing, ADR-047-documented cross-machine floating-point
+divergence, present identically before and after). `pytest
+tests/test_skills.py`: 4 passed / 4 failed, same four tests, both
+machines, before and after. None of the hard gate numbers moved — the fix
+is kept.
+
+**Chain composition, genuinely tested:** `scripts/chained_demo.py`
+(unmodified) re-run on bm-ptl. Step 1 (`pick(A, fork)`) PASSES. Step 2
+(`handoff(A→B, fork)`) no longer hits the old Phase 1 bug — Phase 1
+correctly skips and Phase 2 succeeds — but now FAILS at Phase 3 (`to_arm`
+approach): a genuine cross-arm collision while staging
+(`from_arm`'s post-Phase-2 pose differs from the standalone case because
+Phase 1 no longer runs its own nested pick, so `from_arm` instead carries
+over step 1's independent full-budget pick's own final pose). Step 3
+(`place(B, fork, table)`) was never reached. The fallback
+`place(A, fork, table)` ran and passed this time (fork left in a different
+table position than Fix C's own fallback run, which is why Fix C's
+arm-vs-mug near-miss did not reproduce here). **Not patched, per this
+fix's own instructions** — the new Phase 3 collision is reported as a real
+finding, not chased with a threshold or routing change. No video rendered
+(chain did not fully succeed). Full account:
+`docs/hardware/overnight-batch-log.md`; full ADR:
+`ARCHITECTURE.md`.
+
+---
+
 ## ADR-053 — M08 extended: 20-seed Track A robustness sweep, same file as ADR-049 — seeds 0-9 reproduce bit-for-bit, `pick(A,'bottle')`'s true rate revises to 45% (9/20), `handoff`'s 20/20 re-disclosed as degenerate everywhere it appears
 
 **Ratified:** Sept 15, 2026 · **Follows:** ADR-049 (original two-track

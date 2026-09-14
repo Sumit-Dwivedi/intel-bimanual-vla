@@ -5050,6 +5050,183 @@ skills (ADR-053).") — code and eval doc land together.
 
 ---
 
+### ADR-054 — `run_handoff` Phase 1 `already_held` guard (mirrors ADR-034, same convention): fixes the pick→handoff re-pick gap so skills compose into a chain; standalone regression gate reproduced byte-identical on laptop and bm-ptl, before and after; the chain still fails, now at a NEW Phase 3 waypoint, reported not patched
+
+**Ratified:** Sept 15, 2026 · **Follows:** ADR-034 (`run_place`'s
+already-held guard, the pattern this ADR copies rather than reinvents),
+ADR-037 (handoff's sequential choreography and frozen-hold snapshots,
+unmodified here), ADR-038 (per-arm-identity retreat vectors, unmodified
+here), Fix C (`docs/hardware/overnight-batch-log.md`'s "Fix B" entry —
+mis-numbered in that log's own text but the same chained-demo attempt —
+which found and diagnosed this exact bug, did not touch
+`skills_scripted.py` per its own task scope, and explicitly left ADR-054
+unratified pending this fix).
+
+**The bug, exactly as measured before this change.** `run_handoff`'s Phase
+1 (`skills_scripted.py`, previously line 2136) called the nested
+`run_pick(env, from_arm, target_object, ...)` UNCONDITIONALLY, with no
+check for whether `from_arm` already held `target_object` — unlike
+`run_place`, which ADR-034 already fixed for exactly this shape of bug. In
+a chained episode (`scripts/chained_demo.py`: one `env.reset()`, one
+`WeldGrasp`, `pick(A, fork)` immediately followed by `handoff(A→B, fork)`
+in the same episode — the composition a multi-step task plan produces),
+Phase 1 tried to re-grasp a fork arm A already held. `grasp.py`'s
+already-holds gate (`WeldGrasp.attempt_grasp`) correctly refuses every
+step of that re-grasp attempt, so the nested pick's GRIP waypoint
+exhausted `GRIP_HOLD_FRAMES` (300) with no attach and `handoff` died with
+`weld_attach_failed_after_300_frames` before ever reaching Phase 2.
+
+**Fix applied (`skills_scripted.py`, `run_handoff` Phase 1 only — copied
+from ADR-034's `run_place` pattern, not a new convention).** Added
+`already_held = weld is not None and weld.is_holding(from_arm) == body_name`
+immediately before the nested `run_pick` call. If true, the nested pick is
+skipped entirely and `pick_result` is set to `None`; every downstream
+`pick_result.<attr>` access (`.frames_used`, `.success`, `.reason`,
+`.weld_attach_frame`) is now inside an `if pick_result is not None:`
+guard, so the skipped-pick case cannot crash or misreport frame counts —
+the same care ADR-034 took with its own `pick_attach_frame` variable.
+Unlike `run_place`, nothing later in `run_handoff` reads `pick_result`
+again (checked explicitly, not assumed): Phase 4's own `weld_attach_frame`
+reporting uses a separate `attach_frame` variable tied to `to_arm`'s own
+grip, entirely independent of Phase 1's pick — so no second propagated
+variable (`run_place`'s `pick_attach_frame`) was needed here. When `weld
+is None` or the object is not already held — true for every standalone
+`handoff` call, including `scripts/verify_adr038_skills.py`'s and
+`scripts/run_demo.py`'s — `already_held` evaluates `False` and the nested
+`run_pick` call runs exactly as before. No other line in `run_handoff` was
+touched; `run_pick`, `run_place`, ADR-031's GRIP freeze, ADR-033's
+per-prop hover, ADR-035's interpolation, and ADR-037/038's choreography
+phases and retreat vectors are all unmodified. No change to `grasp.py`,
+`ik.py`, `executor.py`, `env.py`, `randomization.py`, `scenes/so101/`, or
+`gen_dual_scene.py`.
+
+**Regression gate — the safety property this fix depends on, verified
+directly rather than assumed.** `scripts/verify_adr038_skills.py` exercises
+the standalone path (`weld` is fresh, never pre-attached, for every one of
+its four calls), so `already_held` should evaluate `False` at every call
+site and reproduce the exact prior behaviour. Run before and after the
+code change, on both machines:
+
+| machine | metric | before | after | diff |
+|---|---|---|---|---|
+| bm-ptl | `pick(A, fork)` z | 0.3560 → 0.3989 | 0.3560 → 0.3989 | none |
+| bm-ptl | `place(A, fork, table)` final z | 0.3588 | 0.3588 | none |
+| bm-ptl | `pick(A, 'bottle')` z | 0.4400 → 0.6192 | 0.4400 → 0.6192 | none |
+| bm-ptl | `handoff(A→B, fork)` lateral sep / frames_used | 0.1946 m / 6610 | 0.1946 m / 6610 | none |
+| laptop | `pick(A, fork)` z | 0.3560 → 0.3987 | 0.3560 → 0.3987 | none |
+| laptop | `place(A, fork, table)` final z | 0.3588 | 0.3588 | none |
+| laptop | `pick(A, 'bottle')` z | 0.4400 → 0.6191 | 0.4400 → 0.6191 | none |
+| laptop | `handoff(A→B, fork)` lateral sep / frames_used | 0.1958 m / 6610 | 0.1958 m / 6610 | none |
+
+The laptop-vs-bm-ptl digit difference (0.3987 vs 0.3989, 0.1958 m vs
+0.1946 m) is the SAME pre-existing, already-disclosed cross-machine
+floating-point divergence ADR-047 found and attributed to contact-solver
+iteration-order drift across CPUs, not a consequence of this fix — it is
+present identically before and after, on both machines, confirming this
+fix changed no floating-point-sensitive code path in the standalone case.
+Full raw output of both runs, both machines, both before and after, is
+captured verbatim in this commit's terminal record; every digit above was
+read directly off that output, not retyped from memory.
+
+`pytest tests/test_skills.py`, both machines, before and after this
+change: **4 passed / 4 failed**, the same four failing tests with the
+same residuals every time —
+`test_open_drawer_reaches_near_limit`,
+`test_pick_plate_lifts_above_table`,
+`test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b` (the last one's own failure reason,
+`phase 1 (from_arm pick) failed (waypoint 1 (approach) failed
+[convergence (IK residual=0.0532 m >= 0.01 m)])`, is unchanged digit for
+digit before and after — this test's own `handoff` call never has
+`from_arm` already holding the mug, so `already_held` evaluates `False`
+there too, exactly as this fix's safety property requires).
+
+**None of the hard revert conditions moved.** All five numbers this task
+was gated on (`pick(A, fork)` z, `place` final z, `pick(A, 'bottle')` z,
+handoff lateral separation, `frames_used`) and the pytest count are
+byte-identical before and after, on the authoritative machine (bm-ptl) and
+on the laptop. The fix is kept, not reverted.
+
+**Then: does the chain compose? Genuinely tested, not assumed — and the
+answer is no, at a NEW waypoint.** `scripts/chained_demo.py` (Fix C built
+it; unmodified here) re-run on bm-ptl with this fix applied:
+
+1. **`pick(A, fork)` — PASS.** `frames_used=1655`, `weld_attach_frame=1155`,
+   fork z 0.3560 → 0.3989, `is_holding('A')=='fork'`.
+2. **`handoff(A→B, fork)` — FAILS, at a DIFFERENT waypoint than before this
+   fix.** The old failure (`weld_attach_failed_after_300_frames` inside
+   Phase 1's nested re-pick) is gone — this fix's own target bug is
+   confirmed fixed, in the chained case, not just in isolation. Phase 1
+   now correctly skips (0 frames spent) and Phase 2 (`from_arm` approaches
+   `transfer_point`) succeeds. The NEW failure is Phase 3 (`to_arm`
+   approaches the receiving point): `"phase 3 (to_arm approach) failed
+   [direct approach failed [convergence (IK residual=0.0875 m >= 0.01 m)];
+   staging to y=-0.06 also failed [collision (cross_arm contacts=1 vs
+   baseline 0; armB-vs-table_top contacts=0 vs baseline 0)]]"`,
+   `frames_used=1500`. **Diagnosed, not guessed: this is a plausible
+   consequence of `from_arm`'s different starting pose, not of this fix's
+   own logic.** In the standalone verification above, Phase 1 always runs
+   a nested pick that ends its own RETREAT at a specific pose; in the
+   chained case, Phase 1 is now skipped and `from_arm` instead carries
+   over whatever pose STEP 1's own independent, full-budget `run_pick`
+   call left it at (a legitimately different final pose — the standalone
+   nested pick inside `handoff` only ever got `step_budget // 2`, and
+   critically, `run_pick`'s own APPROACH/DESCEND targets depend on the
+   object's position at the START of that specific call). That different
+   `from_arm` starting pose propagates through Phase 2's approach to
+   `transfer_point` and apparently leaves `from_arm` sitting in a slightly
+   different final spot than the standalone case, which is then close
+   enough to `to_arm`'s staging corridor (`HANDOFF_STAGING_Y_M`,
+   ADR-035/037) to produce a genuine cross-arm collision when `to_arm`
+   tries to stage through it. This was reasoned about, not verified by
+   further instrumentation — the task instructions for this fix
+   explicitly forbid modifying anything further to chase this down, so it
+   is reported as a plausible mechanism, not a proven one, exactly the way
+   ADR-034's own second (unpatched) reachability failure was reported.
+3. **`place(B, fork, table)` — NEVER REACHED.** Step 2 failed, so the
+   script never attempts step 3 (`chained_demo.py`'s own control flow
+   stops the chain honestly at the first failure).
+
+**Fallback, exactly as the task instructions anticipated (labelled, not
+conflated with chain success).** `chained_demo.py`'s own fallback branch —
+`place(A, fork, table)`, since arm A still held the fork after step 2's
+failed handoff — ran and **PASSED this time**: `frames_used=1800`, final
+fork position `x=0.0835 y=-0.0585 z=0.3591`, `is_holding('A') is None`.
+This is a DIFFERENT outcome than Fix C's own fallback run (which hit an
+arm-vs-mug collision at −0.0051 m against a −0.005 m threshold, a 0.1 mm
+miss) — expected, not a contradiction: Fix C's fallback ran immediately
+after Phase 1's OLD failure (fork essentially untouched since step 1), the
+task instructions warn marginal collisions are live in this area, and this
+fix's fallback runs after Phase 2 of a DIFFERENT, now-further-progressed
+handoff attempt left the fork at a different table position before the
+fallback place began. Reported as observed, not adjusted or re-run to
+chase a match with Fix C's number — **no threshold, gate, or waypoint
+constant was touched to produce or explain either fallback outcome.**
+
+**Not done, deliberately.** No attempt was made to fix, route around, or
+adjust any threshold for the new Phase 3 collision — per this fix's own
+task instructions, that is a real finding to report, not a defect in this
+fix to chase. No video was rendered: the chain did not fully succeed, so
+`docs/videos/chained-demo.mp4` was not produced and none of
+`ffmpeg`/`scp`/PNG rendering was invoked. `SUBMISSION.md` was not modified
+(the batch's standing rule); this finding is logged in
+`docs/hardware/overnight-batch-log.md` instead.
+
+**Net honest status.** `run_handoff`'s Phase 1 re-pick bug (the bug this
+ADR was scoped to fix) is fixed and verified two ways: the standalone
+regression gate is byte-identical on two machines before and after, and
+the chained case's OLD failure mode (`weld_attach_failed_after_300_frames`
+at Phase 1) no longer occurs. The three-skill chain still does not
+complete end to end — it now fails one phase later, at Phase 3's cross-arm
+staging collision, a different and previously unmeasured failure mode.
+`pytest tests/test_skills.py`: 4 passed / 4 failed, identical to every
+prior ADR in this chain.
+
+**Source:** this commit ("M06 handoff: already-held guard so skills
+compose into a chain (ADR-054).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
