@@ -11,6 +11,78 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-049 — M08: two-track 10-seed robustness eval — own-prop randomization (Track A) vs. M07 Round 1's multi-prop randomization (Track B); `handoff`'s Track A 10/10 is disclosed as a degenerate measurement, not a robustness result
+
+**Ratified:** Sept 14, 2026 · **Follows:** ADR-047 (cross-trial state-leak
+fix, the regression gate this module reproduces byte-identical), ADR-048
+(measured `SKILL_ENVELOPES`, the ONLY source this module's envelopes are
+allowed to disagree with) · **Adds:** `scripts/eval_m08.py`,
+`docs/hardware/m08-eval.md`
+
+**Context.** M08's brief calls for randomizing only a skill's own target
+prop over seeds 0-9. Taken literally, that method cannot reproduce M07's
+own Round 1 numbers (`docs/hardware/m07-envelopes.md`'s Task 3) — most
+importantly `handoff`'s 0/10, which came from randomizing `water_bottle`
+(the only prop with a non-degenerate individual envelope) underneath
+**every** skill's seeds, including `handoff`, which never targets it.
+`handoff`'s own fork envelope is a single point (`dx=0, dy=0`,
+`m07-envelopes.md:163`), so an own-prop-only method draws the identical
+zero offset every seed and scores `handoff` 10/10 by construction — a
+determinism check, not a robustness result, and reporting it unqualified
+next to the other three skills' real ranges would be actively misleading.
+
+**Decision.** Run and report BOTH methods, always labelled, never merged
+into one table: **Track A** (own-prop, this brief's method, reading
+rectangles straight from `randomization.py`'s already-measured
+`SKILL_ENVELOPES` — never re-measured) and **Track B** (M07 Round 1's
+method, reconstructed exactly: `water_bottle: (0,0,-0.010,+0.010)`, `fork`
+excluded, applied under all four skills). Every appearance of Track A's
+`handoff` number — table, prose, this ADR — carries the qualifier "envelope
+is a single point, zero displacement applied; this measures determinism,
+not robustness." `randomization.py`'s shipped `ENVELOPES` stays `{}`,
+untouched; both tracks construct their own `ScenarioRandomizer(envelopes=
+{...})` locally in the new `scripts/eval_m08.py`, using the class's
+existing, documented constructor argument.
+
+**Results (bm-ptl, fresh env+executor per trial per ADR-047; full per-seed
+offsets and failure reasons in `docs/hardware/m08-eval.md`):**
+
+| skill | Track A | Track B |
+|---|---|---|
+| `pick(A, fork)` | 10/10 | 10/10 |
+| `place(A, fork, table)` | 10/10 | 8/10 (seeds 5, 8 — mug collision via float coupling) |
+| `handoff(B, A, fork)` | **10/10 — degenerate, not robustness** | **0/10 — every seed, identical failure** |
+| `pick(A, 'bottle')` | 6/10 (seeds 0,1,2,4 fail) | 6/10 (identical to Track A — same target prop both tracks) |
+
+Track B reproduces M07 Round 1's historical report (10/10, 8/10, 0/10,
+6/10, same failing `place_fork` seeds) fresh, today — Round 1 was not a
+one-off.
+
+**Cross-prop coupling, confirmed a third time.** ADR-038 (moving the mug
+alone broke `handoff` at phase 3, fork untouched) and M07's Commit 2
+(0.1 mm-resolution probe: any nonzero `water_bottle` offset reproduces the
+identical phase-3 failure) both said a skill can be broken by a prop it
+never manipulates. This module's Track B run reproduces the same cliff
+independently. Mechanism: MuJoCo recomputes the whole system's
+contacts/forces every step, so a prop's position anywhere in the scene can
+perturb floating-point rounding enough, over a long rollout, to tip an
+already-marginal collision check (`handoff`'s cross-arm corridor) the wrong
+way — this is *why* ADR-048's cross-skill-safe intersection collapsed to
+empty, and it is an architectural constraint, not a scheduled bug fix.
+
+**Interpretation, stated plainly.** Every PASS here was measured inside
+envelopes on the order of ±10-20 mm, tuned to what these skills already
+tolerate. The pre-M07/M08 audit measured 0/40 at a coarse ±50 mm jitter.
+This is an honest robustness measurement within a narrow, tuned band — not
+a general robustness claim.
+
+**Regression gates re-verified, bm-ptl, before and after:**
+`verify_adr038_skills.py` reproduces `0.3989/0.3588/0.6192/0.1946`;
+`pytest tests/test_skills.py` reproduces 4 passed / 4 failed, same four
+tests and reasons as ADR-047/ADR-048.
+
+---
+
 ## ADR-048 — M07: fine-grid placement envelopes (7x7, 1 cm step, +/-3 cm), opt-in `ScenarioRandomizer` — measured envelopes for `fork`/`water_bottle` both collapse to a single point once `handoff`'s cross-prop fragility is included, so the shipped randomizer intentionally randomizes nothing this pass
 
 **Ratified:** Sept 14, 2026 · **Follows:** ADR-038 (regenerated scene + four

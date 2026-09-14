@@ -4484,6 +4484,111 @@ randomization, preliminary per-skill robustness (ADR-048).").
 
 ---
 
+### ADR-049 — M08: two-track 10-seed robustness eval — own-prop randomization (Track A) vs. M07 Round 1's multi-prop randomization (Track B); `handoff`'s Track A 10/10 is disclosed as a degenerate measurement, not a robustness result
+
+**Context.** M08's brief (PLAN.md, as re-scoped after M07/ADR-048) calls for
+randomizing only the skill's own target prop and evaluating over seeds 0-9.
+Applied literally, that method cannot reproduce M07's own Round 1 numbers
+(`docs/hardware/m07-envelopes.md`'s Task 3), most importantly `handoff`'s
+0/10 — because Round 1 randomized `water_bottle` (the only prop with a
+non-degenerate individual envelope) underneath **every** skill, including
+`handoff`, which never targets it. `handoff`'s own measured fork envelope
+(`m07-envelopes.md:163`) is `dx=0, dy=0` — a single point — so an own-prop-
+only method draws the identical zero offset on every seed and scores
+`handoff` 10/10 by construction, which is not evidence of robustness, only
+of determinism.
+
+**Decision.** Run and report both methods, explicitly labelled, never
+collapsed into one table:
+- **Track A — own-prop randomization** (this module's own brief). Only the
+  skill's own target prop moves, drawn from that skill's own
+  `SKILL_ENVELOPES` rectangle (`randomization.py`). A degenerate
+  (single-point) rectangle is used AS-IS, not filtered out — the point of
+  `handoff`'s Track A row is to show the degeneracy, not hide it.
+- **Track B — multi-prop randomization** (M07 Round 1's method,
+  reconstructed exactly: `water_bottle: (0, 0, -0.010, +0.010)`, `fork`
+  excluded — applied underneath all four skills' ten seeds regardless of
+  target).
+
+Every mention of Track A's `handoff` result — in the results table, the
+summary prose, and this ADR — carries the qualifier: **"envelope is a
+single point, zero displacement applied; this measures determinism, not
+robustness."** No mention of that number appears without it.
+
+**Options considered for where the envelopes come from.**
+- (a) Re-measure envelopes from scratch for this module.
+- (b) Read `SKILL_ENVELOPES` directly out of `randomization.py` (already
+  measured and committed by ADR-048) and construct per-track
+  `ScenarioRandomizer(envelopes={...})` instances locally in a new
+  `scripts/eval_m08.py`, never touching `randomization.py` itself.
+
+**Decision.** (b). `randomization.py`'s own module-level `ENVELOPES` export
+is the cross-skill-safe, degenerate-excluding default and must stay `{}`
+(ADR-048's own finding, and this task's explicit instruction to leave it
+so) — it is not what either track of this evaluation uses.
+`ScenarioRandomizer.__init__` already accepts an explicit `envelopes=`
+argument for exactly this kind of caller; using it is additive, not a
+change to the shipped class or its default behaviour.
+
+**Results (bm-ptl, seeds 0-9, oracle mode, fresh `TableSettingEnv` + fresh
+`ScriptedSkillExecutor` per trial per ADR-047). Full per-seed offsets,
+failure reasons and frame counts in `docs/hardware/m08-eval.md`.**
+
+| skill | Track A (own-prop) | Track B (multi-prop, M07 Round 1's method) |
+|---|---|---|
+| `pick(A, fork)` | 10/10 | 10/10 |
+| `place(A, fork, table)` | 10/10 | 8/10 (seeds 5, 8 fail — mug collision via floating-point coupling) |
+| `handoff(B, A, fork)` | **10/10 — degenerate, zero displacement, not a robustness result** | **0/10 — every seed, identical failure reason and frame count** |
+| `pick(A, 'bottle')` | 6/10 (seeds 0,1,2,4 fail) | 6/10 (identical seeds, offsets and outcomes to Track A — expected: `water_bottle` is this skill's own target in both tracks) |
+
+Track B's numbers reproduce M07 Round 1's historical report
+(`docs/hardware/m07-envelopes.md`'s Task 3 Round 1: 10/10, 8/10, 0/10, 6/10,
+same failing seeds for `place_fork`) on a fresh run, today, confirming
+Round 1 was not a one-off artifact.
+
+**Cross-prop coupling — an architectural constraint, not a bug to schedule
+a fix for.** Two independent findings agree: ADR-038 (moving the mug alone,
+at a scene-composition level, broke `handoff` at phase 3 with the fork
+itself untouched) and M07's Commit 2 (probed to 0.1 mm resolution: any
+nonzero `water_bottle` offset reproduces the identical phase-3 failure,
+only exactly zero reproduces baseline). This document's own Track B run is
+a third, independent reproduction of the same cliff. The mechanism is
+MuJoCo's whole-system contact/force recomputation at every step: a prop's
+position anywhere in the scene can perturb floating-point rounding through
+a long closed-loop rollout enough to tip an already-marginal collision
+check (`handoff`'s cross-arm corridor, ADR-037's "knife-edge") the wrong
+way, with zero geometric proximity required. This is *why* a single,
+skill-agnostic randomizer's cross-skill-safe intersection collapses to
+empty (ADR-048): safety for `handoff` requires tolerance to every prop's
+position, not just its own target's, and the measured tolerance for
+`water_bottle` under that requirement is a single point.
+
+**Consequence for how these two tracks should be read.** Track A answers
+"how much can a skill's own target move." Track B answers "how much can
+anything else in the scene move before this skill breaks." They are not
+two measurements of the same quantity at different rigor — they are
+answers to different questions, and `handoff` is the clearest case where
+the two disagree completely (10/10 vs 0/10). Any future consumer of this
+evaluation (README, demo narration, submission writeup) must cite both
+numbers together for `handoff`, never Track A alone.
+
+**Interpretation, stated plainly.** Every PASS in this module was measured
+inside envelopes on the order of ±10-20 mm, tuned specifically to what
+these four skills already tolerate. The pre-M07/M08 audit measured 0/40
+aggregate at a coarse ±50 mm jitter. This module is an honest measurement
+of robustness within a narrow, specifically-tuned band — not a general
+robustness claim, and `docs/hardware/m08-eval.md` says so in those words.
+
+**Regression gates, re-verified on bm-ptl before and after this module's
+run.** `scripts/verify_adr038_skills.py`: `0.3989 / 0.3588 / 0.6192 /
+0.1946`, unchanged. `pytest tests/test_skills.py`: 4 passed / 4 failed,
+same four tests and reasons as ADR-047/ADR-048.
+
+**Source:** this commit ("M08: 10-seed robustness eval, per-skill success
+rates within individual envelopes (ADR-049).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
