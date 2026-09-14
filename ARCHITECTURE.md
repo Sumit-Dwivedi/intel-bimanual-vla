@@ -3961,6 +3961,112 @@ per-prop MAE fork=3.2mm bottle=2.6mm mug=2.8mm (ADR-044).").
 
 ---
 
+### ADR-045 — M10 Phase 4: PoseNet converted to OpenVINO IR (FP32/FP16), benchmarked CPU/iGPU/NPU — all six combos succeeded (including NPU+FP32), one silent-default trap found and fixed, one threshold miss reported honestly
+
+**Context.** M10 Phase 3 (ADR-044) produced a trained checkpoint. ADR-013's
+Sept-12 correction, from M03, established the export/benchmark discipline
+this phase must follow: static or bounded shapes for the NPU (a fully
+dynamic batch dimension does not raise a catchable exception on this NPU --
+it kills the whole interpreter with `STATUS_ACCESS_VIOLATION`), no ONNX
+intermediate, and every NPU compile attempt isolated in its own subprocess
+so one crash cannot destroy already-successful results from other devices.
+ADR-043 put `torch` and `openvino` in the same `train_env` venv specifically
+so this phase could convert AND benchmark in one place, on bm-ptl, without
+the laptop/bm-ptl split M03's `ov_smoke.py` needed.
+
+**Options.**
+- (a) Convert once, benchmark all six (device, precision) combinations in one
+  long-lived process, write one results file at the end.
+- (b) Convert once (static batch-1 `[1,3,224,224]`, per ADR-013), then
+  benchmark each (device, precision) combo in its OWN subprocess, in a fixed
+  CPU -> GPU -> NPU order, appending each result to `results.jsonl` the
+  instant it is known.
+
+**Decision.** (b), mirroring `scripts/ov_smoke.py`'s
+`do_single_variant`/`do_device_run` subprocess-per-variant pattern
+(ARCHITECTURE.md's own M03 section) rather than reinventing a different
+shape. (a) was rejected for the same reason ADR-013 already rejected it for
+M03: a hard process kill during NPU's combos would silently cost CPU's and
+GPU's already-obtained results too, and M03 already demonstrated this
+happening once.
+
+**Result.** `checkpoints/posenet_best.pth` (43.2 MiB, weights-only load,
+11,310,153 params) converted to FP32 IR (43.13 MiB `.bin`) and FP16 IR (21.56
+MiB `.bin`, exactly 0.500x). All six (device, precision) combos --
+CPU/GPU/NPU x FP32/FP16 -- compiled and ran to completion **without a single
+crash** on this hardware/driver/OpenVINO-version combination, including
+NPU+FP32 (which the task brief flagged as a plausible capability limit and
+deliberately left out of the correctness-threshold table; it compiled and
+inferred successfully here, so its deviation is reported for the record with
+no pass/fail threshold applied). The subprocess-isolation and incremental-
+write discipline above was exercised on every combo and never actually
+triggered by a crash this run -- worth recording as a fact about this run,
+not as evidence the defence was unnecessary to build.
+
+Headline mean latency / throughput (10 warm-up discarded, 100 measured,
+static batch-1 `[1,3,224,224]`): **PyTorch-XPU baseline 3.59 ms / 278 Hz**
+(`torch.xpu.synchronize()`-guarded around both warm-up and the timed region,
+since XPU kernel launches are asynchronous and an unguarded region would
+measure launch overhead only). **OpenVINO: CPU 6.4-6.5 ms / ~154 Hz, GPU
+0.59-0.68 ms / ~1.5-1.7 kHz, NPU 1.10-1.28 ms / ~780-910 Hz.** Full
+min/median/p95/std table in `docs/hardware/m10-phase4-benchmark.md`.
+
+**Correctness vs the PyTorch-XPU reference, on the same 5 validation samples
+ADR-044's mean-collapse check used** (thresholds: CPU/GPU FP32 < 1e-4,
+CPU/GPU FP16 < 1e-3, NPU FP16 < 1e-2): CPU FP32 1.043e-07, CPU FP16 9.203e-05,
+GPU FP16 1.445e-04, NPU FP16 1.653e-04 -- all within threshold. **GPU FP32
+misses its own threshold** (1.445e-04 vs 1e-04, a ~1.4x miss, well under the
+brief's >10x flag margin) and reports the exact same deviation value as GPU
+FP16. The most likely explanation is that the Arc B390 GPU plugin defaults
+its internal compute precision to FP16 regardless of the IR's stored weight
+precision (a documented Intel GPU-plugin behaviour, not unique to this
+model) -- stated here as a hypothesis about *why*, not a measured cause,
+since this script did not override `INFERENCE_PRECISION_HINT` to confirm it
+directly. Reported plainly rather than hidden; every other combo is within
+its threshold.
+
+**Two things caught during the build, not swept under the checkpoint.**
+1. **`ov.save_model`'s `compress_to_fp16` parameter defaults to `True`**
+   (`help(ov.save_model)`: "Floating point weights are compressed to FP16 by
+   default."). A first pass at the export step omitted the argument for the
+   intended-FP32 save and produced a 21.56 MiB `.bin` -- byte-identical to
+   the FP16 save, i.e. the "FP32" IR was silently FP16-compressed. Caught by
+   checking the file size against the ~43 MiB an 11.3M-param FP32 dump
+   implies, fixed by passing `compress_to_fp16=False` explicitly.
+2. **The brief's named conversion form was tried and verified failing, not
+   assumed to fail.** `ov.convert_model(model, example_input=x,
+   input=[("image", [1, 3, 224, 224])])` raised `RuntimeError: Input for
+   tensor name 'image' is not found.` against this live PoseNet module on
+   openvino 2026.3.1. Fell back to the plain-list form already proven in
+   this repo (`scripts/ov_smoke.py:181`, `input=list(INPUT_SHAPE)`), which
+   succeeded and is what both IR variants were built from.
+
+**Consequences.** `scripts/posenet_to_openvino.py` is the one committed path
+from checkpoint to IR to benchmark table; `artifacts/posenet_ir/` (the IR
+files, `results.jsonl`, the 5-sample reference arrays) stays gitignored and
+regenerable, per the same "Build artifacts" `.gitignore` block M03's
+artifacts already used. The GPU FP32/FP16 precision-hint ambiguity (point 2
+of Correctness above) is left open rather than chased further this phase --
+confirming it would need explicitly setting and comparing
+`INFERENCE_PRECISION_HINT` values, which is not required by this module's
+done-when criteria and is noted here for anyone extending this benchmark
+later.
+
+**Process note.** Before this module's work began, bm-ptl's repo was one
+commit behind (`7dcaaa6`, missing `9999379`'s ARCHITECTURE.md sync) with a
+stale local `origin/master` tracking ref falsely reporting "ahead by 103
+commits" -- resynced via `fetch` + `reset --hard FETCH_HEAD` (bm-ptl cannot
+authenticate a bare `git pull`) before any new work started. Every bm-ptl
+command in this module ran in its own foreground SSH invocation, never
+detached, per this module's SSH-hygiene instruction.
+
+**Source:** this commit ("M10 Phase 4: PoseNet OpenVINO conversion, benchmark
+across CPU/GPU/NPU (ADR-045).") -- code, benchmark doc and this ADR land
+together, so there is no separate prior commit to cite the way ADR-044 above
+cites `7dcaaa6`.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

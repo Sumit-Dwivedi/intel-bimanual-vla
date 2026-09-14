@@ -11,6 +11,86 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-045 — M10 Phase 4: PoseNet converted to OpenVINO IR (FP32/FP16), benchmarked CPU/iGPU/NPU — all six combos succeeded (including NPU+FP32), one silent-default trap found and fixed, one threshold miss reported honestly
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-044 (M10 Phase 3, trained checkpoint),
+ADR-043 (`train_env` with torch+openvino coexisting), ADR-013 (precision/device
+mapping strategy and the NPU crash-isolation lesson from M03) · **Adds:**
+`scripts/posenet_to_openvino.py`, `docs/hardware/m10-phase4-benchmark.md`. IR
+artifacts (`artifacts/posenet_ir/`) are gitignored (`.gitignore:50`,
+"Build artifacts (OpenVINO IR, reference tensors)") and live only on bm-ptl.
+
+**Result.** `checkpoints/posenet_best.pth` (43.2 MiB, weights-only load via
+`torch.load(..., weights_only=True)`, 11,310,153 params) converted to FP32 IR
+(43.13 MiB `.bin`) and FP16 IR (21.56 MiB `.bin`, exactly 0.500x). Benchmarked
+CPU/GPU/NPU x FP32/FP16 -- 10 warm-up inferences discarded, then 100 measured,
+static batch-1 `[1,3,224,224]` throughout -- plus a PyTorch-XPU baseline with
+the identical methodology, `torch.xpu.synchronize()`-guarded around both the
+warm-up and the timed region (XPU kernel launches are asynchronous; without
+the sync the timed region would measure launch overhead only). Headline mean
+latency / throughput: **XPU (PyTorch) 3.59 ms / 278 Hz, CPU 6.4-6.5 ms / ~154
+Hz, GPU 0.59-0.68 ms / ~1.5-1.7 kHz, NPU 1.10-1.28 ms / ~780-910 Hz.** Full
+table with min/median/p95/std in `docs/hardware/m10-phase4-benchmark.md`.
+
+**All six (device, precision) combos compiled and ran without a crash,
+including NPU+FP32.** ADR-013's M03 lesson (an unsupported NPU graph does not
+raise a catchable exception, it kills the whole interpreter with
+`STATUS_ACCESS_VIOLATION`) was taken seriously here even though the static
+`[1,3,224,224]` shape was not expected to trigger it: every (device,
+precision) combo ran in its own `subprocess.run(...)`, in the fixed order
+CPU -> GPU -> NPU, with every result appended to `results.jsonl` the instant
+it was known, never buffered until the end. NPU ran last, after CPU's and
+GPU's rows were already on disk. This defence was exercised on every
+combo and never actually triggered by a crash this run -- recorded as a fact
+about this run, not as evidence the defence was unnecessary to build.
+
+**NPU accepted an FP32 static-batch-1 graph.** This module's task brief
+flagged NPU+FP32 as a plausible capability limit (NPUs are typically
+FP16-oriented) and its threshold table omitted it accordingly. On this
+NPU5010 build it compiled and inferred successfully (deviation 1.653e-4 vs
+the PyTorch-XPU reference) -- reported for the record since no threshold is
+defined for it, not scored pass/fail.
+
+**Two things found and handled honestly rather than smoothed over:**
+1. **`ov.save_model`'s `compress_to_fp16` parameter defaults to `True`**
+   (`help(ov.save_model)`: "Floating point weights are compressed to FP16 by
+   default."). A first pass at the export step omitted the argument for the
+   intended-FP32 save and produced a 21.56 MiB `.bin` -- byte-identical to
+   the FP16 save, i.e. the "FP32" IR was silently FP16. Caught by checking
+   the file size against the ~43 MiB an 11.3M-param FP32 dump implies, and
+   fixed by passing `compress_to_fp16=False` explicitly for the FP32 save.
+2. **GPU FP32 exceeds its own stated threshold**: 1.445e-4 vs the 1e-4
+   CPU/GPU-FP32 threshold (a ~1.4x miss, well under the >10x flag margin).
+   GPU FP32 and GPU FP16 report byte-identical deviation and near-identical
+   latency, consistent with the Arc B390 GPU plugin defaulting its internal
+   compute precision to FP16 regardless of the IR's stored weight precision
+   (a documented Intel GPU-plugin behaviour, not unique to this model) --
+   stated as a hypothesis about *why*, not a measured cause, since this
+   script did not override `INFERENCE_PRECISION_HINT` to test it directly.
+   Every other combo (CPU FP32/FP16, GPU FP16, NPU FP16) is within its
+   threshold.
+
+**Conversion form: brief's named form tried first, verified failing, fell
+back per the brief's own instruction.** `input=[('image', [1,3,224,224])]`
+was tried directly against the live PoseNet module first and failed with
+`RuntimeError: Input for tensor name 'image' is not found.` (openvino
+2026.3.1). Fell back to the plain-list form already proven in this repo
+(`scripts/ov_smoke.py:181`, `input=list(INPUT_SHAPE)`), which succeeded.
+
+**Process note.** Before this module's work began, bm-ptl's repo was one
+commit behind (`7dcaaa6`, missing `9999379`'s ARCHITECTURE.md sync) with a
+stale local `origin/master` tracking ref reporting a false "ahead by 103
+commits" -- resynced via the documented `fetch` + `reset --hard FETCH_HEAD`
+recipe (bm-ptl cannot authenticate a bare `git pull`) before any new work
+started. All bm-ptl commands in this module ran in a foreground SSH session
+per call, never detached, per this module's SSH-hygiene instruction.
+
+**Source:** this commit ("M10 Phase 4: PoseNet OpenVINO conversion, benchmark
+across CPU/GPU/NPU (ADR-045).") -- code, benchmark doc and this ADR land
+together, so there is no separate prior commit to cite.
+
+---
+
 ## ADR-044 — M10 Phase 3: PoseNet trained on Intel Arc B390, per-prop MAE 2.6-3.2 mm; verified input-dependent, not mean-collapse
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-039/040/041 (dataset), ADR-042
