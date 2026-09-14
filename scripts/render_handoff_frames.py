@@ -82,6 +82,15 @@ TO_ARM, FROM_ARM = "B", "A"  # run_handoff(env, to_arm, from_arm, ...) -- to_arm
 # milestone 3 (measured on this run's own first attempt: 1 frame apart).
 M2_OFFSET_FRAMES = 2500
 
+# Fix B (demo motion clip): number of frames to sample, evenly spaced by
+# physics-step index, across the "interesting span" -- from milestone 1
+# (arm A holding the fork, lifted) through milestone 4 (run_handoff's own
+# return / retreat-complete) -- rather than across all ~6610 steps of the
+# run, most of which is A's initial approach to the fork (not part of the
+# handoff itself). 30 frames @ 15 fps (see ffmpeg step) is a 2-second clip.
+CLIP_N_FRAMES = 30
+CLIP_OUT_DIR = REPO_ROOT / "clip_frames_tmp"
+
 
 def write_png(path: pathlib.Path, rgb: np.ndarray) -> None:
     """Write an HxWx3 uint8 array as a PNG using only the standard library
@@ -205,8 +214,17 @@ def main() -> int:
     site_a = sk._site_id(model, ik.gripperframe_site_name("A"))
     transfer_point = np.array(sk.HANDOFF_POSITION_XYZ, dtype=np.float64)
 
+    capture_clip = "--clip" in sys.argv
+
     milestones: dict[str, dict] = {}
     frame_counter = {"n": 0}
+    # Fix B: every physics-step snapshot from milestone 1 onward, ONLY when
+    # --clip is requested (state vectors are small, but there's no reason to
+    # pay this memory/copy cost on ordinary candidate-image runs). Keyed by
+    # frame index so the post-run sampler below can pick ~CLIP_N_FRAMES of
+    # them evenly spaced between m1 and m4 without having known m4's frame
+    # index in advance (m4 is only known once run_handoff returns).
+    clip_span_states: dict[int, np.ndarray] = {}
     original_step = env.step
 
     def observing_step(*args, **kwargs):
@@ -221,6 +239,11 @@ def main() -> int:
             fork_z > sk.TABLE_SURFACE_Z + sk.PICK_LIFT_MARGIN_M
         ):
             milestones["m1_holding_fork"] = {"frame": n, "state": env.get_state().copy()}
+
+        if capture_clip and "m1_holding_fork" in milestones:
+            # Recorded AFTER the m1 check above so frame n == m1's own frame
+            # is included (dict order doesn't matter here, only membership).
+            clip_span_states[n] = env.get_state().copy()
 
         if (
             "m2_at_transfer" not in milestones
@@ -303,6 +326,44 @@ def main() -> int:
     print(f"  ADR-038 fix 2 measured: final-frame LATERAL (y) gripper separation = {lateral_y_separation:.4f} m")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if capture_clip:
+        # Fix B: render ~CLIP_N_FRAMES PNG frames, evenly spaced by physics-
+        # step index across [m1_holding_fork, m4_final], using CANDIDATE 1's
+        # exact camera (azimuth=20, elevation=-10, distance=0.35, lookat=the
+        # midpoint between the two arms' FINAL gripper sites) -- the same
+        # camera that produced docs/images/m06-handoff-complete.png, chosen
+        # there because the red fork and the empty gripper both read
+        # clearly. Reused verbatim (not recomputed per-frame) so the clip is
+        # a fixed reference frame, same rationale as the 4-panel strip's
+        # cam_fixed_sequence above: a moving camera would make the fork
+        # appear to "jump" even when nothing physically jumped.
+        clip_mid = (site_a_final + site_b_final) / 2.0
+        clip_camera = {"azimuth": 20, "elevation": -10, "distance": 0.35, "lookat": list(clip_mid)}
+        m1_frame = milestones["m1_holding_fork"]["frame"]
+        m4_frame = milestones["m4_final"]["frame"]
+        available = sorted(clip_span_states.keys())
+        # Evenly spaced target frame indices across the span; snap each to
+        # the nearest frame index actually recorded in clip_span_states
+        # (recording started exactly at m1_frame, so this is always exact
+        # for endpoints and near-exact in between).
+        targets = np.linspace(m1_frame, m4_frame, CLIP_N_FRAMES)
+        CLIP_OUT_DIR.mkdir(parents=True, exist_ok=True)
+        # Clear any stale frames from a previous run of this script.
+        for old in CLIP_OUT_DIR.glob("frame_*.png"):
+            old.unlink()
+        chosen_frames = []
+        for i, target in enumerate(targets):
+            nearest = min(available, key=lambda f: abs(f - target))
+            chosen_frames.append(nearest)
+            img = render_snapshot(model, data, clip_span_states[nearest], clip_camera, FULL_W, FULL_H)
+            write_png(CLIP_OUT_DIR / f"frame_{i:03d}.png", img)
+        print(
+            f"  Fix B clip: wrote {len(targets)} frames to {CLIP_OUT_DIR} "
+            f"spanning frame_index {m1_frame}..{m4_frame} "
+            f"(camera={clip_camera})"
+        )
+        print(f"  Fix B clip: chosen frame indices = {chosen_frames}")
 
     if "--sweep" in sys.argv:
         # Tuning-only diagnostic: an azimuth sweep at fixed elevation/distance,

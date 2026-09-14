@@ -24,6 +24,9 @@ data/posenet/images/
 data/posenet/labels/
 *.mp4
 *.avi
+# Exception: committed demo clip evidence (Fix B), small handful of MB,
+# analogous to the docs/images/ render evidence already tracked.
+!docs/videos/*.mp4
 
 # Ad hoc probe/debug render output (scripts/probe_render.py); committed render
 # evidence lives under docs/images/ instead, named per module.
