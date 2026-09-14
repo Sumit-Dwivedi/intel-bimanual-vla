@@ -171,10 +171,15 @@ class TableSettingEnv:
         self._renderer: mujoco.Renderer | None = None
 
         # Owned RNG, seeded in reset(). Nothing in step()/render() consumes
-        # it yet -- it exists so M07's Randomizer has a documented, seeded
-        # source to draw from without reaching into global numpy state
-        # (ARCHITECTURE.md ADR-012: "nothing in the control or perception
-        # path may consume the randomization RNG" outside this seam).
+        # it, and M07's shipped `ScenarioRandomizer` (ADR-048) does not
+        # either -- it seeds its OWN `np.random.default_rng(seed)` directly
+        # from the same `seed` int `reset()` receives, rather than reaching
+        # into this instance attribute, so `randomize(seed)` stays a pure
+        # function of `seed` alone (testable and reproducible with no `env`
+        # object at all). `self.np_random` is kept anyway as the documented
+        # seam ADR-012 reserved ("nothing in the control or perception path
+        # may consume the randomization RNG" outside this seam) in case a
+        # future caller wants an env-bound stream instead of a pure one.
         self.np_random: np.random.Generator | None = None
         self._seed: int | None = None
 
@@ -182,7 +187,12 @@ class TableSettingEnv:
     # Core contract
     # ------------------------------------------------------------------
 
-    def reset(self, seed: int = 0, cameras: list[str] | None = None) -> dict:
+    def reset(
+        self,
+        seed: int = 0,
+        cameras: list[str] | None = None,
+        randomizer=None,
+    ) -> dict:
         """Reset physics to the model's compiled initial state.
 
         Obs schema: always 'qpos' (nq,) float64 and 'qvel' (nv,) float64.
@@ -205,6 +215,35 @@ class TableSettingEnv:
                 name is validated against the model's discovered cameras;
                 an unknown name raises `ValueError` naming the offending
                 camera and listing every valid name.
+            randomizer: **M07 (ADR-048), opt-in, `None` by default.** `None`
+                (the default) means this method is BYTE-IDENTICAL to its
+                pre-M07 behaviour for every `seed` -- this is deliberate,
+                not an oversight: `scripts/verify_adr038_skills.py:19` and
+                `tests/test_skills.py:76` both call `reset(seed=N)` today and
+                depend on it producing the exact fixed baseline scene (the
+                30-point regression evidence and the 4-passed/4-failed
+                pytest baseline). Making randomization the default the
+                moment a caller passes a `seed` would silently invalidate
+                both without raising anything -- the same "default OFF,
+                explicit opt-in" shape ADR-046 already established for
+                perception (`ScriptedSkillExecutor(inference=None)`).
+                When not `None`, `randomizer` must implement
+                `randomize(seed) -> dict[str, tuple[float, float]]`
+                (`bimanual.sim.randomization.ScenarioRandomizer` is the one
+                shipped implementation) mapping a prop's body name to an
+                (dx, dy) offset in METRES, applied ON TOP OF whatever x/y the
+                deterministic reset above already wrote via the compiled
+                model's own "home" keyframe -- never by regenerating the
+                scene XML (ADR-038 found that breaks `handoff`). Applied via
+                a direct `data.qpos` write to that prop's own free joint,
+                exactly the runtime mechanism `scripts/generate_posenet_data.py`
+                and the pre-M07 audit's own probe already used, followed by
+                one extra `mj_forward` to recompute derived kinematics
+                (`data.xpos` etc.) before this call builds its observation.
+                A prop name `randomizer.randomize()` returns that has no
+                `"<name>_free"` joint in the compiled model raises
+                `KeyError` immediately -- fail loud, not a silently-ignored
+                offset.
 
         Returns:
             Observation dict; see the obs schema note above.
@@ -225,8 +264,49 @@ class TableSettingEnv:
             mujoco.mj_resetDataKeyframe(self.model, self.data, home_key_id)
         mujoco.mj_forward(self.model, self.data)
 
+        # M07 (ADR-048): opt-in scoped randomization, applied AFTER the
+        # deterministic baseline above and BEFORE the observation is built,
+        # so a caller that never passes `randomizer=` sees no change at all
+        # (the `if` below is simply never entered) -- see this method's
+        # `randomizer` arg docstring for why that byte-identical guarantee
+        # matters.
+        if randomizer is not None:
+            offsets = randomizer.randomize(seed)
+            for prop_name, (dx, dy) in offsets.items():
+                adr = self._prop_free_joint_qpos_adr(prop_name)
+                self.data.qpos[adr] += dx
+                self.data.qpos[adr + 1] += dy
+            # Recompute data.xpos/xquat/etc. from the modified qpos -- the
+            # skill layer (skills_scripted.py) reads xpos, not qpos, for
+            # every targeting decision, so skipping this would leave every
+            # randomized prop's derived pose stale until the first step().
+            mujoco.mj_forward(self.model, self.data)
+
         effective_cameras = self._resolve_cameras(cameras)
         return self._build_obs(effective_cameras)
+
+    def _prop_free_joint_qpos_adr(self, prop_name: str) -> int:
+        """Resolve `prop_name`'s free-joint `qpos` address by name.
+
+        Every movable prop in the packaged scene (`gen_dual_scene.py`) has a
+        free joint literally named `"<body_name>_free"` -- the same lookup
+        `scripts/generate_posenet_data.py` and
+        `scripts/probe_pre_m07_audit.py` already perform, repeated here so
+        `reset()`'s randomizer hook needs no hardcoded prop list of its own
+        (the model, via `randomizer.randomize()`'s returned keys, is the
+        source of truth for WHICH props get offset). `mj_name2id` returns
+        -1 for an unknown joint name rather than raising -- turned into a
+        loud `KeyError` here instead of a silently-ignored offset.
+        """
+        joint_name = f"{prop_name}_free"
+        jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if jid == -1:
+            raise KeyError(
+                f"randomizer offset requested for prop {prop_name!r}, but this model has "
+                f"no free joint named {joint_name!r}. Valid prop names have a "
+                f"'<name>_free' joint in the compiled scene."
+            )
+        return int(self.model.jnt_qposadr[jid])
 
     def step(self, action, cameras: list[str] | None = None) -> tuple[dict, bool, dict]:
         """Advance physics by one timestep under `action`.

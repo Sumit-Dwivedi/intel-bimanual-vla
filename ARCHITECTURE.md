@@ -4352,6 +4352,138 @@ state corruption (ADR-047).").
 
 ---
 
+### ADR-048 — M07: fine-grid placement envelopes (7x7, 1 cm step, +/-3 cm), opt-in `ScenarioRandomizer` — measured envelopes for `fork`/`water_bottle` both collapse to a single point once `handoff`'s cross-prop fragility is included, so the shipped randomizer intentionally randomizes nothing this pass
+
+**Context.** PLAN.md's M07 calls for randomizing initial object placement
+(brief p2 objective 3, 15 rubric points, `CONSTRAINTS.md:33`). The pre-M07/
+M08 audit (`docs/hardware/m10-pre-m07-audit.md`) had already found, at a
+coarse ±5 cm jitter, that all four ADR-038-gated skills tolerate essentially
+zero placement perturbation (0/40 aggregate), with a real but narrow
+(~1 cm x 0.5 cm, asymmetric) band for `pick(A, fork)` visible only at finer
+resolution. This module measures that band properly and builds a
+randomizer scoped to whatever the measurement actually supports, rather
+than to the brief's un-measured "modest range" framing.
+
+**Decision 1 — randomization is opt-in, default OFF.**
+`scripts/verify_adr038_skills.py:19` and `tests/test_skills.py:76` both
+depend on `env.reset(seed=N)` producing the FIXED baseline scene (the four
+ADR-038 numbers; the 4-passed/4-failed pytest baseline). `TableSettingEnv.
+reset()` gained a new `randomizer=None` argument; omitted, it is
+byte-identical to pre-M07 behaviour for every `seed` — the same
+default-OFF shape ADR-046 established for perception
+(`ScriptedSkillExecutor(inference=None)`). When given a
+`ScenarioRandomizer`-shaped object, `reset()` applies its
+`randomize(seed) -> {prop: (dx, dy)}` return value to each named prop's
+free-joint `qpos` (x, y only) via a direct write plus one extra
+`mj_forward`, AFTER the deterministic "home"-keyframe reset — the same
+runtime-qpos mechanism `scripts/generate_posenet_data.py` and the pre-M07
+audit's own probe already used, never scene-XML regeneration (ADR-038
+found that breaks `handoff`).
+
+**Decision 2 — measurement design.** `scripts/probe_envelope.py sweep`:
+7x7 grid, 1 cm step, ±3 cm range, around each of `fork`'s and
+`water_bottle`'s own default (x, y), for the four skills
+`pick(A, fork)`, `place(A, fork, table)`, `handoff(B, A, fork)`,
+`pick(A, 'bottle')`. 5 fresh-env-fresh-executor reps per cell (seeds 0-4;
+every non-rejected cell reported exactly 0/5 or 5/5, never 1-4/5 — a live
+regression check against the ADR-047 state-leak bug class, not a real
+randomization axis, since nothing on this code path consumes any RNG given
+a fixed pose). A candidate cell is REJECTED (not scored as a failure) if
+off-table (checked against `gen_dual_scene.py`'s declared table half-
+extents) or if it produces a real MuJoCo contact penetration deeper than
+2 mm against another prop (post-`mj_forward` collision detection —
+deliberately NOT `generate_posenet_data.py`'s own bounding-circle
+heuristic, which is a render-legibility check that would incorrectly
+reject cells the shipped scene's own default already occupies). Measured
+result (full grids in `docs/hardware/m07-envelopes.md`): `pick_fork`
+4/29 passed (`dx in [-0.010,+0.020]`, `dy=0`); `place_fork` 2/29
+(`dx in [-0.010,0]`, `dy=0`, narrower than `pick` as expected); `handoff`
+**1/29 — a single point, the unperturbed default itself**; `pick_bottle`
+8/49, scattered, with a usable 3-cell rectangle (`dx=0`,
+`dy in [-0.010,+0.010]`).
+
+**A harness near-miss, caught and corrected before being reported as a
+finding.** An early-stop attempt on `handoff`'s sweep (this task's own
+instructions permit stopping early on a plausibly-empty envelope) stopped
+after its first two rows came back all-fail — without ever reaching
+`dx=0`, the point `verify_adr038_skills.py` already proves succeeds with a
+0.2263 m margin. Caught before write-up; the sweep was re-run in full and
+found the correct single-cell result. Recorded as a methodology lesson:
+order any future early-stopping sweep so the flag cannot fire before a
+known-good centre point has been tested.
+
+**Decision 3 — per-prop scoping is an intersection across every skill that
+CONSTRAINS a prop, not just skills that directly TARGET it.**
+`ScenarioRandomizer.ENVELOPES[prop]` starts as the rectangle intersection
+across every skill whose OWN target object is that prop (`fork`: `pick`,
+`place`, `handoff` — intersects to the single point `(0,0)`; `water_bottle`:
+`pick_bottle` only — `dx=0`, `dy in [-0.010,+0.010]`, real and
+non-degenerate on this first cut). **Task 3 (seeds 0-9, randomizer opted
+in) found this first cut insufficient**: with ONLY `water_bottle`
+randomized (fork untouched, confirmed bit-identical initial `qpos` across
+all 10 seeds), `handoff` — which never targets `water_bottle` — failed
+0/10, byte-identical residual and frame count every seed. Probed directly
+at `dy` in `{±0.0001, ±0.001, ±0.005}` m: every nonzero offset reproduces
+the identical Phase-3 (cross-arm approach) collision failure; exactly
+`0.0` reproduces the true baseline bit-for-bit. A genuine binary cliff, not
+a smoothly shrinkable range — MuJoCo recomputes the whole system's
+contacts every step, so a prop with zero direct geometric proximity to a
+maneuver can still perturb an already-"joint-limit knife-edge" (ADR-037's
+own term) collision check elsewhere in the scene. Since a global,
+skill-agnostic `reset()` hook cannot know which skill will run next, and
+`handoff` is one of the four ADR-038-gated skills, this was folded back in
+as an explicit cross-prop COMPATIBILITY entry,
+`SKILL_ENVELOPES["handoff"]["water_bottle"] = (0,0,0,0)`, intersected the
+same way as every direct-target entry.
+
+**Result: both `fork`'s and `water_bottle`'s final intersections are
+single points (zero width on both axes).** `_is_degenerate_point` excludes
+both from `ENVELOPES` rather than offering a fake always-zero
+`rng.uniform(0,0)` "range" — the same "say so and exclude, don't silently
+emit a zero-width range" rule this task specified for a geometrically empty
+intersection, extended to this degenerate-but-technically-non-empty case.
+`plate`/`mug`/`spoon` are absent from `ENVELOPES` for the separate, simpler
+reason that no measured skill targets them at all. **Net effect: the
+shipped `ScenarioRandomizer` randomizes nothing** (`ENVELOPES = {}`) —
+verified by re-running `randomized_eval` for all four skills against the
+shipped randomizer: 10/10 each, `mean_frames_on_success` bit-identical to
+the unperturbed baseline's own `frames_used` for every skill.
+
+**A second, non-blocking chaos finding, recorded for a future harness's
+benefit.** Before the cross-prop fix, `place_fork`'s Task-3 round (8/10,
+`water_bottle`-only randomization) had 2 failures traced to global
+floating-point coupling: `fork`'s own initial `qpos` is bit-identical
+across all 10 seeds and the SAME seed reproduces the SAME outcome
+deterministically, yet different (far-away) `water_bottle` positions
+measurably shifted where the nested pick ended up gripping the fork over a
+3455-step rollout, occasionally landing a later waypoint in collision with
+`mug`. 80% clears this task's own 60% floor (no remediation required by
+that rule), but it is a real example of "a prop excluded from randomization
+is not fully insulated from another randomized prop's effect on its own
+skill" — relevant to any future M08 harness reasoning about which props are
+"safe."
+
+**Verification (bm-ptl, `ov_env`).** `verify_adr038_skills.py` and `pytest
+tests/test_skills.py` both reproduced byte-identical to the ADR-047
+baseline throughout this commit's changes (including after `env.py`'s
+`reset()` signature changed and after `ENVELOPES`'s computation changed a
+second time, mid-investigation, to fold in the cross-prop constraint).
+
+**Consequences.** M08's future evaluation harness gets a
+`ScenarioRandomizer` that is honest about its own current scope (a
+documented no-op) rather than one that silently ships a degenerate or
+unsafe range. Real randomization range, if wanted later, requires either
+fixing `handoff`'s underlying fragility (Phase 1's nested-pick tolerance
+and/or Phase 3's cross-arm corridor) or building a skill-aware randomizer
+(out of this pass's scope — `env.py`'s `reset()` hook is necessarily
+skill-agnostic, matching how a real seed loop randomizes a scenario before
+choosing which skill to run against it).
+
+**Source:** this commit ("M07: fine-grid envelope measurement, deterministic
+randomization, preliminary per-skill robustness (ADR-048).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
