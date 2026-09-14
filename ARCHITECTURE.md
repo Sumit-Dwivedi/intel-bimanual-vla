@@ -4589,6 +4589,146 @@ rates within individual envelopes (ADR-049).").
 
 ---
 
+### ADR-050 — M10 Phase 4 extension: INT8 PoseNet quantization via NNCF, benchmarked CPU/iGPU/NPU — 4x smaller than FP32 and 2-4x faster than FP16/FP32, but deviation (36-37 mm) is an order of magnitude above the model's own ground-truth MAE (2.6-3.2 mm)
+
+**Context.** ADR-013's original precision/device-mapping decision said INT8
+via NNCF post-training quantization "targets the NPU5010." ADR-045 (M10
+Phase 4) benchmarked FP32 and FP16 only, leaving INT8 as a deferred row.
+This module's task brief marks INT8 explicitly as a bonus, not critical
+path: "if it fails, STOP and report rather than fighting it." It did not
+fail, so this ADR records what was measured.
+
+**Options.**
+- (a) Regenerate the FP32 IR fresh before quantizing, in case Phase 4's
+  artifact had drifted since ADR-045.
+- (b) Quantize the EXISTING, already-verified FP32 IR
+  (`artifacts/posenet_ir/posenet_fp32.xml`) with NNCF, calibrated on a
+  freshly-sampled subset of M09a's images, and reuse Phase 4's own 5-sample
+  PyTorch-XPU reference predictions (`val_images.npy` /
+  `val_predictions_xpu.npy`) for the correctness check rather than
+  recomputing them.
+
+**Decision.** (b). Before any new work started, the FP32/FP16 `.bin` sizes
+on bm-ptl were independently re-verified byte-for-byte against ADR-045's own
+numbers (45,221,444 / 22,610,738 bytes) -- confirming the artifact this
+module quantizes is the exact one ADR-045 benchmarked, not a re-derived
+one. Regenerating it would have risked silently producing a different graph
+than what Phase 4's FP32/FP16 rows describe.
+
+**Dependency install, `--no-deps` first, then only what import actually
+needed.** `pip install --no-deps nncf` installed nncf 3.3.0 itself but
+`import nncf` then failed on a missing transitive import. Rather than
+re-resolving NNCF's full declared dependency tree (which pulls scipy,
+scikit-learn, pydot, ninja, rich and more -- several of which could
+plausibly want to bump numpy or another pinned package), each missing
+import was added ONE PACKAGE AT A TIME, each also with `--no-deps`, retrying
+`import nncf` after each addition and stopping the moment it succeeded:
+`packaging`, `rich`, `tabulate`, `psutil`, `safetensors`, `scipy` -- 6
+packages, `import nncf` succeeded after `scipy`. `pip show nncf` also lists
+`ninja`, `pydot` and `scikit-learn` as declared requirements, and `pip
+check` correctly flags all three as missing (plus `rich`'s own
+`markdown-it-py`/`pygments`) -- none of the three was needed by `import
+nncf` or by a live `nncf.quantize(...)` smoke test against a trivial
+OpenVINO model (the same MinMax-statistics + Fast-Bias-Correction algorithm
+path the real quantization uses), so none is installed. `torch.__version__`
+(`2.14.0+xpu`), `torch.xpu.is_available()` (`True`) and `numpy.__version__`
+(`2.4.6`) were verified unchanged before and after every one of the 7
+install steps (nncf itself plus the 6 additions) -- per this module's task
+brief, any install that changed torch or numpy would have been an
+immediate abort-and-report, and none did. `ov_env`
+(`scripts/requirements-bmptl.txt`) was never touched; NNCF lives only in
+`train_env`, recorded in `scripts/requirements-train.txt` (the file ADR-043
+created for exactly this purpose).
+
+**Calibration.** 300 images sampled without replacement from
+`data/posenet/images/` (5,000 available), `numpy.random.default_rng(seed=42)`,
+preprocessed identically to training (224x224 RGB -> float32 `[0,1]` -> CHW,
+no mean/std normalization, matching `PoseNetDataset.__getitem__`). The exact
+`sample_index` list drawn is recorded in
+`artifacts/posenet_ir/int8_calibration_info.json` for reproducibility.
+`nncf.quantize(ov_model, calib_dataset, subset_size=300,
+target_device=nncf.TargetDevice.NPU)` per ADR-013's stated NPU target --
+the produced IR is still a generic OpenVINO IR and was benchmarked on
+CPU/GPU/NPU identically to the FP32/FP16 IRs, not restricted to NPU.
+
+**Result — size.** INT8 `.bin` is 10.82 MiB, 0.251x FP32's 43.13 MiB and
+0.502x FP16's 21.56 MiB -- almost exactly the 0.25x an INT8-vs-FP32
+bit-width ratio predicts.
+
+**Result — latency (10 warm-up discarded, 100 measured, static batch-1
+`[1,3,224,224]`, identical methodology to Phase 4).** CPU 1.616 ms / 619 Hz
+(vs FP32/FP16's 6.4-6.5 ms), GPU 0.340 ms / 2939 Hz (vs FP32/FP16's
+0.59-0.68 ms), NPU 0.903 ms / 1107 Hz (vs FP32/FP16's 1.10-1.28 ms). All
+three devices compiled and ran INT8 without a crash; the subprocess-per-
+device isolation (ADR-013's M03 lesson, restated in ADR-045) was exercised
+on every combo and never triggered by a crash this run.
+
+**Result — correctness, and the honest finding this ADR exists to record.**
+Max absolute deviation vs the PyTorch-XPU reference, same 5 validation
+samples and same reference array Phase 4 used: CPU 36.600 mm, GPU 37.499 mm,
+NPU 36.391 mm. This is roughly two orders of magnitude larger than FP16's
+deviation (~1.7e-4 m = 0.17 mm) and is NOT small relative to what matters
+for control: PoseNet's own ground-truth MAE is 2.6-3.2 mm per prop, so an
+INT8 deviation of ~36-37 mm is **an order of magnitude above the model's own
+error scale**, not "well under" it. Judged against that scale rather than as
+a bare number (this module's task brief's own instruction), this INT8
+quantization is **not** a free win the way FP16 was -- it is markedly less
+accurate, in a way that would be material to control if this IR were
+actually driving a skill, not just a benchmark row. This is plausible and
+not evidence of a bug: PoseNet's head regresses precise 3D millimetre-scale
+coordinates rather than a classification logit, and naive INT8 post-training
+quantization is well known to degrade regression heads far more than
+classification heads, which tolerate coarser activation quantization because
+only the argmax needs to survive. Consistency across all three devices
+(36.4-37.5 mm, not wildly different from each other) supports "the
+quantization itself is imprecise for this task" over "a device-specific
+bug."
+
+**On GPU INT8 vs GPU FP16 specifically.** ADR-045 found GPU FP32 and GPU
+FP16 report byte-identical deviation and near-identical latency, consistent
+with the Arc B390 plugin running its internal compute in FP16 regardless of
+the IR's stored weight precision. If that holds, comparing GPU INT8 against
+GPU FP16 here may be comparing INT8 against an already-FP16-internal
+baseline rather than against a genuinely higher-precision one -- flagged as
+a caveat on the GPU row, not a claim this script verifies (would require
+overriding `INFERENCE_PRECISION_HINT` directly, out of scope here).
+
+**Per-device recommendation.** NPU is ADR-013's originally intended INT8
+target and is the fastest of the three at INT8 while being competitively
+fast even against FP16's NPU row (0.903 ms vs 1.10-1.28 ms); GPU is
+fastest overall at INT8 (0.340 ms). But given the ~36-37 mm deviation on all
+three, **none of the three is recommended as the demo's perception backend
+in its current form** -- the demo path stays on FP16 (ADR-046's GPU FP16
+runtime), and this INT8 IR is reported as a documented benchmark artifact,
+not adopted. A future pass could try excluding the regression head from
+quantization (`ignored_scope`) or a larger/more representative calibration
+set before reconsidering INT8 for the control loop; neither was attempted
+here, since this module's task brief scoped it as calibration-and-measure,
+not as an accuracy-recovery exercise.
+
+**Consequences.** `scripts/quantize_posenet.py` is the committed path from
+the existing FP32 IR to the INT8 IR and its benchmark rows;
+`artifacts/posenet_ir/posenet_int8.{xml,bin}`,
+`int8_calibration_info.json` and `int8_convert_info.json` stay gitignored
+and regenerable, in the same `.gitignore` block Phase 4's artifacts already
+use. `docs/hardware/m10-phase4-benchmark.md` gained three new table rows
+(CPU/GPU/NPU x INT8) and a new "INT8 quantization" section; Phase 4's own
+table rows, findings and prose are unchanged.
+
+**Process note.** bm-ptl's repo was already at the same commit as origin
+(`98a0a25`) when this module began, with the same stale-tracking-ref pattern
+ADR-045 already documented (a local `origin/master` ref reporting a false
+"ahead by N commits" despite `git log` matching exactly) -- re-verified, not
+re-fixed, since it does not block work. Every bm-ptl command in this module
+ran in its own foreground SSH invocation, never detached, per this module's
+SSH-hygiene instruction.
+
+**Source:** this commit ("M10 Phase 4 extension: INT8 PoseNet quantization
+across CPU/iGPU/NPU (ADR-050).") -- code, benchmark doc and this ADR land
+together.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

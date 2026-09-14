@@ -37,6 +37,9 @@ Converts `checkpoints/posenet_best.pth` (M10 Phase 3, ADR-044) to OpenVINO IR an
 | GPU | FP16 | COMPILE_OK | 0.5880 | 0.6827 | 0.6386 | 0.8448 | 0.0910 | 1464.8581 | 1.445e-04 | EXECUTION_DEVICES=['GPU.0'] |
 | NPU | FP32 | COMPILE_OK | 0.8745 | 1.2806 | 1.2020 | 2.0230 | 0.3046 | 780.8974 | 1.653e-04 | No threshold defined for this (device, precision) pair -- reported for the record only.; EXECUTION_DEVICES=NPU |
 | NPU | FP16 | COMPILE_OK | 0.8615 | 1.0994 | 1.1111 | 1.2571 | 0.1020 | 909.6044 | 1.653e-04 | EXECUTION_DEVICES=NPU |
+| CPU | INT8 | COMPILE_OK | 1.3144 | 1.6160 | 1.5918 | 1.9684 | 0.1398 | 618.8238 | 3.660e-02 | 36.600 mm vs 2.625 mm min MAE; EXECUTION_DEVICES=['CPU'] |
+| GPU | INT8 | COMPILE_OK | 0.3227 | 0.3402 | 0.3345 | 0.3830 | 0.0267 | 2939.1191 | 3.750e-02 | 37.499 mm vs 2.625 mm min MAE; EXECUTION_DEVICES=['GPU.0'] |
+| NPU | INT8 | COMPILE_OK | 0.6121 | 0.9030 | 0.9000 | 0.9702 | 0.0537 | 1107.4724 | 3.639e-02 | 36.391 mm vs 2.625 mm min MAE; EXECUTION_DEVICES=NPU |
 
 ## Interpretation
 
@@ -49,4 +52,29 @@ In the same spirit as `docs/hardware/bmptl-verification.md`'s Day-0 caveat (carr
 2. **NPU accepted an FP32 static-batch-1 graph.** This module's task brief flagged NPU+FP32 as a plausible capability limit (NPUs are typically FP16-oriented) and deliberately left it out of the threshold table. On this NPU5010 build it compiled and inferred successfully; no threshold is defined for it, so its deviation is reported for the record only, not pass/failed.
 3. **GPU FP32 and GPU FP16 report byte-identical `max_abs_deviation_vs_xpu` (1.445e-4) and near-identical latency.** The most likely explanation is that the Arc B390 GPU plugin's default `INFERENCE_PRECISION_HINT` runs FP16 internally regardless of the IR's stored weight precision (a documented Intel GPU-plugin default, not unique to this model) -- this script did not override that hint, so it cannot distinguish a genuinely-FP32 GPU execution from an FP16-internal one here. This is an inference about *why*, not a measured cause; stated as a hypothesis, not a fact.
 4. **GPU FP32 exceeds its own stated threshold** (1.445e-4 vs the 1e-4 CPU/GPU FP32 threshold, a ~1.4x miss) **but not the >10x flag margin**, consistent with finding 3 above -- an FP32-labelled row actually running at FP16-level precision would be expected to land closer to the FP16 threshold band than the FP32 one. Reported, not hidden; every other combo is within its threshold.
+
+## INT8 quantization (M10 Phase 4 extension, ADR-050)
+
+NNCF post-training quantization applied to the EXISTING FP32 IR (`artifacts/posenet_ir/posenet_fp32.xml`, not regenerated), producing `artifacts/posenet_ir/posenet_int8.xml/.bin`. `nncf` (3.3.0) plus 6 of its declared dependencies (`packaging`, `rich`, `tabulate`, `psutil`, `safetensors`, `scipy`) were installed into `train_env` with `--no-deps` each, one at a time, stopping as soon as `import nncf` succeeded -- `ninja`, `pydot`, `scikit-learn` (nncf's remaining declared deps) and `rich`'s own `markdown-it-py`/`pygments` were never needed and are not installed (`pip check` lists them as missing, informational only). `torch.__version__` (`2.14.0+xpu`), `torch.xpu.is_available()` (`True`) and `numpy.__version__` (`2.4.6`) were verified unchanged before and after every install step. `ov_env` (`scripts/requirements-bmptl.txt`) was never touched -- NNCF lives only in `train_env`, recorded in `scripts/requirements-train.txt`.
+
+**Calibration:** 300 images sampled without replacement from `data/posenet/images/` (5,000 available), `numpy.random.default_rng(seed=42)`, preprocessed identically to training (224x224 RGB -> float32 [0,1] -> CHW, no mean/std normalization). The exact sample_index list drawn is recorded in `artifacts/posenet_ir/int8_calibration_info.json` for reproducibility. `nncf.quantize(..., target_device=nncf.TargetDevice.NPU)` per ADR-013's decision that INT8 "targets the NPU5010" -- the produced IR is still generic OpenVINO IR and is benchmarked on CPU/GPU/NPU below exactly like the FP32/FP16 IRs.
+
+**Size:** INT8 `.bin` is 10.82 MiB, vs FP32's 43.13 MiB (0.251x) and FP16's 21.56 MiB (0.502x).
+
+**Correctness (max abs deviation vs the PyTorch-XPU reference, same 5 validation samples and same `val_predictions_xpu.npy` Phase 4 used):**
+- CPU: 36.600 mm. PoseNet's own smallest per-prop ground-truth MAE is 2.625 mm (bottle; fork 3.211 mm, mug 2.768 mm) -- 36.600 mm is **at or above** that scale, so this deviation is judged material to control, not safe to treat as free.
+- GPU: 37.499 mm. PoseNet's own smallest per-prop ground-truth MAE is 2.625 mm (bottle; fork 3.211 mm, mug 2.768 mm) -- 37.499 mm is **at or above** that scale, so this deviation is judged material to control, not safe to treat as free.
+- NPU: 36.391 mm. PoseNet's own smallest per-prop ground-truth MAE is 2.625 mm (bottle; fork 3.211 mm, mug 2.768 mm) -- 36.391 mm is **at or above** that scale, so this deviation is judged material to control, not safe to treat as free.
+
+
+**On comparing GPU INT8 to GPU FP16 specifically:** Phase 4 found GPU FP32 and GPU FP16 report byte-identical deviation (1.445e-4) and near-identical latency, consistent with the Arc B390 plugin running its internal compute in FP16 regardless of the IR's stored weight precision. If that holds, a "GPU INT8 vs GPU FP16" comparison here may be comparing INT8 against an already-FP16-internal baseline rather than against a genuinely higher-precision one -- worth keeping in mind when reading the GPU row above, not a claim this script can verify without overriding `INFERENCE_PRECISION_HINT` directly.
+
+
+**Per-device recommendation, from the measurements above:**
+
+- **CPU:** 1.6160 ms mean latency, 36.600 mm deviation (exceeds the model's own MAE scale -- treat with caution).
+
+- **GPU:** 0.3402 ms mean latency, 37.499 mm deviation (exceeds the model's own MAE scale -- treat with caution).
+
+- **NPU:** 0.9030 ms mean latency, 36.391 mm deviation (exceeds the model's own MAE scale -- treat with caution) (ADR-013's intended INT8 target device).
 

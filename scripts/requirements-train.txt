@@ -98,3 +98,33 @@ tcmlib==1.5.0
 triton-xpu==3.8.0
 typing_extensions==4.16.0
 umf==1.1.0
+
+# M10 Phase 4 extension addition (Sept 14, 2026, ADR-050): NNCF, for INT8
+# post-training quantization of the already-exported FP32 IR
+# (scripts/quantize_posenet.py). Installed into THIS venv (train_env), same
+# reasoning as the openvino addition above -- ov_env is never installed
+# into. `pip install --no-deps nncf` alone was not sufficient (NNCF pulls a
+# large transitive dependency tree that was deliberately NOT re-resolved,
+# per this module's task brief correction 3): `import nncf` was retried
+# after each addition below, one package at a time, each also with
+# `--no-deps`, stopping the moment the import succeeded. `pip show nncf`
+# additionally declares `ninja`, `pydot` and `scikit-learn` as requirements
+# -- none of the three was needed for `import nncf` or for a live
+# `nncf.quantize(...)` smoke test (MinMax statistics collection + Fast Bias
+# Correction, the same algorithm path the real PoseNet quantization uses),
+# so none of the three is installed here. `pip check` correctly flags all
+# three as missing, plus `rich`'s own declared (also unused-here) deps
+# `markdown-it-py`/`pygments` -- recorded as a known, harmless gap rather
+# than silently resolved.
+#
+# Verified before AND after EVERY install step below (see
+# docs/hardware/m10-phase4-benchmark.md's INT8 section): torch.__version__
+# unchanged (2.14.0+xpu), torch.xpu.is_available() still True, numpy
+# unchanged (2.4.6). None of these 7 packages touched torch or numpy.
+nncf==3.3.0
+packaging==26.3
+rich==15.0.0
+tabulate==0.10.0
+psutil==7.2.2
+safetensors==0.8.0
+scipy==1.17.1
