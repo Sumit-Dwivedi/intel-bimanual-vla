@@ -11,6 +11,66 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-044 — M10 Phase 3: PoseNet trained on Intel Arc B390, per-prop MAE 2.6-3.2 mm; verified input-dependent, not mean-collapse
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-039/040/041 (dataset), ADR-042
+(architecture), ADR-043 (train_env + openvino) · **Adds:**
+`docs/hardware/m10-phase3-training-log.md`. Checkpoints are gitignored
+(`.gitignore:12`, `checkpoints/*.pth`, ~45 MB each) and live only on bm-ptl.
+
+**Result.** 30 epochs, **956.1 s (15.9 min)**, **141.2 samples/sec** on the Arc
+B390 iGPU via native `torch.xpu` (no IPEX, ADR-042). Best val loss **0.000011**
+at epoch 30. Per-prop MAE at the best checkpoint: **fork 3.2 mm, water_bottle
+2.6 mm, mug 2.8 mm** — all inside the "< 0.02 m excellent" band, so Phase 4 can
+proceed without an accuracy caveat on the headline number.
+
+**The run was ~4x faster than the 60-90 min estimate.** 15.9 minutes for 30
+epochs over 4500 samples. Two contributors: `--num-workers 0` (ADR-043 measured
+104.7 vs 53.3 samples/sec, spawn overhead dominating on Windows), and the Arc
+B390 handling an 11.3 M-param ResNet18-scale model comfortably.
+
+**Verified genuinely learned, not mean-collapse.** A regressor that outputs the
+dataset mean for every input can post a plausible loss; with props randomised
+over x,y in [-0.18, +0.18] such a model would score ~90 mm MAE. Tested directly
+on 5 validation samples with the best checkpoint:
+
+```
+std of PREDICTIONS across 5 samples: [0.1533 0.0672 0.0017 0.0472 0.0981 0.0021 0.0549 0.1108 0.0008]
+std of GROUND TRUTH  across 5 samples: [0.1537 0.0673 0.      0.0469 0.0978 0.      0.0558 0.1098 0.     ]
+pred_spread / gt_spread = 1.009
+```
+
+Predictions vary as much as ground truth does. Worst single-axis error across
+those 15 prop-samples is 5.0 mm; most are under 3 mm.
+
+**Curve shape: still improving at the end.** Epochs 1-2 drop steeply, 3-15
+oscillate under a high cosine learning rate (train and val move together on the
+downswings — not overfitting), 16-30 descend monotonically. **The best epoch is
+the final one and val_loss was still falling**, so the model is under-trained
+rather than over-trained; more epochs would likely help. Final train 0.000017 vs
+val 0.000011 — val *below* train, no overfitting signal anywhere.
+
+**Four caveats that must not be lost when this number is quoted.**
+1. **z is not meaningfully predicted.** Ground-truth z std across samples is
+   exactly 0: each prop's height is pinned to its own resting value by design
+   (ADR-039's correction). Only x and y carry signal, so this is effectively 2-D
+   localisation and the MAE should be read that way.
+2. **Synthetic, single camera, no augmentation.** One fixed `posenet_cam` pose,
+   one lighting condition. These are in-distribution figures, not robustness.
+3. **Arms are always at the home keyframe** in every training image. A scene with
+   arms mid-motion is out of distribution.
+4. **The occluded tail is uncharacterised.** All five sanity samples had
+   `visibility_ratio == 1.00`. Accepted samples run down to ~0.44 (ADR-041's
+   filter rejects below 0.30), and accuracy there was not measured.
+
+**Process note.** The first training attempt was launched by a builder agent as a
+detached background process on bm-ptl; it initialised correctly (device, split,
+param count all logged) and then died silently when its SSH session closed,
+leaving an empty error log and no checkpoints. The successful run held the
+process in a foreground SSH session inside a supervising background job — the
+same pattern that carried the 35-minute dataset generation — so it could not be
+orphaned.
+
 ## ADR-043 — M10 Phase 3 prep: `openvino==2026.3.1` installed into `train_env` alongside torch (for Phase 4's live-PyTorch->OpenVINO conversion), `num_workers` default corrected 4 -> 0 — `ov_env` untouched
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-042 (created `train_env`, measured
