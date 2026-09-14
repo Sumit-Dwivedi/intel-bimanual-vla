@@ -1,5 +1,14 @@
 """M08: formal 10-seed robustness evaluation of the four ADR-038-gated
-skills (ADR-049).
+skills (ADR-049), EXTENDED to a 20-seed Track A sweep (ADR-053,
+`docs/hardware/m08-extended-eval.md`).
+
+**Backward compatibility, stated up front.** Every default is unchanged
+from ADR-049: `--num-seeds` defaults to 10 and `--track`/`--skill` behave
+exactly as before, so `python scripts/eval_m08.py --track both --skill all
+--out-dir out/m08_eval` still reproduces ADR-049's original 10-seed result
+from this SAME file. ADR-053 only exercises the NEW `--num-seeds 20` flag,
+and only for Track A (this brief's own-prop method) -- Track B was not
+asked to be extended and is not reported past 10 seeds anywhere.
 
 **Two tracks, reported separately -- see `docs/hardware/m08-eval.md` for the
 full write-up and why they cannot be collapsed into one table.**
@@ -46,11 +55,27 @@ explicit, script-local `envelopes=` dicts (a supported, documented
 constructor argument -- see `randomization.py`'s `ScenarioRandomizer.__init__`).
 `randomization.py`'s own module-level `ENVELOPES` stays empty and untouched.
 
+**Per-trial timeout (ADR-053, batch discipline).** Each trial runs on a
+background `threading.Thread`, joined with a `TRIAL_TIMEOUT_S` (default 300
+s / 5 min) wait. If the thread has not finished by then, the seed is logged
+as a timeout failure (`reason="trial_timeout_after_300s"`) and the sweep
+moves on to the next seed immediately -- it does not block waiting for the
+hung trial. The thread itself is a daemon and is NOT forcibly killed
+(CPython cannot kill a thread); it is abandoned to finish or hang in the
+background against its own, already-isolated `TableSettingEnv` +
+`ScriptedSkillExecutor` (never reused by any later trial, so an abandoned
+thread cannot corrupt a later seed's result). This is a soft, logical
+timeout, not OS-level process termination -- disclosed here rather than
+overstated. No hang was observed in ADR-049's original 80-trial run or in
+this module's own 20-seed extension; this exists purely as the defensive
+measure the batch brief asked for.
+
 Usage
 -----
   python scripts/eval_m08.py --track A --skill pick_fork --out out/m08/trackA_pick_fork.jsonl
   python scripts/eval_m08.py --track B --skill handoff --out out/m08/trackB_handoff.jsonl
   python scripts/eval_m08.py --track both --skill all --out-dir out/m08
+  python scripts/eval_m08.py --track A --skill all --num-seeds 20 --out-dir out/m08_eval_extended
 """
 
 from __future__ import annotations
@@ -58,6 +83,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import threading
 import time
 
 from bimanual.control import ik
@@ -67,6 +93,15 @@ from bimanual.sim.env import TableSettingEnv
 from bimanual.sim.randomization import ScenarioRandomizer, SKILL_ENVELOPES
 
 ALL_SKILLS = ("pick_fork", "place_fork", "handoff", "pick_bottle")
+
+#: Backward-compatible default -- unchanged from ADR-049, so any call site
+#: that does not pass `--num-seeds` reproduces the original 10-seed result.
+DEFAULT_NUM_SEEDS = 10
+
+#: ADR-053 batch discipline: "per-trial timeout ~5 min; on a hang, log the
+#: seed and continue rather than blocking the sweep." See this module's
+#: docstring for the exact (soft, thread-abandonment) mechanism.
+TRIAL_TIMEOUT_S = 300
 
 # Track B's fixed config, cited verbatim from docs/hardware/m07-envelopes.md's
 # Task 3 "Round 1" (`ENVELOPES = {"water_bottle": (0,0,-0.010,+0.010)}`,
@@ -122,54 +157,117 @@ def _write_jsonl(path: pathlib.Path, record: dict) -> None:
         f.flush()
 
 
-def run_track(track: str, skill_name: str, out_path: pathlib.Path) -> dict:
-    """Run one (track, skill) combination across seeds 0-9. Fresh env +
-    fresh executor per trial (ADR-047). Returns the summary dict, which is
-    also appended to `out_path` as the final line.
+def _execute_one_trial(track: str, skill_name: str, seed: int, randomizer: ScenarioRandomizer, result_holder: list) -> None:
+    """Run exactly one trial and append its outcome dict to `result_holder`.
+
+    Runs on a `threading.Thread` (see `run_track` below) so a hang can be
+    timed out without blocking the rest of the sweep. Fresh `TableSettingEnv`
+    + fresh `ScriptedSkillExecutor` here, same as before this ADR-053
+    extension (ADR-047: reusing either across a `reset()`-based loop
+    silently corrupts `WeldGrasp.active_welds`). Any exception is caught and
+    recorded as a harness-error outcome rather than propagating and killing
+    this (background) thread silently.
+    """
+    try:
+        env = TableSettingEnv(cameras=None)
+        executor = ScriptedSkillExecutor()
+        env.reset(seed=seed, cameras=None, randomizer=randomizer)
+        t0 = time.time()
+        result = executor.execute(_skill_call(skill_name), env, step_budget=ik.DEFAULT_STEP_BUDGET)
+        wall_s = time.time() - t0
+        env.close()
+        result_holder.append(
+            {
+                "success": bool(result.success),
+                "reason": result.reason,
+                "frames_used": int(result.frames_used),
+                "wall_s": wall_s,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 -- must surface as a logged trial failure, not a dead thread
+        result_holder.append(
+            {
+                "success": False,
+                "reason": f"trial_harness_error: {type(exc).__name__}: {exc}",
+                "frames_used": None,
+                "wall_s": None,
+            }
+        )
+
+
+def run_track(track: str, skill_name: str, out_path: pathlib.Path, num_seeds: int = DEFAULT_NUM_SEEDS) -> dict:
+    """Run one (track, skill) combination across seeds 0..num_seeds-1.
+
+    `num_seeds` defaults to `DEFAULT_NUM_SEEDS` (10), unchanged from
+    ADR-049 -- passing 20 is ADR-053's extension, additive only. Fresh env +
+    fresh executor per trial (ADR-047), each trial guarded by
+    `TRIAL_TIMEOUT_S` (ADR-053 batch discipline; see module docstring).
+    Returns the summary dict, which is also appended to `out_path` as the
+    final line.
     """
     randomizer = _track_a_randomizer(skill_name) if track == "A" else _track_b_randomizer()
-    print(f"=== track {track} skill={skill_name} envelopes={randomizer.envelopes} ===")
+    print(f"=== track {track} skill={skill_name} num_seeds={num_seeds} envelopes={randomizer.envelopes} ===")
 
     n_success = 0
     frames_on_success: list[int] = []
     failure_reasons: dict[str, int] = {}
     per_seed_rows = []
 
-    for seed in range(10):
-        env = TableSettingEnv(cameras=None)
-        executor = ScriptedSkillExecutor()
-        env.reset(seed=seed, cameras=None, randomizer=randomizer)
-        # Pure function of seed -- reset() above already applied these
-        # offsets; calling it again here is for RECORD-KEEPING only (same
-        # pattern as probe_envelope.py's randomized_eval).
+    for seed in range(num_seeds):
+        # Pure function of seed (ScenarioRandomizer.randomize docstring) --
+        # computed here, on the MAIN thread, purely for record-keeping. The
+        # background trial thread below independently calls env.reset(...,
+        # randomizer=randomizer), which draws the SAME offsets internally;
+        # this duplicate draw is read-only and never touches `env`/`executor`.
         offsets_used = randomizer.randomize(seed)
 
-        t0 = time.time()
-        result = executor.execute(_skill_call(skill_name), env, step_budget=ik.DEFAULT_STEP_BUDGET)
-        wall_s = time.time() - t0
+        result_holder: list = []
+        trial_thread = threading.Thread(
+            target=_execute_one_trial,
+            args=(track, skill_name, seed, randomizer, result_holder),
+            daemon=True,  # never blocks process exit if abandoned after a timeout
+        )
+        wall_t0 = time.time()
+        trial_thread.start()
+        trial_thread.join(TRIAL_TIMEOUT_S)
+        outer_wall_s = time.time() - wall_t0
+
+        if trial_thread.is_alive():
+            # Hang: log it and move on rather than blocking the sweep
+            # (ADR-053 batch discipline). The thread is a daemon and is
+            # deliberately NOT joined further -- see module docstring for
+            # why it cannot be forcibly killed and why that is safe here.
+            trial_result = {
+                "success": False,
+                "reason": f"trial_timeout_after_{TRIAL_TIMEOUT_S}s",
+                "frames_used": None,
+                "wall_s": outer_wall_s,
+            }
+            print(f"  seed={seed} *** TIMED OUT after {TRIAL_TIMEOUT_S}s -- logged, continuing to next seed ***")
+        else:
+            trial_result = result_holder[0]
 
         record = {
             "track": track,
             "skill": skill_name,
             "seed": seed,
             "offsets_used": {k: list(v) for k, v in offsets_used.items()},
-            "success": bool(result.success),
-            "reason": result.reason,
-            "frames_used": int(result.frames_used),
-            "wall_s": wall_s,
+            "success": trial_result["success"],
+            "reason": trial_result["reason"],
+            "frames_used": trial_result["frames_used"],
+            "wall_s": trial_result["wall_s"],
         }
-        n_success += int(result.success)
-        if result.success:
-            frames_on_success.append(result.frames_used)
+        n_success += int(trial_result["success"])
+        if trial_result["success"]:
+            frames_on_success.append(trial_result["frames_used"])
         else:
-            failure_reasons[result.reason] = failure_reasons.get(result.reason, 0) + 1
+            failure_reasons[trial_result["reason"]] = failure_reasons.get(trial_result["reason"], 0) + 1
         per_seed_rows.append(record)
         _write_jsonl(out_path, record)
         print(
-            f"  seed={seed} offsets={offsets_used} success={result.success} "
-            f"frames={result.frames_used} wall={wall_s:.2f}s reason={result.reason}"
+            f"  seed={seed} offsets={offsets_used} success={trial_result['success']} "
+            f"frames={trial_result['frames_used']} wall={outer_wall_s:.2f}s reason={trial_result['reason']}"
         )
-        env.close()
 
     mean_frames = (sum(frames_on_success) / len(frames_on_success)) if frames_on_success else None
     summary = {
@@ -177,14 +275,14 @@ def run_track(track: str, skill_name: str, out_path: pathlib.Path) -> dict:
         "track": track,
         "skill": skill_name,
         "n_success": n_success,
-        "n_total": 10,
+        "n_total": num_seeds,
         "mean_frames_on_success": mean_frames,
         "failure_reasons": failure_reasons,
         "envelope_used": {k: list(v) for k, v in randomizer.envelopes.items()},
     }
     _write_jsonl(out_path, summary)
     print(
-        f"[track {track}][{skill_name}] {n_success}/10, "
+        f"[track {track}][{skill_name}] {n_success}/{num_seeds}, "
         f"mean_frames_on_success={mean_frames}, failures={failure_reasons}"
     )
     return summary
@@ -195,6 +293,15 @@ def main() -> int:
     parser.add_argument("--track", choices=["A", "B", "both"], required=True)
     parser.add_argument("--skill", choices=list(ALL_SKILLS) + ["all"], required=True)
     parser.add_argument("--out-dir", default="out/m08_eval", help="Directory for per-run JSONL files")
+    parser.add_argument(
+        "--num-seeds",
+        type=int,
+        default=DEFAULT_NUM_SEEDS,
+        help=(
+            f"Seeds 0..N-1 to evaluate (default {DEFAULT_NUM_SEEDS}, unchanged from ADR-049 -- "
+            "pass 20 for ADR-053's extended Track A sweep)."
+        ),
+    )
     args = parser.parse_args()
 
     tracks = ["A", "B"] if args.track == "both" else [args.track]
@@ -205,7 +312,7 @@ def main() -> int:
     for track in tracks:
         for skill_name in skills:
             out_path = out_dir / f"track{track}_{skill_name}.jsonl"
-            summary = run_track(track, skill_name, out_path)
+            summary = run_track(track, skill_name, out_path, num_seeds=args.num_seeds)
             all_summaries.append(summary)
 
     # Combined summary file, written last (all per-(track,skill) files are

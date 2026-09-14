@@ -11,6 +11,92 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-053 — M08 extended: 20-seed Track A robustness sweep, same file as ADR-049 — seeds 0-9 reproduce bit-for-bit, `pick(A,'bottle')`'s true rate revises to 45% (9/20), `handoff`'s 20/20 re-disclosed as degenerate everywhere it appears
+
+**Ratified:** Sept 15, 2026 · **Follows:** ADR-049 (original two-track
+10-seed eval), ADR-047 (fresh env/executor per trial, unchanged here),
+ADR-051 (`handoff` fails 0/5 under the smallest non-placement
+perturbation), ADR-046 (`handoff` fails under a 2.2 mm perception offset)
+· **Adds:** `docs/hardware/m08-extended-eval.md`; extends
+`scripts/eval_m08.py` (`--num-seeds`, default 10 unchanged; a per-trial
+thread-based timeout).
+
+**Scope.** Track A only (own-prop randomization), seeds 0-19, all four
+working skills — this is what the task brief asked for. Track B
+(multi-prop randomization) was not extended and still stands at its
+original 10-seed report in `docs/hardware/m08-eval.md`, unmodified.
+`scripts/eval_m08.py` was extended, not forked: `--num-seeds` defaults to
+10, so `python scripts/eval_m08.py --track both --skill all --out-dir
+out/m08_eval` (no new flags) still reproduces ADR-049's original run from
+this same file.
+
+**Reproducibility check, the task brief's "genuinely interesting
+question," answered explicitly.** Seeds 0-9 inside this 20-seed run were
+compared row-by-row against `m08-eval.md`'s original Track A tables for
+every skill. Result: **bit-for-bit identical** — same offsets, same
+pass/fail pattern, same frame counts, on all four skills, zero exceptions.
+No reproducibility failure was found; this is the expected result for a
+`ScenarioRandomizer` that is a pure function of `seed`, run through
+ADR-047's fresh-env-per-trial harness, and it is reported here as a
+checked, positive finding rather than assumed.
+
+**Results, seeds 0-19, Track A, bm-ptl:**
+
+| skill | 20-seed result | ADR-049's 10-seed result |
+|---|---|---|
+| `pick(A, fork)` | 20/20 | 10/10 |
+| `place(A, fork, table)` | 20/20 | 10/10 |
+| `handoff(B, A, fork)` | **20/20 — degenerate: envelope is a single point, zero displacement every trial; measures determinism, not robustness** | 10/10 — same qualifier |
+| `pick(A, 'bottle')` | **9/20 (45%)** | 6/10 (60%) |
+
+`pick(A, 'bottle')`'s pooled rate drops from 60% to 45% once seeds 10-19
+are included (that decade alone: 3/10). Not a reproducibility problem
+(seeds 0-9 match ADR-049 exactly, above) — it is what a larger sample
+reveals about a smaller, luckier one. **45% supersedes 60% as this skill's
+reported rate going forward**, per ADR-018's rule against reporting a
+favourable subset as the whole picture. The same non-monotonic, sub-cm
+failure structure ADR-049 found persists at double the sample (e.g. seed 11
+at `dy=-0.01mm` PASSES beside seed 15 at `dy=+6.32mm`, which FAILS) — ten
+more samples of already-known fine structure, not a new finding.
+
+**`handoff`'s 20/20 carries ADR-049's exact qualifier, repeated at every
+appearance** (summary table, per-skill section, demo-seed table in
+`m08-extended-eval.md`) rather than stated once and left for the reader to
+carry forward. All twenty trials are the byte-identical unperturbed
+scenario (`frames_used=6610`, `from_arm_retreat_dist=0.2263`, matching
+`scripts/verify_adr038_skills.py`'s own numbers). Twenty repeats of one
+deterministic scenario is not a bigger robustness sample — it is the same
+zero-variance measurement repeated twice as often. Three independent,
+already-ratified measurements say the opposite of "robust": ADR-049 Track B
+(0/10 when a prop `handoff` never touches is randomized), ADR-051 (0/5 at
+the smallest tested arm-angle noise, no prop movement involved), and
+ADR-046 (perception-mode failure at a 2.2 mm targeting offset). This
+module does not change any of those three findings.
+
+**Per-trial timeout (batch discipline), disclosed as soft, not OS-level.**
+Each trial runs on a `threading.Thread` joined with a 300 s timeout; on a
+hang the seed is logged as `trial_timeout_after_300s` and the sweep
+continues. CPython cannot forcibly kill a thread, so an abandoned hung
+thread is not terminated, only isolated (its own fresh, unshared
+`env`/`executor`, per ADR-047) — unlike ADR-052's OS-level
+subprocess-per-combo isolation. Zero timeouts occurred; the slowest skill,
+`handoff`, averaged 17.4 s/trial, well under the 300 s bound.
+
+**Regression gates, bm-ptl, before AND after, both identical:** `pytest
+tests/test_skills.py` reproduced `4 passed / 4 failed`, same four tests as
+ADR-047/048/049/051/052. `scripts/verify_adr038_skills.py` reproduced
+`0.3989 / 0.3588 / 0.6192 / 0.1946`, unchanged.
+
+**`SUBMISSION.md` was explicitly not touched.** Findings that would
+otherwise have gone there are logged in
+`docs/hardware/overnight-batch-log.md` per the standing overnight-batch
+rule to leave that file for morning review.
+
+**Source:** this commit ("M08 extended: 20-seed robustness sweep across 4
+skills (ADR-053).").
+
+---
+
 ## ADR-052 — M10 batch scaling: PoseNet FP16 throughput vs. batch (1/4/8/16) across CPU/iGPU/NPU via static `reshape()` on the existing IR — all 12 combos succeeded, including NPU at every batch size, contradicting the predicted destructive-crash trigger class
 
 **Ratified:** Sept 15, 2026 · **Follows:** ADR-045 (M10 Phase 4: FP32/FP16 IR,

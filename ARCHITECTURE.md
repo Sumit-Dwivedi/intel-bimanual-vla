@@ -4906,6 +4906,150 @@ CPU/GPU/NPU (ADR-052).") — code and benchmark doc land together.
 
 ---
 
+### ADR-053 — M08 extended: 20-seed Track A robustness sweep across all four working skills, same file as ADR-049 — reproducibility confirmed bit-for-bit on the shared ten seeds; `handoff`'s 20/20 re-disclosed as degenerate at every appearance, not a robustness claim
+
+**Ratified:** Sept 15, 2026 · **Follows:** ADR-049 (M08's original two-track
+10-seed eval, this module extends Track A only), ADR-047 (fresh
+env/executor per trial, carried forward unchanged), ADR-051 (`handoff`
+fails 0/5 under the smallest tested non-placement perturbation), ADR-046
+(`handoff` fails under a 2.2 mm perception offset) · **Adds:**
+`docs/hardware/m08-extended-eval.md`; extends `scripts/eval_m08.py`
+(new `--num-seeds` argument, default 10 — unchanged from ADR-049 — and a
+per-trial thread-based timeout).
+
+**Question.** Does a doubled sample (seeds 0-19 instead of 0-9) change any
+of ADR-049's Track A conclusions, and — the specific check this module's
+task brief asked for by name — do seeds 0-9 inside the 20-seed run
+reproduce ADR-049's original 10-seed numbers exactly, or does re-running
+the same seeds through the same pure-function-of-seed randomizer produce
+any drift?
+
+**Decision on scope: extend the existing script, do not fork a second
+one.** `scripts/eval_m08.py` gained `DEFAULT_NUM_SEEDS = 10` and a
+`--num-seeds` CLI argument; every existing default, code path and the
+Track A/Track B construction logic is unchanged, so `python
+scripts/eval_m08.py --track both --skill all --out-dir out/m08_eval` (no
+new flags) still reproduces ADR-049's original run from this same file —
+verified, not assumed (see "Regression gates" below). Only Track A was
+extended to 20 seeds, per the task brief; Track B stays at its original
+10-seed report in `docs/hardware/m08-eval.md`, unmodified.
+
+**Per-trial timeout, added defensively, not because a hang occurred.**
+Each trial now runs on a `threading.Thread` joined with a 300 s (5 min)
+timeout; on a hang, the seed is logged as `trial_timeout_after_300s` and
+the sweep moves to the next seed rather than blocking indefinitely. This
+is a SOFT timeout — CPython cannot forcibly kill a thread, so a genuinely
+hung trial's thread would be abandoned (daemon, isolated to its own
+already-fresh `env`/`executor`, unable to corrupt a later trial) rather
+than terminated at the OS level, unlike ADR-052's subprocess-per-combo
+isolation. Disclosed as a real limitation, not overstated as equivalent
+protection. Zero timeouts occurred in this run; the slowest skill,
+`handoff`, averaged 17.4 s/trial, nowhere close to the 300 s bound.
+
+**Reproducibility check — the result this module's task brief called "the
+genuinely interesting question."** Seeds 0-9 inside this 20-seed run were
+checked row-by-row against `docs/hardware/m08-eval.md`'s original Track A
+tables for all four skills: offsets, pass/fail pattern, and frame counts
+are IDENTICAL on every shared seed, for every skill, with zero exceptions.
+`pick(A, fork)`: 10/10 both runs, frames=1655 every seed both runs.
+`place(A, fork, table)`: 10/10 both runs, frames=3455 every seed both runs.
+`handoff`: (0,0) offset and 10/10 both runs (degenerate, see below).
+`pick(A, 'bottle')`: identical failing seeds (0, 1, 2, 4) both runs, same
+frame counts including the two seeds (8, 9) whose weld-attach frame
+differs slightly from the rest (1695/1718 vs 1655) in both runs. **No
+reproducibility failure was found.** This is the expected result for a
+`ScenarioRandomizer` that is a pure function of `seed` run through a
+harness that constructs a fresh `TableSettingEnv` + fresh
+`ScriptedSkillExecutor` per trial (ADR-047) — there is no cross-trial state
+left for a re-run to diverge through — and it is reported here as a
+positive, checked finding rather than a formality, per the task brief's
+explicit instruction to check it either way.
+
+**Results, seeds 0-19, Track A (own-prop randomization), bm-ptl:**
+
+| skill | 20-seed result | ADR-049's 10-seed result |
+|---|---|---|
+| `pick(A, fork)` | 20/20 | 10/10 |
+| `place(A, fork, table)` | 20/20 | 10/10 |
+| `handoff(B, A, fork)` | **20/20 — degenerate: envelope is a single point, zero displacement applied every trial; measures determinism, not robustness** | 10/10 — same qualifier |
+| `pick(A, 'bottle')` | **9/20 (45%)** | 6/10 (60%) |
+
+**`pick(A, 'bottle')`'s pooled rate drops from 60% to 45%** once seeds
+10-19 are included (that decade alone: 3/10, worse than seeds 0-9's 6/10).
+This is not a reproducibility problem (seeds 0-9 are bit-identical to
+ADR-049, shown above) — it is exactly what a larger sample is supposed to
+reveal about a small one: ADR-049's original 6/10 sat on the better half of
+this skill's tolerance rectangle more often than the next ten seeds did.
+**45% (9/20) is the more reliable estimate of this skill's true
+within-envelope success rate and supersedes the 60% figure going
+forward**, per ADR-018's standing rule against reporting a favourable
+subset as the whole picture. The failure pattern remains non-monotonic in
+`dy` at double the sample (e.g. seed 11 at `dy=-0.01mm` PASSES immediately
+next to seed 15 at `dy=+6.32mm`, which FAILS, while seed 6 at
+`dy=-3.13mm`, similar magnitude to seed 15, PASSES) — the same fine,
+sub-cm structure ADR-049 already attributed to the 1 cm grid
+`docs/hardware/m07-envelopes.md`'s sweep used to choose this rectangle, now
+sampled ten more times rather than newly discovered.
+
+**`handoff`'s 20/20 carries the SAME qualifier ADR-049 attached to its
+10/10, repeated at every appearance in `docs/hardware/m08-extended-eval.md`
+(summary table, per-skill section, demo-seed table) rather than stated
+once.** All twenty trials are the byte-identical unperturbed scenario
+(`frames_used=6610`, `dist_to_armB=0.0582`, `from_arm_retreat_dist=0.2263`
+— all bit-identical to `scripts/verify_adr038_skills.py`'s own numbers).
+Twenty repeats of one deterministic scenario is not a larger robustness
+sample than ten repeats of the same scenario; it is the identical
+zero-variance measurement run twice as many times. Reading this 20/20
+unqualified next to `pick(A, 'bottle')`'s 45% would say `handoff` is the
+most robust skill measured here — the opposite of what three independent,
+already-ratified measurements say: ADR-049's own Track B (0/10 when
+`water_bottle`, a prop `handoff` never touches, is randomized underneath
+it), ADR-051 (0/5 at the smallest tested home-pose arm-angle noise,
+±0.005 rad — no prop placement involved at all), and ADR-046 (perception
+mode fails `handoff` at a 2.2 mm targeting offset on an object outside its
+own success check). This module changes none of those three findings; it
+only re-confirms, at double the sample, that `handoff`'s own envelope
+still has zero width.
+
+**Regression gates, bm-ptl, before AND after this sweep, both identical:**
+`pytest tests/test_skills.py` reproduced `4 passed / 4 failed`, same four
+tests and reasons as ADR-047/048/049/051/052.
+`scripts/verify_adr038_skills.py` reproduced `0.3989 / 0.3588 / 0.6192 /
+0.1946`, unchanged. Expected, not merely hoped for: this module changed no
+skill, grasp, IK, executor, environment or randomization code, only
+`scripts/eval_m08.py`'s CLI surface and internal timeout handling.
+
+**Timing.** All 80 trials (4 skills x 20 seeds, Track A only) completed on
+bm-ptl in under 8 minutes wall-clock; every trial finished well inside the
+300 s per-trial timeout (mean per-trial time ranged 1.7 s for
+`pick(A,'bottle')` to 17.4 s for `handoff`). Zero trials timed out; zero
+harness errors were logged.
+
+**Consequences.** `out/m08_eval_extended/` (gitignored, same `out/` block
+every other M08/M10 artifact directory uses) holds the four per-skill
+JSONL files plus a combined `summary_all.json`; ADR-049's original
+`out/m08_eval/` directory was never touched, and its 10-seed,
+two-track report in `docs/hardware/m08-eval.md` stands unmodified.
+`SUBMISSION.md` was explicitly NOT edited for this module (overnight-batch
+rule, logged in `docs/hardware/overnight-batch-log.md` instead of the
+submission file it would otherwise have touched).
+
+**Process note (mirrors ADR-052's own account of the same constraint).**
+bm-ptl's PAT remains pull-only (pushes return HTTP 403), so this commit is
+pushed from the laptop; bm-ptl was synced afterward via the pull-only PAT
+fetch (`git fetch https://<PAT>@github.com/.../intel-bimanual-vla.git
+master` then `git reset --hard FETCH_HEAD`, PAT never written to a file).
+The modified `scripts/eval_m08.py` was transferred to bm-ptl via `scp`
+(not a git operation) to run this sweep, since the code had not yet
+landed on `master` at run time; bm-ptl's working tree carried this one
+file as an uncommitted local diff for the duration of the run and was
+never committed to there.
+
+**Source:** this commit ("M08 extended: 20-seed robustness sweep across 4
+skills (ADR-053).") — code and eval doc land together.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
