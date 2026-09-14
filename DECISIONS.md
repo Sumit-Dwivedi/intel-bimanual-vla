@@ -11,6 +11,92 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-039 — M10 Phase 1 (PoseNet training data): runtime qpos randomization through `TableSettingEnv`'s opt-in `front` camera, per-prop resting z, sequential rejection-sampled placement; full-joint rejection sampling measurably failed and was replaced
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-016 (frozen upstream asset), ADR-020
+(bm-ptl-only MuJoCo execution), ADR-022 (opt-in camera rendering), ADR-038 (a moved
+prop can break `handoff` at phase 3) · **Adds:** `scripts/generate_posenet_data.py`,
+`data/posenet/dataset_meta.json` (tracked), `data/posenet/{images,labels}/`
+(gitignored), `docs/hardware/m10-training-data-samples.md`.
+
+**Scope.** M10 Phase 1 only: generate labelled (image, ground-truth-xyz) pairs for
+a future PoseNet. No model is defined or trained here, and no inference runs. This
+is the dataset that will eventually let the scripted controller's oracle
+`data.xpos` prop-position reads be replaced by camera-based inference.
+
+**Decision 1 — render through the existing opt-in camera path, touch neither XML
+file.** The `front` camera lives in the GENERATED scene
+(`src/bimanual/sim/assets/so101_dual_table.xml`, `gen_dual_scene.py`'s output), not
+in the frozen upstream asset (`scenes/so101/`, ADR-016). This script constructs
+`TableSettingEnv(cameras=["front"], ...)` and calls `env.render("front")` (the
+escape hatch documented in `env.py`) for each sample's capture — it never reads or
+writes either XML file directly, and never re-invokes `gen_dual_scene.py`.
+
+**Decision 2 — randomize x,y only, at runtime, via `data.qpos`; z stays per-prop.**
+Each of the five props (`plate, mug, fork, spoon, water_bottle`) has its own
+resting z baked into the scene's "home" keyframe (0.355 / 0.39 / 0.356 / 0.356 /
+0.44 m against a 0.35 m table surface). This script reads each prop's z LIVE off
+`data.qpos` immediately after `env.reset()` (not a hardcoded duplicate of
+`gen_dual_scene.py`'s position constants) and overwrites only the x,y slots of
+each prop's free-joint qpos before `mujoco.mj_forward`. A single shared z (e.g.
+the table surface, 0.35) would sink every prop partway into the table slab; this
+was flagged before any code was written and never implemented.
+
+**Decision 3 — no Pillow; `write_png` copied with attribution.** `PIL` is not
+installed in bm-ptl's `ov_env` and this script does not install it (an unrelated
+install is what silently upgraded mujoco during the ADR-037 mink probe). The PNG
+writer is copied verbatim from `scripts/render_handoff_frames.py`'s own
+`write_png` (itself copied from `scripts/probe_render.py`), a stdlib-only
+(zlib + hand-rolled IHDR/IDAT/IEND) encoder. Verified on HxWx3 uint8 input at
+224x224 (this module's resolution) before generating any volume of images, via a
+10-sample run whose images were copied back to the laptop and visually inspected.
+
+**Decision 4 — sequential, largest-first placement with rejection sampling,
+REPLACING a full-joint draw that measurably failed.** Initial implementation drew
+all five props' x,y simultaneously from `[-0.15, 0.15]` m and rejected/retried the
+whole draw on any pairwise overlap (radii `plate=0.06, mug=0.06, fork=0.08,
+spoon=0.07, water_bottle=0.03` m, `+0.02` m clearance, 500 attempts). This failed
+on the FIRST real run on bm-ptl: sample 0 exhausted all 500 attempts and raised
+`RuntimeError` before writing anything. Diagnosis: five simultaneous pairwise
+constraints inside a 0.30 m x 0.30 m (0.09 m^2) box is a tight packing problem —
+the fork/spoon threshold alone (0.08+0.07+0.02=0.17 m) forbids a disk of area
+~0.091 m^2, i.e. up to the entire box, once the first point lands near centre.
+**Fix, not a workaround:** placement is now sequential — largest footprint first
+(`fork, spoon, plate, mug, water_bottle`), each prop drawn against only the props
+already placed (a 1-point rejection problem, not a 5-point joint one), clearance
+margin reduced to 0.015 m, 5,000 draws budgeted per prop, up to 200 whole-sample
+restarts if a prop's own budget is exhausted. Re-run after the fix: the 10-sample
+verification succeeded with `placement_draws` ranging from single digits to 172
+(mean 77.2, max 172) — comfortably inside budget, and the full 5,000-sample run
+completed under the same scheme (see `dataset_meta.json` for its own measured
+draw statistics).
+
+**Decision 5 — `.gitignore` narrowed, not left as a blanket `data/` ignore.** M01
+had gitignored the whole `data/` directory. That would have swept
+`dataset_meta.json` (the reproducibility record: seed, ranges, mujoco version,
+scene checksum) into the same ignore as the bulk images/labels. Replaced with two
+specific entries, `data/posenet/images/` and `data/posenet/labels/`, verified with
+`git check-ignore -v` (image/label paths matched; `dataset_meta.json` did not) and
+`git status` (meta file shows as trackable; images/labels do not appear at all).
+
+**On reachability, stated once more so it cannot be missed.** ADR-038 found that
+moving even a single prop can break `handoff` at phase 3. This dataset's
+randomized layouts are consequently expected to include many configurations in
+which the scripted manipulation skills would fail — and that is fine, because no
+skill is ever executed against any sampled layout here; this is a
+perception-only dataset. `dataset_meta.json`'s own `note` field and
+`docs/hardware/m10-training-data-samples.md` both say this explicitly, so the
+dataset is never later cited as evidence of validated or reachable scene
+configurations.
+
+**Baseline preserved.** `pytest tests/test_skills.py` was re-run on bm-ptl before
+any of this module's code touched the repo: 4 passed / 4 failed, identical to the
+pre-existing baseline (no source file this module is scoped to touch —
+`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`gen_dual_scene.py`, `scenes/so101/`, `so101_dual_table.xml` — was modified).
+
+---
+
 ## ADR-038 — Handoff render legibility: red fork and lateral retreat ADOPTED; prop repositioning TRIED AND FULLY REVERTED because every prop move broke `handoff` at phase 3
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-037 (`311430e`, sequential

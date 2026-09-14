@@ -1,0 +1,61 @@
+{
+  "sample_count": 5000,
+  "resolution": [
+    224,
+    224
+  ],
+  "camera": "front",
+  "rng_seed": 20260914,
+  "env_reset_seed": 0,
+  "randomization_range_m": {
+    "x": [
+      -0.15,
+      0.15
+    ],
+    "y": [
+      -0.15,
+      0.15
+    ]
+  },
+  "props_randomized": [
+    "plate",
+    "mug",
+    "fork",
+    "spoon",
+    "water_bottle"
+  ],
+  "resting_z_m": {
+    "plate": 0.355,
+    "mug": 0.39,
+    "fork": 0.356,
+    "spoon": 0.356,
+    "water_bottle": 0.44
+  },
+  "footprint_radius_m": {
+    "plate": 0.06,
+    "mug": 0.06,
+    "fork": 0.08,
+    "spoon": 0.07,
+    "water_bottle": 0.03
+  },
+  "clearance_margin_m": 0.015,
+  "placement_order": [
+    "fork",
+    "spoon",
+    "plate",
+    "mug",
+    "water_bottle"
+  ],
+  "per_prop_attempts": 5000,
+  "max_sample_restarts": 200,
+  "placement_draws_stats": {
+    "mean": 54.8096,
+    "max": 5054
+  },
+  "mujoco_version": "3.2.7",
+  "scene_xml_path": "src/bimanual/sim/assets/so101_dual_table.xml",
+  "scene_xml_sha256": "22bb6d4181c68af1146f69f144931a5de50bbd0e30f41ea7aea7fec9b7847981",
+  "wall_clock_seconds": 1647.135363817215,
+  "samples_per_second": 3.03557321992806,
+  "note": "Object x,y positions are randomized independently per sample within randomization_range_m, subject to pairwise non-overlap rejection sampling (see footprint_radius_m / clearance_margin_m). z is held fixed per-prop at its own resting height (resting_z_m) -- never at one shared table-surface value. Randomized layouts are NOT validated or claimed as physically reachable/solvable scene configurations: ADR-038 found that moving even a single prop can break the handoff skill at phase 3. This dataset trains a perception model (PoseNet) only; no manipulation skill is ever executed against any sampled layout in this script."
+}

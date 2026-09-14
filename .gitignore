@@ -15,7 +15,13 @@ checkpoints/*.bin
 !checkpoints/.gitkeep
 
 # Data
-data/
+# M10 Phase 1 (PoseNet training data, scripts/generate_posenet_data.py):
+# ignore the bulk generated images/labels but keep dataset_meta.json tracked
+# (sample count, seed, ranges, mujoco version, scene checksum -- the
+# reproducibility record). Narrowed from a blanket `data/` (M01) to these two
+# subdirectories specifically so dataset_meta.json is not swept up with them.
+data/posenet/images/
+data/posenet/labels/
 *.mp4
 *.avi
 
