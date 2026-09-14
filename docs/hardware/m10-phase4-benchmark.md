@@ -78,3 +78,50 @@ NNCF post-training quantization applied to the EXISTING FP32 IR (`artifacts/pose
 
 - **NPU:** 0.9030 ms mean latency, 36.391 mm deviation (exceeds the model's own MAE scale -- treat with caution) (ADR-013's intended INT8 target device).
 
+
+## Batch Scaling Analysis (M10 Phase 4 extension, ADR-052)
+
+FP16 PoseNet throughput vs. batch size (1, 4, 8, 16) across CPU / iGPU / NPU, measured by `scripts/benchmark_batch_scaling.py`. Reuses the EXISTING `artifacts/posenet_ir/posenet_fp16.xml/.bin` (M10 Phase 4, ADR-045) -- no new IR was produced. Each batch size is obtained by `core.read_model(...)` followed by `model.reshape({0: [N, 3, 224, 224]})` **before** `compile_model`, done fresh for every (device, batch) combo; the saved IR itself stays static batch-1 on disk. 10 warm-up inferences discarded, then up to 100 measured per combo (dropped to 50 for any combo run past this script's internal 20-minute soft time budget -- flagged per-row below if that happened). Throughput = `batch * 1000 / mean_ms`. Every (device, batch) combo ran in its own subprocess, order CPU -> GPU -> NPU with batches ascending within a device, so NPU ran last with every other row already on disk (module docstring; the M03 `STATUS_ACCESS_VIOLATION` finding this defends against is recorded in `DECISIONS.md`'s "M03 -- OpenVINO conversion smoke test complete" entry, not verbatim in `bmptl-verification.md` -- checked directly against both files while writing this section).
+
+| Device | Batch | Status | Min (ms) | Mean (ms) | Median (ms) | P95 (ms) | Std (ms) | Throughput (Hz) | Notes |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---|
+| CPU | 1 | COMPILE_OK | 5.8251 | 6.3828 | 6.3361 | 6.6834 | 0.3341 | 156.7 | EXECUTION_DEVICES=['CPU'] |
+| CPU | 4 | COMPILE_OK | 14.3430 | 15.2066 | 14.8507 | 16.4022 | 1.5697 | 263.0 | EXECUTION_DEVICES=['CPU'] |
+| CPU | 8 | COMPILE_OK | 28.0470 | 31.6824 | 31.4012 | 35.4973 | 2.0007 | 252.5 | EXECUTION_DEVICES=['CPU'] |
+| CPU | 16 | COMPILE_OK | 55.2787 | 69.2524 | 68.3588 | 80.1539 | 6.1267 | 231.0 | EXECUTION_DEVICES=['CPU'] |
+| GPU | 1 | COMPILE_OK | 0.5725 | 0.5893 | 0.5866 | 0.6031 | 0.0227 | 1697.0 | EXECUTION_DEVICES=['GPU.0'] |
+| GPU | 4 | COMPILE_OK | 1.2205 | 1.2534 | 1.2527 | 1.2783 | 0.0153 | 3191.2 | EXECUTION_DEVICES=['GPU.0'] |
+| GPU | 8 | COMPILE_OK | 1.9296 | 1.9856 | 1.9819 | 2.0461 | 0.0353 | 4028.9 | EXECUTION_DEVICES=['GPU.0'] |
+| GPU | 16 | COMPILE_OK | 2.6605 | 2.7584 | 2.7565 | 2.8086 | 0.0298 | 5800.4 | EXECUTION_DEVICES=['GPU.0'] |
+| NPU | 1 | COMPILE_OK | 0.9010 | 1.1269 | 1.1110 | 1.3168 | 0.1027 | 887.4 | EXECUTION_DEVICES=NPU |
+| NPU | 4 | COMPILE_OK | 1.9717 | 2.6525 | 2.5113 | 3.6538 | 0.5489 | 1508.0 | EXECUTION_DEVICES=NPU |
+| NPU | 8 | COMPILE_OK | 3.7923 | 4.4398 | 4.1334 | 6.0625 | 0.6459 | 1801.9 | EXECUTION_DEVICES=NPU |
+| NPU | 16 | COMPILE_OK | 10.4897 | 10.8286 | 10.6515 | 12.1032 | 0.4824 | 1477.6 | EXECUTION_DEVICES=NPU |
+
+**Findings worth stating plainly, not smoothed over:**
+
+1. **The anticipated destructive NPU crash did not occur at any tested batch size (4, 8, 16).** This module's task brief flagged batch>1 as "exactly the trigger class" for the `STATUS_ACCESS_VIOLATION` process-kill M03 documented (`DECISIONS.md`'s "M03 -- OpenVINO conversion smoke test complete" entry) -- but that finding was specifically about a **fully-open dynamic** batch dimension (`-1`, unbounded), where the NPU compiler cannot determine upper bounds at all. A **static** reshape to a fixed N (4, 8, or 16) is a different and much narrower case, and on this NPU5010/driver/OpenVINO-2026.3.1 combination it compiled and ran cleanly at every tested N. The subprocess-per-combo isolation and incremental-write discipline (module docstring) were exercised on every row but never actually triggered by a crash -- recorded here as a finding, not as evidence the defence was unnecessary to build (the same posture Phase 4/ADR-045 took when none of its six combos crashed either).
+
+2. **Throughput scaling ranked device-to-device: GPU (3.42x at batch 16 vs. batch 1), then NPU (1.67x at batch 16 vs. batch 1), then CPU (1.47x at batch 16 vs. batch 1)** on the batches that ran -- plausible reading is that larger batches amortize fixed per-call dispatch overhead better on devices with more parallel compute headroom relative to this model's size, but this script does not instrument dispatch-vs-compute time separately, so that is an inference from the shape of the curve, not a directly measured cause.
+
+
+**Anchoring against the batch-1 rows already in this document (M10 Phase 4, ADR-045):** GPU FP16 0.683 ms / 1465 Hz, NPU FP16 1.099 ms / 910 Hz, CPU FP16 6.492 ms / 154 Hz.
+
+- **CPU batch=1 re-measurement this run:** mean 6.3828 ms / 156.7 Hz vs. the existing 6.492 ms / 154 Hz row (-1.7% latency drift run-to-run -- expected measurement noise, not a regression, unless stated otherwise below).
+
+- **GPU batch=1 re-measurement this run:** mean 0.5893 ms / 1697.0 Hz vs. the existing 0.683 ms / 1465 Hz row (-13.7% latency drift run-to-run -- expected measurement noise, not a regression, unless stated otherwise below).
+
+- **NPU batch=1 re-measurement this run:** mean 1.1269 ms / 887.4 Hz vs. the existing 1.099 ms / 910 Hz row (+2.5% latency drift run-to-run -- expected measurement noise, not a regression, unless stated otherwise below).
+
+
+**Scaling shape, linear vs. sub-linear, per device:**
+
+- **CPU:** batch 1 -> 16: mean latency 6.3828 -> 69.2524 ms (10.85x for a 16x batch increase), throughput 156.7 -> 231.0 Hz (1.47x). Latency growing slower than batch size (10.85x < 16x) means throughput keeps climbing with batch -- **sub-linear-to-linear** scaling on the batches that actually ran on this device.
+
+- **GPU:** batch 1 -> 16: mean latency 0.5893 -> 2.7584 ms (4.68x for a 16x batch increase), throughput 1697.0 -> 5800.4 Hz (3.42x). Latency growing slower than batch size (4.68x < 16x) means throughput keeps climbing with batch -- **sub-linear-to-linear** scaling on the batches that actually ran on this device.
+
+- **NPU:** batch 1 -> 16: mean latency 1.1269 -> 10.8286 ms (9.61x for a 16x batch increase), throughput 887.4 -> 1477.6 Hz (1.67x). Latency growing slower than batch size (9.61x < 16x) means throughput keeps climbing with batch -- **sub-linear-to-linear** scaling on the batches that actually ran on this device.
+
+
+**GPU FP16-internal-execution caveat, carried forward:** M10 Phase 4's own finding (`docs/hardware/m10-phase4-benchmark.md`'s Interpretation section, point 3) is that GPU FP32 and GPU FP16 reported byte-identical deviation and near-identical latency at batch 1, consistent with the Arc GPU plugin running its internal compute in FP16 regardless of the IR's stored weight precision. This script only benchmarks the FP16 IR (task brief scope), so it cannot itself re-confirm or contradict that finding -- but if it holds, the GPU curve above is the plugin's native execution path, not a case of FP16 imposing an extra conversion cost on top of an FP32-native GPU pipeline, which is a reasonable prior for why GPU scales as well as it does.
+

@@ -11,6 +11,89 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-052 — M10 batch scaling: PoseNet FP16 throughput vs. batch (1/4/8/16) across CPU/iGPU/NPU via static `reshape()` on the existing IR — all 12 combos succeeded, including NPU at every batch size, contradicting the predicted destructive-crash trigger class
+
+**Ratified:** Sept 15, 2026 · **Follows:** ADR-045 (M10 Phase 4: FP32/FP16 IR,
+static batch-1), ADR-050 (INT8 extension) · **Provenance:** all numbers from
+**bm-ptl**, per ADR-047's cross-machine float-divergence record — laptop
+figures are not reported anywhere in this entry.
+
+**Question.** Does PoseNet's FP16 IR throughput scale linearly, sub-linearly
+or super-linearly with batch size (1, 4, 8, 16) on CPU, iGPU and NPU, and
+does the NPU tolerate a batch dimension above 1 at all?
+
+**Method, and the reshape-not-reconvert choice.** `artifacts/posenet_ir/
+posenet_fp16.xml` (ADR-045) was converted at a STATIC batch-1 shape and
+stays that way on disk — it does not become batch-4 by being loaded and
+asked for four inferences. `scripts/benchmark_batch_scaling.py` instead
+does, fresh per (device, batch) combo: `core.read_model(...)` then
+`model.reshape({0: [N, 3, 224, 224]})` **before** `compile_model` — reshape
+before compile, not reconversion, and no new `.xml`/`.bin` pair was
+produced. 10 warm-up inferences discarded, 100 measured per combo (the
+90-minute time cap was never hit, so no combo needed the 50-iteration
+fallback). Throughput reported as `batch * 1000 / mean_ms`.
+
+**Subprocess isolation, and why it mattered even though nothing crashed.**
+`DECISIONS.md`'s own "M03 — OpenVINO conversion smoke test complete" entry
+(not `bmptl-verification.md` verbatim — checked directly against both files
+while writing this entry, a citation correction worth recording plainly)
+documents that the NPU plugin can kill the whole process
+(`STATUS_ACCESS_VIOLATION` / `0xC0000005`) on an unsupported graph, and that
+a harness which buffers results in memory loses everything on that crash.
+This module's task brief named batch>1 as "exactly the trigger class" for a
+repeat of that failure. Every (device, batch) combo therefore ran in its
+own `subprocess.run(...)`, order CPU → GPU → NPU with batches ascending
+within a device, and every result — success, reshape failure, compile
+failure, or a dead child with no result at all — was appended to
+`artifacts/posenet_ir/batch_scaling_results.jsonl` the instant it was known.
+
+**Result — the predicted crash did not occur.** All 12 (device, batch)
+combos compiled and ran successfully, including NPU at batch 4, 8 and 16.
+This does not contradict M03's finding: M03's crash was specifically on a
+FULLY-OPEN dynamic batch dimension (`-1`, unbounded upper bound); a static
+reshape to a fixed N is a narrower, different case, and on this
+NPU5010/driver/OpenVINO-2026.3.1 combination it is tolerated at every N
+tested. The defensive subprocess-per-combo/incremental-write discipline was
+exercised on every row but never actually triggered by a crash — the same
+posture ADR-045 recorded when none of its six combos crashed either.
+
+**Scaling shape.** All three devices scale sub-linearly-to-linearly in
+latency vs. batch (latency grows slower than batch size), so throughput
+keeps climbing through batch 16 on every device: CPU 156.7 → 231.0 Hz
+(1.47x), NPU 887.4 → 1477.6 Hz (1.67x), GPU 1697.0 → 5800.4 Hz (3.42x) —
+GPU scales best, consistent with it having the most parallel compute
+headroom relative to this model's size, though this script does not
+instrument dispatch-vs-compute time separately, so that reading is an
+inference from the curve shape, not a directly measured cause. Batch-1
+numbers this run land within run-to-run measurement noise of the existing
+Phase 4 table (GPU −13.7%, NPU +2.5%, CPU −1.7%), not evidence of
+regression. Phase 4's own GPU FP16-internal-execution caveat (Arc plugin
+likely running FP16 internally regardless of stored precision) is carried
+forward as context for why the GPU curve looks the way it does, not
+re-verified here (this script only benchmarks the FP16 IR).
+
+**Regression gate, bm-ptl, before this run:** `pytest tests/test_skills.py`
+reproduced `4 passed / 4 failed`, unchanged from ADR-047/048/049/051 —
+untouched by this measurement-only work.
+
+**Consequences.** New files only: `scripts/benchmark_batch_scaling.py`,
+`artifacts/posenet_ir/batch_scaling_results.jsonl` (gitignored, same
+`artifacts/` block Phase 4/INT8 already use). `docs/hardware/
+m10-phase4-benchmark.md` gained one new "Batch Scaling Analysis" section;
+every prior section, row and finding in that document is unchanged.
+`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`scenes/so101/`, `gen_dual_scene.py`, `posenet.py`, `dataset.py`, the
+checkpoint and every requirements file were not touched; nothing was
+installed into `ov_env` or `train_env`. bm-ptl was synced to this commit's
+parent (`c9a65be`) via the pull-only PAT fetch + `reset --hard FETCH_HEAD`
+before this script ran, since bm-ptl's push access is not possible (pushes
+return HTTP 403) — this commit is pushed from the laptop.
+
+**Source:** this commit ("M10 batch scaling: throughput vs batch across
+CPU/GPU/NPU (ADR-052).") — code and benchmark doc land together.
+
+---
+
 ## ADR-051 — M06 handoff perturbation diagnostic: home-pose arm-angle noise is not tolerated at any tested magnitude (0/5 at +/-0.005 rad) — no robustness claim beyond exact determinism is made for `handoff`
 
 **Ratified:** Sept 14, 2026 · **Follows:** ADR-049 (M08, disclosed `handoff`

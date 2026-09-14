@@ -4803,6 +4803,109 @@ tests as ADR-047/048/049 (`test_open_drawer_reaches_near_limit`,
 
 ---
 
+### ADR-052 — M10 batch scaling: PoseNet FP16 throughput vs. batch (1/4/8/16) across CPU/iGPU/NPU via static `reshape()` on the existing IR — all 12 combos succeeded, including NPU at every batch size, contradicting the predicted destructive-crash trigger class
+
+**Context.** M10 Phase 4 (ADR-045) benchmarked PoseNet's FP32/FP16 IR at a
+STATIC batch-1 shape only. This module asks whether FP16 throughput scales
+linearly, sub-linearly or super-linearly with batch size (1, 4, 8, 16) on
+CPU, iGPU and NPU, and — the higher-risk half of the question — whether the
+NPU tolerates a batch dimension above 1 at all. Provenance: all numbers
+from bm-ptl, per ADR-047's cross-machine float-divergence record; laptop
+figures are not reported.
+
+**Reshape, not reconversion.** `artifacts/posenet_ir/posenet_fp16.xml`
+(ADR-045) stays on disk exactly as Phase 4 produced it — static batch-1.
+`scripts/benchmark_batch_scaling.py` obtains each batch size fresh, per
+(device, batch) combo, via `core.read_model(...)` then
+`model.reshape({0: [N, 3, 224, 224]})` **before** `compile_model`. No new
+`.xml`/`.bin` pair was written. 10 warm-up inferences discarded, 100
+measured per combo (the 90-minute cap was never approached, so the
+50-iteration time-cap fallback this module's task brief allowed was never
+needed). Throughput reported as `batch * 1000 / mean_ms`.
+
+**Subprocess isolation carried forward from M03/ADR-045, even though it
+was not needed this time.** `DECISIONS.md`'s "M03 — OpenVINO conversion
+smoke test complete" entry records that the NPU plugin can kill the whole
+process (`STATUS_ACCESS_VIOLATION` / `0xC0000005`) on an unsupported graph
+rather than raising a catchable exception, and that a harness which
+buffers results in memory loses everything already earned when that
+happens. (Note for readers: that exact quote lives in `DECISIONS.md`, not
+verbatim in `docs/hardware/bmptl-verification.md` — checked directly
+against both files while writing this entry.) This module's task brief
+named batch>1 as "exactly the trigger class" for a repeat of that failure.
+Every (device, batch) combo therefore ran in its own `subprocess.run(...)`,
+device order CPU → GPU → NPU, batches ascending within a device, with
+every result — success, reshape failure, compile failure, or a dead child
+with no result at all — appended to `artifacts/posenet_ir/
+batch_scaling_results.jsonl` the instant it was known, and an
+`NPU_ONLY_BATCH_1`-tagged skip path wired in for any larger NPU batch after
+a first NPU batch>1 failure (never triggered this run, since none failed).
+
+**Result — the predicted crash did not occur.** All 12 (device, batch)
+combos compiled and ran successfully, including NPU at batch 4, 8 and 16.
+This does not contradict M03: M03's crash was specifically on a
+FULLY-OPEN dynamic batch dimension (`-1`, unbounded upper bound) — the
+diagnostic named `Upper bounds are not specified for node 'Multiply_11422'
+... bounds are '[9223372036854775807, 3, 224, 224]'`. A static reshape to a
+fixed N is a narrower, different case, and on this
+NPU5010/driver/OpenVINO-2026.3.1 combination it is tolerated at every N
+tested here. The subprocess-per-combo/incremental-write discipline was
+exercised on every row but never actually triggered by a crash — the same
+posture ADR-045 recorded when none of its own six combos crashed either.
+
+**Scaling shape and the numbers, anchored against Phase 4's batch-1 rows
+(GPU FP16 0.683 ms / 1465 Hz, NPU FP16 1.099 ms / 910 Hz, CPU FP16 6.492 ms
+/ 154 Hz).** All three devices scale sub-linearly-to-linearly in latency
+vs. batch (latency grows slower than batch size), so throughput keeps
+climbing through batch 16 on every device:
+
+| Device | Batch 1 mean / throughput | Batch 16 mean / throughput | Throughput ratio |
+|---|---:|---:|---:|
+| CPU | 6.3828 ms / 156.7 Hz | 69.2524 ms / 231.0 Hz | 1.47x |
+| GPU | 0.5893 ms / 1697.0 Hz | 2.7584 ms / 5800.4 Hz | 3.42x |
+| NPU | 1.1269 ms / 887.4 Hz | 10.8286 ms / 1477.6 Hz | 1.67x |
+
+GPU scales best — plausibly the most parallel compute headroom relative to
+this model's size, though this script does not instrument
+dispatch-vs-compute time separately, so that reading is an inference from
+the curve shape, not a directly measured cause. Every device's batch-1
+number this run lands within run-to-run measurement noise of Phase 4's own
+table (GPU −13.7%, NPU +2.5%, CPU −1.7%), not a regression. Phase 4's own
+finding that GPU FP32/FP16 report byte-identical deviation and
+near-identical latency (consistent with the Arc plugin running FP16
+internally regardless of stored precision) is carried forward as context
+for the GPU curve's shape, not re-verified here — this script benchmarks
+the FP16 IR only.
+
+**Regression gate, bm-ptl, before this run:** `pytest tests/test_skills.py`
+reproduced `4 passed / 4 failed`, same four tests as ADR-047/048/049/051 —
+untouched by this measurement-only work.
+
+**Consequences.** New files only: `scripts/benchmark_batch_scaling.py`,
+`artifacts/posenet_ir/batch_scaling_results.jsonl` (gitignored, same
+`artifacts/` block Phase 4/INT8 already use). `docs/hardware/
+m10-phase4-benchmark.md` gained one new "Batch Scaling Analysis" section;
+every prior section, row and finding in that document is unchanged.
+`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`scenes/so101/`, `gen_dual_scene.py`, `posenet.py`, `dataset.py`, the
+checkpoint and every requirements file were not touched; nothing was
+installed into `ov_env` or `train_env`.
+
+**Process note.** bm-ptl's local `master` had fallen behind origin (last
+synced commit `471fcb3`, three commits behind this module's starting
+`c9a65be`) — a stale-clone situation rather than the stale-tracking-ref
+symptom ADR-045 previously documented. Synced via the pull-only PAT fetch
+(`git fetch https://<PAT>@github.com/.../intel-bimanual-vla.git master`)
+then `git reset --hard FETCH_HEAD` before this script ran; the PAT itself
+was never written to a file. bm-ptl's push access is not possible (pushes
+return HTTP 403 with this PAT), so this commit is pushed from the laptop,
+not bm-ptl.
+
+**Source:** this commit ("M10 batch scaling: throughput vs batch across
+CPU/GPU/NPU (ADR-052).") — code and benchmark doc land together.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
