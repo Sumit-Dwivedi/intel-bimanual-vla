@@ -11,6 +11,60 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-055 — Perception-in-loop demo: `pick(A, fork)` run end to end with PoseNet driving its grasp-point targeting (M10 Phase 5 wiring, GPU FP16) — PASSES on oracle ground truth, reproducing ADR-046's own 8.4 mm outcome delta to within 0.03 mm
+
+**Ratified:** Sept 15, 2026 · **Follows:** ADR-046 (M10 Phase 5's
+targeting/verification split and opt-in wiring — exercised here, not
+modified), ADR-045 (the PoseNet OpenVINO IR compiled here, GPU FP16),
+ADR-047 (`WeldGrasp`/executor reset fix, relied on implicitly). Number
+corrected mid-batch from the brief's original "056" to **055** after
+ADR-054 was ratified first (`docs/hardware/overnight-batch-log.md`'s
+"Fix F" entry).
+
+New `scripts/perception_demo.py` calls the unmodified
+`sk.run_pick(env, "A", "fork", weld=weld, position_provider=provider)` —
+the same entry point `ScriptedSkillExecutor` itself would produce — with
+`position_provider` a real `PoseNetInference(device='GPU')` +
+`CachedPropPositions`. No skill, grasp, IK, executor, environment, or
+randomization code was touched. Verification stays on oracle reads
+(`env.data.xpos`, `WeldGrasp.is_holding`), independent of `run_pick`'s own
+`.success`, per ADR-046 Correction 1: success requires `fork_z > 0.37`
+(asserted equal to `TABLE_SURFACE_Z + WELD_PICK_SUCCESS_MARGIN_M`, the
+skill's own internal threshold) AND `is_holding('A') == 'fork'`.
+Randomization: `env.reset(seed=0)`, **no randomizer** — `ENVELOPES={}`
+(ADR-048) makes a bare seed select nothing without one; fixed default was
+chosen so this run is the SAME scenario ADR-046's own oracle-vs-PoseNet
+table measured, for a direct comparison.
+
+**Result: PASSES.** fork z 0.3560 → 0.3905, `is_holding('A')=='fork'`,
+`frames_used=1655`, wall clock 1.487 s. Two delta quantities, kept
+separate (a first-draft conflation caught before commit): the
+perception-ESTIMATE delta at the one refresh (fork 2.19 mm, matching
+ADR-046's own 2.2 mm at this seed) vs. the OUTCOME delta — this run's real
+final z vs. the documented oracle-only baseline (0.3989) — 8.37 mm,
+matching ADR-046's own headline "8.4 mm" figure to within 0.03 mm.
+`cache refresh_count=1`, `inference_count=1` (one targeting read, per
+`cached_access.py`'s own one-render-per-generation contract). Supplementary
+`benchmark(n_runs=100)` on the same compiled model: GPU FP16 mean=0.5903 ms
+max=0.6239 ms (ADR-046 measured mean=0.6648 ms, max=7.2228 ms — closely
+tracking, not a regression). GPU compiled on the first attempt; the
+CPU-fallback branch this script also implements was never exercised.
+
+**Regression gates, re-run this commit, unchanged:** `pytest
+tests/test_skills.py` 4 passed / 4 failed (same four tests); `scripts/
+verify_adr038_skills.py` 0.3989 / 0.3588 / 0.6192 / 0.1946 m,
+`frames_used=6610` — byte-identical to the documented baseline, as
+expected since no skill code was touched.
+
+**Video:** `docs/videos/perception-demo.mp4` — 40 PNG frames (`front`
+camera, 640x480) rendered on bm-ptl from full-physics-state snapshots
+(same observer-wrapper technique as `render_handoff_frames.py`), `scp`'d
+to the laptop and encoded there with `ffmpeg` (bm-ptl has no imaging
+libraries). Full account: `docs/hardware/overnight-batch-log.md`; full
+ADR: `ARCHITECTURE.md`.
+
+---
+
 ## ADR-054 — `run_handoff` Phase 1 `already_held` guard (mirrors ADR-034) — pick→handoff re-pick bug fixed, standalone regression gate byte-identical on laptop and bm-ptl before/after; the 3-skill chain still fails, now one phase later, at a NEW Phase 3 cross-arm collision
 
 **Ratified:** Sept 15, 2026 · **Follows:** ADR-034 (`run_place`'s

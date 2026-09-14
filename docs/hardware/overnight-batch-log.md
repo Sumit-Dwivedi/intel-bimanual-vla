@@ -269,3 +269,127 @@ verification, the change was committed and pushed from the laptop only
 standard pull-only PAT fetch (`git fetch ... master` then `git reset
 --hard FETCH_HEAD`) so laptop, origin and bm-ptl end this fix synced and
 clean.
+
+---
+
+## Fix F — Perception-in-loop demo: PoseNet drives `pick(A, fork)` (ADR-055)
+
+**What changed.** New `scripts/perception_demo.py`. Runs the unmodified
+`sk.run_pick(env, "A", "fork", weld=weld, position_provider=provider)` —
+the same call `ScriptedSkillExecutor._dispatch` itself would produce for
+`SkillCall(skill="pick", arm="A", target_object="fork")` — with
+`position_provider` a real `PoseNetInference(device='GPU')` +
+`CachedPropPositions` bound to a fresh `WeldGrasp` (M10 Phase 5's
+opt-in wiring, ADR-046, exercised end to end, not modified). No skill,
+grasp, IK, executor, environment, or randomization code was touched.
+Verification reads `env.data.xpos`/`WeldGrasp.is_holding` directly —
+oracle ground truth, never the perception estimate the skill acted on —
+per ADR-046 Correction 1 and this fix's own task brief ("a skill graded by
+the same estimate it acted on is unfalsifiable"). Full design record:
+`ARCHITECTURE.md`'s ADR-055 entry.
+
+**ADR numbering.** The batch brief numbered this fix's ADR as 056, but
+ADR-054 (the `run_handoff` already-held guard, user-authorised mid-batch)
+took 054 first, so this fix's number is **055**, per the corrected
+sequence (B→053, C→054-conditional-then-unused, handoff-guard→054,
+F→055, D→056). `DECISIONS.md` and `ARCHITECTURE.md` were updated together,
+in the same commit. Verified counts after the edit: `grep -c '^## ADR-'
+DECISIONS.md` = 40, `grep -c '^### ADR-' ARCHITECTURE.md` = 56,
+`grep -c '^: '` = 0 in both files.
+
+**Randomization (batch correction 3).** `env.reset(seed=0)`, **no
+randomizer** — `ENVELOPES = {}` at module scope (`randomization.py`,
+ADR-048) means a bare seed selects nothing without an explicit
+randomizer. Fixed default was chosen (over `pick(A, fork)`'s own Track A
+rectangle from `SKILL_ENVELOPES`, `run_demo.py`'s alternative precedent)
+specifically so this run's numbers are the SAME scenario ADR-046's own
+single-refresh oracle-vs-PoseNet table already measured — a real choice
+between two legitimate options, stated in this script's own printed
+output, not left implicit.
+
+**The ADR-046 per-step render-cost trap (batch correction 4), confirmed
+NOT reintroduced.** `pick(A, fork)` completed in 1.487 s wall clock (1655
+physics steps) — not the 12+ CPU-minutes ADR-046 measured for the
+per-step-render bug. `skills_scripted.py`'s existing `cameras=[]`
+overrides at both internal `env.step()` call sites were inherited
+unmodified; this script never duplicates or bypasses them.
+
+**Result: PASSES, verified on oracle ground truth, not the perception
+estimate.** `env.data.xpos[fork][2]`: 0.3560 → **0.3905**.
+`WeldGrasp.is_holding('A')`: **`'fork'`**. `run_pick.success=True`
+(`weld_attach_frame=1155`, `frames_used=1655`). **`fork_z (0.3905) > 0.37`
+AND `is_holding == 'fork'` → ORACLE_SUCCESS = True.** `0.37` is asserted at
+runtime equal to `sk.TABLE_SURFACE_Z + sk.WELD_PICK_SUCCESS_MARGIN_M`
+(0.35 + 0.02) — the skill's own internal weld-success threshold — checked
+by the script, not merely commented.
+
+**Perception numbers, reported exactly as this fix's task brief asked:**
+- **Cache refresh count: 1. Total inference count: 1.** `run_pick`'s
+  targeting read is the ONLY `position_provider.get()` call in the whole
+  call (`cached_access.py`'s own one-render-per-generation contract,
+  confirmed by direct count).
+- **Per-inference latency.** The one real in-loop `predict()` call: 1.83 ms
+  (n=1 — a single sample, not a distribution, reported as such).
+  Supplementary `PoseNetInference.benchmark(n_runs=100)` on the SAME
+  already-compiled model (no second compile): **GPU FP16 mean=0.5903 ms,
+  median=0.5889 ms, min=0.5773 ms, max=0.6239 ms, throughput=1694 Hz**
+  (`execution_devices=['GPU.0']`) — closely tracking M10 Phase 5/ADR-046's
+  own GPU FP16 figures (mean=0.6648 ms, max=7.2228 ms). Device: GPU, first
+  attempt, no CPU fallback needed.
+- **Oracle-vs-PoseNet delta at the one refresh** (`CachedPropPositions`'s
+  own diagnostic log, never used for control): fork 2.19 mm, water_bottle
+  21.71 mm, mug 13.43 mm. **Two distinct delta quantities were almost
+  conflated in this script's first draft and were caught and fixed before
+  commit:** (1) this 2.19 mm PERCEPTION-ESTIMATE delta (PoseNet's raw xyz
+  guess vs. ground truth at the render instant — matches ADR-046's own
+  reported 2.2 mm for fork at this identical seed/scenario), vs. (2) the
+  **OUTCOME delta** — how far THIS run's real final z (achieved WITH
+  perception driving the grasp-point target) lands from the documented
+  oracle-only baseline final z (0.3989): **8.37 mm**. Quantity (2) is the
+  one M10 Phase 5/ADR-046's own headline "8.4 mm" figure refers to, and
+  this run reproduces it to within 0.03 mm.
+
+**Regression gates, re-run this commit on bm-ptl, unchanged (expected,
+since this fix touches no skill/grasp/ik/executor/env/randomization
+code):**
+- `pytest tests/test_skills.py`: **4 passed / 4 failed** — same four
+  tests, same residuals (`test_open_drawer_reaches_near_limit`,
+  `test_pick_plate_lifts_above_table`, `test_place_plate_returns_to_table_rest`,
+  `test_handoff_mug_ends_held_by_arm_b`).
+- `scripts/verify_adr038_skills.py`: **0.3989 / 0.3588 / 0.6192 / 0.1946,
+  frames_used 6610** — byte-identical to the documented baseline.
+
+**Video rendered:** `docs/videos/perception-demo.mp4`. 40 PNG frames
+(`front` camera, 640x480) written on bm-ptl from
+`mujoco.mjtState.mjSTATE_FULLPHYSICS` snapshots captured by an observer
+wrapper around `env.step` (never altering the real run's control, timing,
+or step count — the same technique `scripts/render_handoff_frames.py`
+already uses), spanning physics-step indices 1..1655. `scp`'d to the
+laptop (bm-ptl has no imaging libraries in `ov_env`), encoded there with
+the WinGet-installed `ffmpeg` at 15 fps (`-pix_fmt yuv420p`). Both endpoint
+frames inspected by eye: the mid-sequence frame shows arm A approaching
+the fork with arm B parked at HOME; the final frame shows arm A retreated
+upward with the fork visibly lifted in its gripper. Temporary PNG
+directories (`perception_demo_frames_tmp/` on bm-ptl, and the laptop-side
+scratch copy) were never `git add`ed and are cleaned up after this commit.
+
+**`SUBMISSION.md` not modified.** Per the batch's standing rule. This
+finding — a working perception-in-loop demo, GPU FP16, PASS on oracle
+ground truth — is logged here for morning-user to fold into
+`SUBMISSION.md`'s eventual perception/OpenVINO evidence section by hand.
+A one-line pointer to `scripts/perception_demo.py` was added to
+`README.md`'s "Documentation" section only — the Quickstart and the
+ADR-015 "Grasping Abstraction and Documented Limitations" sections were
+not touched.
+
+**Push/pull discipline.** `scripts/perception_demo.py` was `scp`'d to
+bm-ptl as an uncommitted working-tree file to run and verify on the
+authoritative machine (ADR-047: cross-machine float divergence) BEFORE
+committing. After verification, the script plus this log entry plus the
+`DECISIONS.md`/`ARCHITECTURE.md` ADR-055 mirror plus the `README.md`
+pointer plus `docs/videos/perception-demo.mp4` (rendered on the laptop
+from bm-ptl-sourced PNGs) were committed and pushed from the laptop only
+(bm-ptl's PAT remains pull-only); bm-ptl is synced afterward via the
+standard pull-only PAT fetch (`git fetch ... master` then `git reset
+--hard FETCH_HEAD`) so laptop, origin and bm-ptl end this fix synced and
+clean.

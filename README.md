@@ -86,6 +86,8 @@ failure reasons) is tracked in `SUBMISSION.md`, updated as skills are verified.
 - Decisions log in `DECISIONS.md`; architecture and rationale in `ARCHITECTURE.md`
 - Submission checklist and rubric self-assessment in `SUBMISSION.md` — tracks every
   deliverable the platform requires and what currently satisfies it, TODO otherwise
+- `scripts/perception_demo.py` — `pick(A, fork)` run with PoseNet (OpenVINO, GPU FP16)
+  driving its grasp-point targeting end to end (ADR-055); `docs/videos/perception-demo.mp4`
 
 ## Environment
 
