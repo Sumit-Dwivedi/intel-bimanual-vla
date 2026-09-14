@@ -11,6 +11,77 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-042 — M10 Phase 2: PoseNet architecture + dataset loader + training script, in a NEW separate `train_env` on bm-ptl (native `torch.xpu`, not IPEX) — `ov_env` untouched
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-009 (ARCHITECTURE.md — a small trained
+vision model keeps the 20-point OpenVINO criterion off the risky ML branch), ADR-037
+(the load-bearing `mujoco==3.2.7` + `openvino==2026.3.1` pairing in `ov_env`, and the
+mink probe's cautionary tale of an unpinned install silently bumping mujoco), ADR-041
+(the 5,000-sample, 3-prop dataset this module trains against) · **Adds:**
+`src/bimanual/perception/posenet.py`, `src/bimanual/perception/dataset.py`,
+`scripts/train_posenet.py`, `scripts/requirements-train.txt`, `checkpoints/.gitkeep`,
+`docs/hardware/m10-phase2-smoke.md`.
+
+**The brief's environment assumptions were checked and found wrong for both machines**
+(PIL is not "proven available on bm-ptl" — it is absent from both `ov_env` and the
+laptop; that absence is why `generate_posenet_data.py` and `render_handoff_frames.py`
+both hand-roll `write_png`). Rather than install torch into `ov_env` — the exact
+mechanism by which ADR-037's mink probe silently upgraded mujoco to 3.13.0 — this
+module creates a **new, separate venv**, `C:\Users\devcloud\project\train_env`,
+containing only torch + Pillow + numpy. `ov_env` is not installed into and is
+re-verified functionally unchanged at the end (`pip list` shows no torch/Pillow;
+`verify_adr038_skills.py`'s four skills still PASS with the same numbers on record;
+`pytest tests/test_skills.py` still reports 4 passed / 4 failed with the same four
+failing test names — see `docs/hardware/m10-phase2-smoke.md` section 7 for the full
+transcript of all three checks).
+
+**Device path: native `torch.xpu` worked on the first attempt** —
+`pip install torch --index-url https://download.pytorch.org/whl/xpu` produced
+`torch==2.14.0+xpu` with `torch.xpu.is_available()==True` and
+`torch.xpu.get_device_name(0)=="Intel(R) Arc(TM) B390 GPU"`. IPEX
+(`intel-extension-for-pytorch`) was never installed and never needed — per the task's
+own instruction to try native XPU before the older IPEX path, and native XPU
+succeeded outright, so there is no IPEX error to report. `scripts/requirements-train.txt`
+pins the exact `pip freeze` (torch's xpu wheel pulls in Intel's oneAPI/SYCL/MKL
+runtime automatically as transitive dependencies).
+
+**PoseNet** re-derives (not imports — `scripts/` is not a Python package) the exact
+ResNet18-scale backbone from `scripts/ov_smoke.py::build_model` (M03's proven
+CPU/GPU/NPU-converting topology), with a global-avg-pool + Linear(512,256)+ReLU +
+Linear(256,9) head. Measured 11,310,153 parameters — within the "~11-12M expected"
+range. Forward-passed a dummy batch successfully on both CPU and XPU.
+
+**PoseNetDataset** reads the real, committed 5,000-sample dataset
+(`data/posenet/images` + `labels`, gitignored bulk / `dataset_meta.json` tracked) per
+the schema verified directly against `generate_posenet_data.py`'s own `label = {...}`
+construction, not guessed. Deterministic `sample_index % 10` split produced exactly
+4500 train / 500 val, and `val[0]`'s loaded labels matched
+`data/posenet/labels/sample_00000.json`'s `objects.*.xyz_m` exactly on hand
+verification.
+
+**A real Windows-`spawn` hang was reproduced, but in throwaway diagnostic scaffolding,
+not in the deliverable.** An ad hoc `DataLoader`-iteration probe written without the
+`if __name__ == "__main__":` guard hung for a full 300s timeout at `num_workers=4` —
+a live demonstration of exactly the trap the task brief warned about. `train_posenet.py`
+itself already carries the guard (required for its own `num_workers` DataLoader) and
+its `--num-workers 4` smoke run completed normally in 9.98s; a second, corrected probe
+run (guard added) measured `num_workers=0` at 104.7 samples/sec and `num_workers=4` at
+53.3 samples/sec over a 10-batch/320-sample window — slower net of a one-time ~4.6s
+Windows spawn-startup cost that a 10-batch probe cannot amortize, not evidence that
+`num_workers=4` is broken. `num_workers=4` was kept as `train_posenet.py`'s default;
+it was not dropped to 0.
+
+**Smoke-tested only, per instruction — no full training run.** Model instantiation +
+forward pass, one real dataset sample, and one training batch (loss reported, exits
+cleanly) on `--device xpu` and on `--device cpu`, both producing the identical loss
+(0.301587) from the same seeded init and batch — a correctness signal that model init,
+data loading and the loss computation agree across devices. Full transcript, all
+measured numbers, and the `checkpoints/` `.gitignore` verification (`git check-ignore
+-v`, read as `source:line:pattern<TAB>pathname`) are in
+`docs/hardware/m10-phase2-smoke.md`.
+
+---
+
 ## ADR-041 — M10 Phase 1.5 correction: 3-prop label scope (fork/water_bottle/mug), occlusion-ratio visibility filtering via MuJoCo segmentation (colour classification tried and measurably failed first), `posenet_cam` pushed further overhead — supersedes ADR-040's camera pose and label scope, keeps ADR-040's mechanism otherwise unchanged
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-016 (frozen upstream asset), ADR-020

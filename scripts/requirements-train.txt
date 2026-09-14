@@ -1,0 +1,84 @@
+# M10 Phase 2 -- PoseNet training environment (bm-ptl ONLY).
+#
+# This is a NEW, SEPARATE venv, deliberately NOT the same one everything
+# else on bm-ptl uses:
+#   C:\Users\devcloud\project\train_env
+#
+# WHY A SEPARATE VENV, NOT ov_env
+# ----------------------------------
+# `ov_env` (scripts/requirements-bmptl.txt) holds the load-bearing
+# `mujoco==3.2.7` + `openvino==2026.3.1` pairing that four verified-working
+# skills and the M09a dataset generator depend on (see
+# scripts/verify_adr038_skills.py, ADR-037). Installing torch into ov_env
+# risks exactly the kind of silent transitive upgrade that ADR-037 already
+# had to recover from once (a `pip install` there previously dragged mujoco
+# from 3.2.7 to 3.13.0 as a side effect). ov_env is verified BYTE-UNCHANGED
+# after this module -- see docs/hardware/m10-phase2-smoke.md.
+#
+# This venv needs only torch, Pillow and numpy. It does NOT need mujoco or
+# openvino and must never import either -- `src/bimanual/perception/
+# posenet.py` and `dataset.py` have no such imports, and `train_posenet.py`
+# doesn't either.
+#
+# DEVICE PATH THAT ACTUALLY WORKED (measured, not assumed)
+# ------------------------------------------------------------
+# Per this module's task brief, native `torch.xpu` was tried BEFORE IPEX
+# (IPEX is the older path; recent PyTorch ships a native XPU backend for
+# Arc iGPUs). Native XPU worked on the first attempt on this hardware
+# (Intel Arc B390 iGPU) -- IPEX was never installed, because it was not
+# needed:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/xpu
+#
+# Verified (docs/hardware/m10-phase2-smoke.md):
+#   torch.__version__        == "2.14.0+xpu"
+#   hasattr(torch, "xpu")    == True
+#   torch.xpu.is_available() == True
+#   torch.xpu.get_device_name(0) == "Intel(R) Arc(TM) B390 GPU"
+#
+# A plain `pip install -r scripts/requirements-train.txt` will fail to
+# resolve `torch==2.14.0+xpu`'s local version segment unless the same extra
+# index is also passed (same caveat pattern as scripts/requirements-dev.txt
+# uses for its CPU torch wheel):
+#
+#   pip install -r scripts/requirements-train.txt --extra-index-url https://download.pytorch.org/whl/xpu
+#
+# Everything below is the exact `pip freeze` from that install (bm-ptl,
+# train_env, 2026-09-14), not a guess -- including the Intel oneAPI /
+# SYCL / MKL runtime packages torch's xpu wheel pulls in automatically as
+# transitive dependencies. These are version-locked to each other by the
+# torch xpu wheel build; do not bump one without re-verifying the others.
+
+torch==2.14.0+xpu
+Pillow==12.3.0
+numpy==2.4.6
+
+# --- transitive closure of the above (pip freeze, verified) ---
+dpcpp-cpp-rt==2026.1.0
+filelock==3.32.3
+fsspec==2026.7.0
+intel-cmplr-lib-rt==2026.1.0
+intel-cmplr-lib-ur==2026.1.0
+intel-cmplr-lic-rt==2026.1.0
+intel-opencl-rt==2026.1.0
+intel-openmp==2026.1.0
+intel-pti==1.0.1
+intel-sycl-rt==2026.1.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+mkl==2026.1.0
+mpmath==1.3.0
+networkx==3.6.1
+onemkl-license==2026.1.0
+onemkl-sycl-blas==2026.1.0
+onemkl-sycl-dft==2026.1.0
+onemkl-sycl-lapack==2026.1.0
+onemkl-sycl-rng==2026.1.0
+onemkl-sycl-sparse==2026.1.0
+pyelftools==0.32
+sympy==1.14.0
+tbb==2023.1.0
+tcmlib==1.5.0
+triton-xpu==3.8.0
+typing_extensions==4.16.0
+umf==1.1.0
