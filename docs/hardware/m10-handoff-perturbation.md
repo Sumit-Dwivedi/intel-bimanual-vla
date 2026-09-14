@@ -197,3 +197,74 @@ executor layer was touched.
 - ADR-051 recorded in `ARCHITECTURE.md` and mirrored in `DECISIONS.md` —
   a real decision emerged (whether to make a robustness claim in the demo
   video), so it was not skipped.
+
+---
+
+## 9. Follow-up pilot at a finer magnitude (Sept 14, 2026, same session as ADR-051 review)
+
+**Question.** ADR-051 (section 5 above) found 0/5 at ±0.005 rad, applied to
+BOTH `shoulder_lift` and `elbow_flex` on both arms together, with all five
+failures identical to four decimal places — a signature that looks like a
+binary cliff rather than a gradient. The only genuinely new question left
+was whether a **40% smaller** magnitude, and a **narrower** perturbation
+(one joint pair, not two), behaves differently.
+
+**Method.** `scripts/probe_handoff_perturbation.py` was extended (not
+rewritten) with two optional, backward-compatible CLI flags, `--joints` and
+`--magnitudes`, both defaulting to the exact values already hardcoded
+(`NOISY_JOINT_SUFFIXES`, `NOISE_LEVELS_RAD`), so the bare invocation
+reproduces ADR-051 unchanged. This let a single-joint, single-magnitude
+condition run without a second script:
+
+```
+python scripts/probe_handoff_perturbation.py --joints shoulder_lift --magnitudes 0.003 \
+    --out out/m10_pilot_shoulder_lift_0003.jsonl
+```
+
+`shoulder_lift` on both arms only (not `elbow_flex`), ±0.003 rad, 5 seeds
+(0-4), same fresh-env/fresh-weld/receiver-first pattern as section 3 above,
+same success criterion (`SkillResult.success`, i.e. `run_handoff` clearing
+every phase gate through Phase 5's `from_arm_retreat_dist > 0.10 m`
+threshold — `skills_scripted.py`'s `HANDOFF_RETREAT_GATE_M`).
+
+**Result: 1/5 passed** (seed 3: `success=True`, 6610 frames,
+`from_arm_retreat_dist=0.2233 m`, matching the baseline shape). The other
+four (seeds 0, 1, 2, 4) failed identically to ADR-051's own signature:
+`phase 3 (to_arm approach) failed [... IK residual=0.0875 m ...;
+cross_arm contacts=1 ...]`, 3155 frames, verbatim across all four.
+
+| seed | armA shoulder_lift (rad) | armB shoulder_lift (rad) | success | frames |
+|---:|---:|---:|---|---:|
+| 0 | +0.000822 | -0.001381 | FAIL | 3155 |
+| 1 | +0.000071 | +0.002703 | FAIL | 3155 |
+| 2 | -0.001430 | -0.001209 | FAIL | 3155 |
+| 3 | -0.002486 | -0.001579 | **PASS** | 6610 |
+| 4 | +0.002658 | +0.000068 | FAIL | 3155 |
+
+**Interpretation.** This task's own pre-declared pilot gate ("0-2/5 →
+STOP, report, do not expand") applies: 1/5 is inside that range, so the
+ladder was not widened to `elbow_flex` or to the timestep condition. Two
+things are worth being precise about, since this result is not identical
+in shape to ADR-051's:
+
+1. At a 40% smaller magnitude, restricted to one joint pair instead of two,
+   the failure is **no longer a clean, deterministic cliff** — one of five
+   seeds passed. This is graded evidence, not a repeat of ADR-051's
+   "identical to four decimal places" pattern.
+2. It is still **decisively a failure regime** — 1/5 (20%) is well under
+   even this task's own most permissive pilot-continuation threshold (3/5),
+   let alone the interpretation bar ADR-051 fixed before its run (>10/15).
+
+**Per this task's pre-declared documentation thresholds (aggregate <50% →
+report only, no ADR, existing claims stand):** no ADR-052 was opened and no
+`SUBMISSION.md` change was made. ADR-051's conclusion is unchanged and
+still governs: no general robustness claim should be made for `handoff` in
+the demo video or submission materials. This section exists so the finding
+is on the record rather than quietly omitted, per this task's own
+instruction that a failing result at a finer magnitude should be noted, not
+dropped, precisely because ADR-051's 0/5 result is already public.
+
+`pytest tests/test_skills.py -q` immediately after this pilot, bm-ptl:
+same `4 passed, 4 failed`, same four tests, same failure reasons as
+ADR-047/048/049/051 — unaffected, as expected (no skill/executor file was
+touched).

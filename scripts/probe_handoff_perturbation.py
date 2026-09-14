@@ -77,9 +77,16 @@ from bimanual.sim.env import TableSettingEnv
 from bimanual.sim.grasp import WeldGrasp
 
 #: Widening ladder -- run in order, stop at the first magnitude that does not
-#: pass all 5 seeds.
+#: pass all 5 seeds. Overridable via --magnitudes (ADR-052 extension: a
+#: finer, single-magnitude condition needed a way to run 0.003 rad alone
+#: without disturbing this default ladder for any other caller).
 NOISE_LEVELS_RAD = (0.005, 0.01, 0.02)
 SEEDS = (0, 1, 2, 3, 4)
+#: Default joint suffixes noised together (ADR-051's original method).
+#: Overridable via --joints (ADR-052 extension: isolating shoulder_lift or
+#: elbow_flex alone was a genuinely new question, not covered by the
+#: combined default -- added as a parameter rather than a second script,
+#: per this task's "reuse it; do not rewrite it" instruction).
 NOISY_JOINT_SUFFIXES = ("shoulder_lift", "elbow_flex")
 
 #: `skills_scripted.run_handoff`'s own f-strings embed this token at every
@@ -88,15 +95,15 @@ NOISY_JOINT_SUFFIXES = ("shoulder_lift", "elbow_flex")
 _RETREAT_RE = re.compile(r"from_arm_retreat_dist=([0-9.]+)")
 
 
-def _noisy_joint_qpos_addrs(model) -> list[tuple[str, int]]:
-    """Resolve the 4 (armA/armB x shoulder_lift/elbow_flex) qpos addresses.
+def _noisy_joint_qpos_addrs(model, joint_suffixes=NOISY_JOINT_SUFFIXES) -> list[tuple[str, int]]:
+    """Resolve the (armA/armB x joint_suffixes) qpos addresses.
 
     Each is a single-DOF hinge joint, so `jnt_qposadr` gives that joint's one
     and only `qpos` slot directly.
     """
     addrs = []
     for arm in ("A", "B"):
-        for suffix in NOISY_JOINT_SUFFIXES:
+        for suffix in joint_suffixes:
             name = f"arm{arm}_{suffix}"
             jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
             if jid == -1:
@@ -112,17 +119,27 @@ def _write_jsonl(path: pathlib.Path, record: dict) -> None:
         f.flush()
 
 
-def _run_trial(seed: int, magnitude_rad: float, out_path: pathlib.Path) -> dict:
+def _run_trial(
+    seed: int,
+    magnitude_rad: float,
+    out_path: pathlib.Path,
+    levels: tuple = NOISE_LEVELS_RAD,
+    joint_suffixes: tuple = NOISY_JOINT_SUFFIXES,
+) -> dict:
     # Deterministic, distinct stream per (magnitude, seed) so a re-run
     # reproduces the identical noise vector -- keyed so no two (magnitude,
-    # seed) pairs in the whole grid ever collide.
-    level_idx = NOISE_LEVELS_RAD.index(magnitude_rad)
+    # seed) pairs in the whole grid ever collide. `levels` defaults to the
+    # original ladder so the default CLI invocation reproduces ADR-051's
+    # exact seeding bit-for-bit; a caller passing a custom --magnitudes list
+    # (ADR-052) gets its own, still-reproducible, still-collision-free
+    # index space.
+    level_idx = levels.index(magnitude_rad)
     rng = np.random.default_rng(seed=1000 * level_idx + seed)
 
     env = TableSettingEnv(cameras=None)
     env.reset(seed=seed, cameras=None)
 
-    addrs = _noisy_joint_qpos_addrs(env.model)
+    addrs = _noisy_joint_qpos_addrs(env.model, joint_suffixes)
     noise = rng.uniform(-magnitude_rad, magnitude_rad, size=len(addrs))
     applied = {}
     for (name, adr), delta in zip(addrs, noise):
@@ -166,15 +183,33 @@ def _run_trial(seed: int, magnitude_rad: float, out_path: pathlib.Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="out/m10_handoff_perturbation.jsonl")
+    # ADR-052 extension (both default to ADR-051's exact original values, so
+    # the bare `python scripts/probe_handoff_perturbation.py` invocation is
+    # byte-for-bit unchanged from last night's run):
+    parser.add_argument(
+        "--magnitudes",
+        default=",".join(str(m) for m in NOISE_LEVELS_RAD),
+        help="comma-separated widening ladder in rad, e.g. '0.003' for a single fixed magnitude",
+    )
+    parser.add_argument(
+        "--joints",
+        default=",".join(NOISY_JOINT_SUFFIXES),
+        help="comma-separated joint suffixes to noise on both arms, e.g. 'shoulder_lift'",
+    )
     args = parser.parse_args()
     out_path = pathlib.Path(args.out)
+    levels = tuple(float(x) for x in args.magnitudes.split(","))
+    joint_suffixes = tuple(x.strip() for x in args.joints.split(","))
 
     all_records: list[dict] = []
     levels_run: list[float] = []
-    for magnitude in NOISE_LEVELS_RAD:
-        print(f"=== magnitude={magnitude} rad (seeds {SEEDS}) ===")
+    for magnitude in levels:
+        print(f"=== magnitude={magnitude} rad joints={joint_suffixes} (seeds {SEEDS}) ===")
         levels_run.append(magnitude)
-        level_records = [_run_trial(seed, magnitude, out_path) for seed in SEEDS]
+        level_records = [
+            _run_trial(seed, magnitude, out_path, levels=levels, joint_suffixes=joint_suffixes)
+            for seed in SEEDS
+        ]
         all_records.extend(level_records)
         n_pass = sum(r["success"] for r in level_records)
         print(f"[magnitude={magnitude}] {n_pass}/{len(SEEDS)}")
@@ -188,6 +223,7 @@ def main() -> int:
         "n_success": n_success,
         "n_total": len(all_records),
         "levels_run_rad": levels_run,
+        "joints": list(joint_suffixes),
     }
     _write_jsonl(out_path, summary)
     print(f"\nTOTAL {n_success}/{len(all_records)}")
