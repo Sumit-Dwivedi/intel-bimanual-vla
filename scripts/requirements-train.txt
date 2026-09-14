@@ -53,6 +53,22 @@ torch==2.14.0+xpu
 Pillow==12.3.0
 numpy==2.4.6
 
+# M10 Phase 3 addition (Sept 14, 2026): openvino, for Phase 4's live-PyTorch
+# ->OpenVINO conversion path, installed into THIS venv (train_env), not
+# ov_env -- ov_env is the read-only regression-gated environment
+# (scripts/requirements-bmptl.txt) and is never installed into. Installed
+# with `pip install --no-deps openvino==2026.3.1` so pip does not
+# re-resolve torch/numpy; openvino-telemetry (which ov_env pins at 2025.2)
+# was ALSO required with --no-deps after `pip check` flagged it as an unmet
+# requirement of openvino's own metadata (import succeeded without it, but
+# pip check did not pass until it was added). Verified in one process,
+# same venv: torch.__version__ unchanged (2.14.0+xpu), torch.xpu.is_available()
+# still True, numpy unchanged (2.4.6), openvino.__version__ == 2026.3.1, and
+# ov.convert_model(model, example_input=x) round-tripped a trivial Linear
+# layer. See DECISIONS.md's ADR-043 entry.
+openvino==2026.3.1
+openvino-telemetry==2025.2.0
+
 # --- transitive closure of the above (pip freeze, verified) ---
 dpcpp-cpp-rt==2026.1.0
 filelock==3.32.3

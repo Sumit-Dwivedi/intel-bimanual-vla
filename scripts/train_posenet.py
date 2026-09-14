@@ -42,10 +42,13 @@ WINDOWS DATALOADER CAVEAT
 which re-imports this module in each worker process -- this is exactly why
 the training entry point below is guarded by `if __name__ == "__main__":`.
 Without that guard, spawn would recursively re-launch the whole script in
-every worker. Default is `--num-workers 4`; drop to `--num-workers 0` with
-`--num-workers 0` if workers prove slow or flaky under spawn (see
-`docs/hardware/m10-phase2-smoke.md` for which one was actually used in the
-smoke test and why).
+every worker. Default is `--num-workers 0`: a corrected, guarded throughput
+probe on this Windows host measured 104.7 samples/sec at 0 workers versus
+53.3 samples/sec at 4 workers over a 10-batch/320-sample window (ADR-042) --
+spawn's one-time per-process startup cost outweighs the parallel-loading
+gain at this dataset size, so more workers is NOT faster here. Raise
+`--num-workers` explicitly (e.g. `--num-workers 4`) only if you re-measure
+and confirm it helps on the machine you are running on.
 """
 
 import argparse
@@ -224,10 +227,12 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
-    p.add_argument("--num-workers", type=int, default=4,
-                    help="DataLoader worker processes. Windows uses spawn for "
-                         "workers > 0 -- see this file's module docstring. "
-                         "Drop to 0 if workers hang or are slower than 0.")
+    p.add_argument("--num-workers", type=int, default=0,
+                    help="DataLoader worker processes. Default 0: measured "
+                         "104.7 samples/sec at 0 workers vs 53.3 at 4 on this "
+                         "Windows host (spawn overhead) -- see this file's "
+                         "module docstring / ADR-042. Override explicitly "
+                         "if you have re-measured on your own machine.")
     p.add_argument("--device", choices=["cpu", "xpu", "cuda"], default="xpu",
                     help="Preferred device; falls back to cpu automatically "
                          "and loudly if unavailable.")

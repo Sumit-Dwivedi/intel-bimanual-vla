@@ -11,6 +11,68 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-043 — M10 Phase 3 prep: `openvino==2026.3.1` installed into `train_env` alongside torch (for Phase 4's live-PyTorch->OpenVINO conversion), `num_workers` default corrected 4 -> 0 — `ov_env` untouched
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-042 (created `train_env`, measured
+`num_workers=0` at 104.7 samples/sec vs `num_workers=4` at 53.3 but left the default at 4
+pending this correction), ADR-037 (`ov_env`'s load-bearing `mujoco==3.2.7` +
+`openvino==2026.3.1` pairing, never installed into) · **Touches:**
+`scripts/train_posenet.py`, `scripts/requirements-train.txt`.
+
+**openvino installed into `train_env`, not `ov_env`.** `pip install --no-deps
+openvino==2026.3.1` into `C:\Users\devcloud\project\train_env` succeeded on the first
+attempt with no re-resolution of torch or numpy. Verified in ONE process, before and
+after: `torch.__version__` unchanged at `2.14.0+xpu`, `torch.xpu.is_available()` still
+`True`, `torch.xpu.get_device_name(0)` still `"Intel(R) Arc(TM) B390 GPU"`, `numpy`
+unchanged at `2.4.6` (both before and after — the likeliest casualty did not occur), and
+`openvino.__version__ == "2026.3.1-22476-759c5a6ab8c-releases/2026/3"`. The combined
+conversion smoke test used the corrected call
+(`ov.convert_model(model, example_input=x)`, matching `scripts/ov_smoke.py:181`'s proven
+form) — the brief's own draft call passed a tensor to `input=` instead of
+`example_input=`, which is the shape/type-spec parameter, not the traced-tensor one, and
+would have raised. Ran clean: `[?,?]` output shape on a trivial `Linear(10, 4)`.
+
+**`--no-deps` did skip one dependency, as the brief predicted.** `pip check` flagged
+`openvino-telemetry` as an unmet requirement of `openvino`'s own metadata after the
+`--no-deps` install (import itself did not raise or warn — the telemetry code path is
+lazy — but `pip check` failed until this was fixed). Installed the single missing package
+the same way: `pip install --no-deps openvino-telemetry==2025.2`, matching `ov_env`'s own
+pin (`scripts/requirements-bmptl.txt:3`). Resolved to `2025.2.0`. `pip check` then
+reported "No broken requirements found", and the combined smoke test above was re-run
+after this second install to confirm nothing regressed. `train_env`'s final `pip list`:
+torch, Pillow, numpy, openvino, openvino-telemetry, plus the unchanged Intel
+oneAPI/SYCL/MKL transitive closure from ADR-042 — no other packages were touched.
+`scripts/requirements-train.txt` records both additions with this reasoning; the wrong
+target named in the brief, `requirements-bmptl.txt` (which describes `ov_env`, the venv
+the brief itself says not to modify), was left untouched.
+
+**`ov_env` re-verified functionally and byte-for-byte unchanged.** `pip list` under
+`ov_env`: `mujoco==3.2.7`, `openvino==2026.3.1`, `numpy==2.4.6`, no torch, no Pillow.
+`scripts/verify_adr038_skills.py` re-run under `ov_env`: all four skills still PASS with
+the same measured numbers on record — `pick(A, fork)` lift +0.0429 m, `place(A, fork,
+table)` final z=0.3588, `pick(A, water_bottle)` lift +0.1792 m, `handoff(A, B, fork)`
+final separation lateral(y)=0.1946 m / vertical(z)=0.0046 m, frames_used=6610.
+`pytest tests/test_skills.py` under `ov_env`: unchanged at 4 passed / 4 failed, same four
+failing test names (`test_open_drawer_reaches_near_limit`,
+`test_pick_plate_lifts_above_table`, `test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b`) for the same already-documented, out-of-scope
+reasons (IK convergence/reach limits on the `plate`/`mug`/drawer path, not on the
+`fork`/`water_bottle` path the four PASSING skills above cover).
+
+**`num_workers` default corrected 4 -> 0 in `scripts/train_posenet.py`.** ADR-042 measured
+0 workers at 104.7 samples/sec versus 4 workers at 53.3 samples/sec on this Windows host
+(spawn overhead outweighs parallel-loading gain at this dataset size) but left the CLI
+default at 4, unreconciled with its own measurement. That is fixed here: `--num-workers`
+now defaults to `0`, with both the module docstring and the argparse help text citing the
+two measured numbers directly, so the default is not "corrected" back to a higher value
+later by someone assuming more workers is always faster. The `--num-workers` override
+remains available and unchanged in mechanism (the `if __name__ == "__main__":` guard this
+relies on for Windows `spawn` compatibility is untouched).
+
+**No training was run.** This module is smoke/verification only, per instruction.
+
+---
+
 ## ADR-042 — M10 Phase 2: PoseNet architecture + dataset loader + training script, in a NEW separate `train_env` on bm-ptl (native `torch.xpu`, not IPEX) — `ov_env` untouched
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-009 (ARCHITECTURE.md — a small trained
