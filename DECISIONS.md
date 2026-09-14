@@ -11,6 +11,130 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-046 — M10 Phase 5: PoseNet wired into the controller via cached per-skill inference, opt-in, oracle default — 3 of 4 skills PASS with perception on, `handoff` FAILS and is reported not tuned; a per-step render-cost bug found and fixed along the way
+
+**Recorded:** Sept 14, 2026 · **Follows:** ADR-045 (M10 Phase 4, OpenVINO IR +
+benchmark), ADR-044 (M10 Phase 3, held-out MAE), ADR-022 (opt-in rendering),
+ADR-030/037 (weld wiring, handoff choreography) · **Adds:**
+`src/bimanual/perception/inference.py`, `cached_access.py`,
+`scripts/verify_m10_phase5.py`, `scripts/run_grounded_demo.py`,
+`docs/hardware/m10-phase5-integration.md`. Full measured evidence lives in
+that doc; this entry is the decision record.
+
+**Context.** M10 Phase 4 produced a compiled, benchmarked OpenVINO IR that
+nothing in the control loop consumed yet. This module wires it in — but the
+four scripted skills back the entire 30-point bimanual-completion criterion,
+so the wiring had to be **provably non-destructive to the oracle path**
+before it could be trusted to add a second one.
+
+**Decision.** Perception is opt-in everywhere, oracle is the unconditional
+default:
+1. **Targeting vs verification, split by call site, not by module.**
+   `run_pick`'s grasp-point read and `run_place`'s destination-offset read
+   take an optional `position_provider`; every skill's own success check
+   (`final_z`, `final_pos`, `initial_z`) stays a direct `env.data.xpos`
+   oracle read, unconditionally, in both modes — a skill must never grade
+   itself with the same estimate it acted on.
+2. **A held object never gets a fresh PoseNet estimate.**
+   `CachedPropPositions.get()` returns `None` (fall through to oracle) for
+   any prop currently held by either arm's `WeldGrasp`, checked on every
+   call. ADR-044 measured PoseNet's z as a per-prop constant (every training
+   frame shows a resting prop) — serving that constant for an airborne
+   object would inject up to ~180 mm of error (the water bottle's own
+   resting-vs-lifted delta, ADR-034). The brief's proposed rule
+   ("invalidate after attach or release") is only half-adopted: invalidate
+   on **release** (implemented — the object is back at rest), NOT on
+   **attach** (deliberately not implemented — the held-object check in
+   `get()` makes it unnecessary, and an attach-time refresh would produce a
+   FRESH resting-z guess for an airborne object, which is worse than a
+   stale one because it is more convincing).
+3. **`ScriptedSkillExecutor(inference=None)`** — the default — is
+   byte-identical to every pre-Phase-5 call site. Passing a
+   `PoseNetInference` opts one executor instance into perception for
+   `pick`/`place`/`handoff` targeting only; the camera-set assertion
+   branches accordingly (`cameras=None` for oracle, `cameras=['posenet_cam']`
+   for perception), and the cache invalidates at the start of every
+   `execute()` call.
+
+**A real cost bug found and fixed while verifying this, not before.**
+`TableSettingEnv(cameras=['posenet_cam'])` makes that camera the env's
+INSTANCE default; `env.step()` with no `cameras=` argument falls back to
+that default (ADR-022). Every internal `env.step()` call inside
+`skills_scripted.py`'s waypoint/dwell helpers was written under oracle-only
+conditions and never overrode this — harmless when the instance default is
+`None`, catastrophic once it is `['posenet_cam']`: every physics step of
+every waypoint started rendering, not just the one render per skill this
+design intended. Measured: `pick(A, fork)` alone did not return in 12+
+CPU-minutes before being killed. **Fixed** by passing `cameras=[]`
+explicitly at both `env.step()` call sites — verified to change nothing for
+oracle mode (`pytest tests/test_skills.py` and
+`scripts/verify_adr038_skills.py` both reproduced their exact pre-fix
+numbers afterward).
+
+**Result — oracle mode: exactly reproduced the ADR-038 baseline.**
+`pick(A, fork)` z=0.3989, `place(A, fork, table)` z=0.3588, `pick(A,
+'bottle')` z=0.6192, `handoff(A→B, fork)` lateral sep=0.1946 m — all four
+byte-identical. `pytest tests/test_skills.py`: 4 passed / 4 failed,
+unchanged.
+
+**Result — vision mode (GPU FP16): 3 of 4 PASS, `handoff` FAILS, reported
+not tuned.** `pick(A, fork)` final z=0.3905 (8.4 mm from baseline),
+`place(A, fork, table)` final z=0.3579 (0.9 mm — see below for why this one
+is nearly untouched), `pick(A, 'bottle')` final z=0.6286 (9.4 mm) — all
+within the "~10 mm expected noise" this module's task brief anticipated, all
+PASS. `place`'s near-zero delta is not a coincidence: its own targeting read
+is mechanically wired to `position_provider.get()` exactly like `pick`'s,
+but by the time it runs the object is always already held, so the
+held-object fallback (point 2 above) serves it from oracle at runtime every
+time — only the upstream pick's few-mm perturbation survives into its final
+number. `handoff(A→B, fork)` **FAILS**: `phase 5 (from_arm retreat) did not
+clear the 0.1 m gate ... from_arm_retreat_dist=0.0540 m` (oracle baseline:
+0.2263 m). This gate is computed purely from site positions against a fixed
+world-frame point — no direct perceptual dependency — yet a 2.2 mm
+grasp-point perturbation at Phase 1 (the only perceptual input anywhere in
+this call) propagates through `handoff`'s ~13-waypoint sequential
+choreography (already the most kinematically fragile skill in this repo per
+ADR-032 through ADR-038's five-revision history, several margins on what
+ADR-037 itself called a "joint-limit knife-edge") and erodes a
+0.2263 m clearance down to 0.0540 m. **No threshold, gate, or waypoint
+constant was touched to make this pass** — a hybrid fallback (scripted
+`handoff`, perception-driven `pick`/`place`) is available and undecided.
+
+**Task 5 (grounder → executor → render), two more pre-existing findings,
+neither a perception regression (both reproduce in oracle mode too):**
+1. The brief's literal demo sentence does not parse under M05's frozen
+   grammar (`hand` alone ≠ `hand off`/`handoff`/`pass`/`give`).
+2. Grounding the two-clause grammar-supported form produces `pick` then
+   `handoff` as separate `SkillCall`s, and running them in sequence fails —
+   `run_handoff`'s Phase 1 unconditionally re-picks the object, with no
+   `already_held` branch the way `run_place` has one. Verified directly in
+   oracle mode. Out of this module's scope to fix (an M06 skill-semantics
+   gap, not a perception issue).
+
+   Worked around by grounding the single grammar-supported clause "Give the
+   fork to arm B." (one `handoff` `SkillCall`, `from_arm` defaulting to "the
+   other arm") — PASSED: `is_holding('A') is None`, `is_holding('B') ==
+   'fork'`. The rendered `docs/images/m10-demo-end-to-end.png` (front
+   camera) does **not** clearly show which arm ends up holding the fork at
+   this framing — stated plainly, not implied otherwise; the programmatic
+   check above is the real verification.
+
+**Consequences.** `bimanual.perception.posenet`'s `import torch` at module
+scope meant `inference.py`/`cached_access.py` cannot import `PROP_ORDER`
+from it (no `torch` in `ov_env`, the only venv with both `mujoco` and
+`openvino`) — both files duplicate the three constants instead, documented
+inline as a disclosed departure with no automatic sync. The GPU shader-cache
+warm-up cost (a first compile took 12+ CPU-minutes once, a second on the
+same machine took 0.349 s) is a real, environment-dependent first-call cost
+this document does not fully separate from the step-render bug it was
+investigated alongside — flagged for anyone deploying to a freshly imaged
+machine.
+
+**Source:** this commit ("M10 Phase 5: PoseNet wired into controller via
+cached per-skill inference (ADR-046, GPU FP16 runtime).").
+
+---
+
 ## ADR-045 — M10 Phase 4: PoseNet converted to OpenVINO IR (FP32/FP16), benchmarked CPU/iGPU/NPU — all six combos succeeded (including NPU+FP32), one silent-default trap found and fixed, one threshold miss reported honestly
 
 **Recorded:** Sept 14, 2026 · **Follows:** ADR-044 (M10 Phase 3, trained checkpoint),

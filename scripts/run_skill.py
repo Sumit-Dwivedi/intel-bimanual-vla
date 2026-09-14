@@ -64,6 +64,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--step-budget", type=int, default=ik.DEFAULT_STEP_BUDGET)
+    parser.add_argument(
+        "--perception",
+        default="oracle",
+        choices=["oracle", "vision"],
+        help="M10 Phase 5 (ADR-046): 'oracle' (default) reproduces every pre-Phase-5 "
+        "number byte-identically (cameras=None, no PoseNetInference constructed). "
+        "'vision' constructs TableSettingEnv(cameras=['posenet_cam']) and a "
+        "PoseNetInference(device=GPU), requires artifacts/posenet_ir/ (bm-ptl only).",
+    )
+    parser.add_argument(
+        "--device",
+        default="GPU",
+        choices=["CPU", "GPU", "NPU"],
+        help="OpenVINO device for --perception vision (ignored for --perception oracle).",
+    )
     return parser
 
 
@@ -115,9 +130,19 @@ def main(argv: list[str] | None = None) -> int:
 
     skill_call = SkillCall(skill=args.skill, arm=args.arm, target_object=target_object, params=params)
 
-    # Vision-based skills out of scope per ADR-023. All skills execute
-    # state-only for ~0.20ms/step budget.
-    env = TableSettingEnv(cameras=None)
+    # ADR-046: perception is opt-in, oracle is the default (M10 Phase 5).
+    # `--perception oracle` (default) reproduces ADR-023's original
+    # state-only path byte-for-byte: cameras=None, ~0.20ms/step, no
+    # PoseNetInference constructed at all.
+    if args.perception == "vision":
+        from bimanual.perception.inference import PoseNetInference
+
+        env = TableSettingEnv(cameras=["posenet_cam"], render_width=224, render_height=224)
+        inference = PoseNetInference(device=args.device)
+        executor_inference = inference
+    else:
+        env = TableSettingEnv(cameras=None)
+        executor_inference = None
     env.reset(seed=args.seed)
 
     body_name = OBJECT_BODY_NAME.get(target_object) if args.skill in ("pick", "place", "handoff") else None
@@ -132,12 +157,21 @@ def main(argv: list[str] | None = None) -> int:
         drawer_qadr = int(env.model.jnt_qposadr[drawer_jid])
         initial_drawer_qpos = float(env.data.qpos[drawer_qadr])
 
-    executor = ScriptedSkillExecutor()
+    executor = ScriptedSkillExecutor(inference=executor_inference)
     result = executor.execute(skill_call, env, step_budget=args.step_budget)
 
-    print(f"skill={args.skill} arm={args.arm} object={target_object} params={params} seed={args.seed}")
+    print(f"skill={args.skill} arm={args.arm} object={target_object} params={params} seed={args.seed} "
+          f"perception={args.perception}")
     print(f"result: success={result.success} frames_used={result.frames_used}")
     print(f"reason: {result.reason}")
+    if executor._position_provider is not None:
+        provider = executor._position_provider
+        print(
+            f"perception: refresh_count={provider.refresh_count} "
+            f"inference_count={provider.inference_count}"
+        )
+        for entry in provider.deltas:
+            print(f"  delta: {entry}")
     # M06 Phase 2 Commit 2 (ADR-030): report the weld's own bookkeeping
     # explicitly, not just buried inside `reason` -- a Tester needs "weld
     # attached at frame N" visible even when the overall skill fails.

@@ -873,7 +873,21 @@ def _drive_to_target(
         solution = ik.solve_position_ik(env.model, env.data, arm, target)
         ctrl = _hold_ctrl(env, frozen_base=hold_ctrl_base)
         _write_arm_ctrl(ctrl, env.model, arm, solution.joint_angles, gripper_ctrl)
-        env.step(ctrl)
+        # ADR-046: `cameras=[]` EXPLICITLY, not omitted. `env.step()`'s own
+        # default (per ADR-022) is "fall back to this env's INSTANCE camera
+        # set" -- harmless (`None`, no render) for every oracle-mode env this
+        # module ever saw before M10 Phase 5, but a perception-mode env's
+        # instance default is `["posenet_cam"]` (this module's own
+        # `position_provider` targeting reads need it opt-in at the env
+        # level, ADR-046's Correction 4). Omitting this override would make
+        # EVERY physics step of EVERY waypoint pay a full render -- measured
+        # directly: turned a sub-second `pick(A, fork)` into several minutes
+        # (up to ~1655 steps x ~0.13 s/render for pick alone, ~6610 x
+        # ~0.13 s ~= 14 minutes for `handoff`) -- found and fixed during this
+        # module's own verification run, not assumed. `cameras=[]` (an
+        # explicit empty list, not `None`) overrides the instance default for
+        # THIS call only, per `_resolve_cameras`'s own documented semantics.
+        env.step(ctrl, cameras=[])
         steps += 1
 
         prop_violations = _prop_collision_violations(env, target_body=target_body)
@@ -984,7 +998,10 @@ def _dwell(
     for i in range(n_steps):
         ctrl = _hold_ctrl(env, frozen_base=hold_ctrl_base)
         _write_arm_ctrl(ctrl, env.model, arm, frozen_arm_ctrl, gripper_ctrl)
-        env.step(ctrl)
+        # ADR-046: same explicit `cameras=[]` override as `_run_waypoint`'s
+        # own `env.step()` call above -- see that call site's comment for the
+        # measured cost of omitting it.
+        env.step(ctrl, cameras=[])
 
         if weld is not None and weld_object_name is not None:
             if weld.attempt_grasp(arm, weld_object_name):
@@ -1392,6 +1409,7 @@ def run_pick(
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
     weld: WeldGrasp | None = None,
     hold_ctrl_base: np.ndarray | None = None,
+    position_provider=None,
 ) -> SkillResult:
     """pick(object, arm): APPROACH (clearance above the grasp point) ->
     DESCEND (onto it) -> GRIP (close + attempt weld attach) -> RETREAT (back
@@ -1430,6 +1448,18 @@ def run_pick(
     this function's pre-ADR-037 behaviour exactly: the OTHER arm is still
     held (ADR-010), just via `_hold_ctrl`'s original per-step qpos-chasing
     default rather than a caller-supplied frozen snapshot.
+
+    `position_provider` (M10 Phase 5, ADR-046): optional
+    `bimanual.perception.cached_access.CachedPropPositions`. `None` (the
+    default -- every call site before M10 Phase 5, and every caller that
+    never opts into perception) reproduces this function's ENTIRE pre-Phase-5
+    behaviour byte-for-byte: the grasp-point targeting read below is the
+    exact same `env.data.xpos` oracle read it always was. When given, ONLY
+    that one targeting read is replaced by `position_provider.get(body_name)`
+    -- every success/verification check in this function (`final_z`, the
+    lift-margin comparisons) keeps reading `env.data.xpos` directly,
+    unconditionally, regardless of `position_provider` (ADR-046's Correction
+    1: a skill must never grade itself with the same estimate it acted on).
     """
     frames = 0
     body_name = OBJECT_BODY_NAME.get(target_object)
@@ -1437,7 +1467,17 @@ def run_pick(
         return SkillResult(False, f"unknown target_object {target_object!r}", frames)
 
     body_id = _body_id(env.model, body_name)
-    obj_pos0 = np.array(env.data.xpos[body_id], dtype=np.float64, copy=True)
+    # ADR-046 targeting read: `position_provider.get()` returns None (falls
+    # through to the oracle read below) for any prop outside PoseNet's
+    # 3-prop scope or currently held by either arm -- see
+    # `cached_access.CachedPropPositions.get`'s docstring. `position_provider
+    # is None` (the default) skips straight to the oracle read, unchanged
+    # from every call site before M10 Phase 5.
+    _perceived_pos0 = position_provider.get(body_name) if position_provider is not None else None
+    obj_pos0 = (
+        _perceived_pos0 if _perceived_pos0 is not None
+        else np.array(env.data.xpos[body_id], dtype=np.float64, copy=True)
+    )
     initial_z = float(obj_pos0[2])
     offset = GRASP_POINT_OFFSET_M.get(target_object, np.zeros(3))
     grasp_point = obj_pos0 + offset
@@ -1549,6 +1589,7 @@ def run_place(
     destination: str = "table",
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
     weld: WeldGrasp | None = None,
+    position_provider=None,
 ) -> SkillResult:
     """place(object, target=table, arm): pick the object up (if not already
     held), then APPROACH above the destination at clearance height ->
@@ -1568,6 +1609,20 @@ def run_place(
     resting band) and within the tabletop's xy bounds -- not fallen through
     and not flown off the edge -- AND every waypoint cleared both
     validation bars.
+
+    `position_provider` (M10 Phase 5, ADR-046): threaded straight into the
+    nested `run_pick` call below, exactly as `weld` is. Also consulted for
+    THIS function's own destination-offset read (`obj_xy`, below) -- but by
+    the time that read happens, `arm` always already holds `target_object`
+    (either the nested `run_pick` just confirmed it, or the `already_held`
+    branch skipped the pick because it was already true), so
+    `position_provider.get()` refuses to serve a perception estimate there
+    (`cached_access.CachedPropPositions.get`'s held-object rule) and this
+    call site is, by construction, oracle-sourced at runtime every time --
+    not because the call site was left oracle, but because serving a
+    resting-height PoseNet guess for an airborne object would be actively
+    wrong (ADR-046's Correction 2). `None` (the default) reproduces this
+    function's entire pre-Phase-5 behaviour unchanged.
     """
     frames = 0
     body_name = OBJECT_BODY_NAME.get(target_object)
@@ -1622,7 +1677,10 @@ def run_place(
         pick_result = None
     else:
         pick_budget = max(1, step_budget // 2)
-        pick_result = run_pick(env, arm, target_object, step_budget=pick_budget, weld=weld)
+        pick_result = run_pick(
+            env, arm, target_object, step_budget=pick_budget, weld=weld,
+            position_provider=position_provider,
+        )
         frames += pick_result.frames_used
         if not pick_result.success:
             return SkillResult(
@@ -1641,7 +1699,14 @@ def run_place(
     if remaining <= 0:
         return SkillResult(False, f"waypoint 1 (approach destination) failed [convergence (no budget remaining after pick)]", frames)
 
-    obj_xy = np.array(env.data.xpos[body_id][:2], dtype=np.float64, copy=True)
+    # ADR-046 targeting read (see this function's docstring for why this
+    # site is oracle-sourced at runtime regardless: the object is always
+    # already held here).
+    _perceived_xy = position_provider.get(body_name) if position_provider is not None else None
+    obj_xy = (
+        np.array(_perceived_xy[:2], dtype=np.float64, copy=True) if _perceived_xy is not None
+        else np.array(env.data.xpos[body_id][:2], dtype=np.float64, copy=True)
+    )
     dest_xy = obj_xy + np.array(PLACE_OFFSET_XY_M)
     # Keep the destination safely inside the tabletop (verified scene
     # geometry: x in [-0.40, 0.40], y in [-0.25, 0.25]) with margin so the
@@ -1682,6 +1747,13 @@ def run_place(
     # open + hold so the object settles under gravity/contact as before.
     if weld is not None:
         weld.release(arm)
+        if position_provider is not None:
+            # ADR-046: the object is back on the table now, at rest --
+            # exactly PoseNet's training distribution. Invalidate so the
+            # NEXT position_provider.get() (any prop, any skill) pays one
+            # fresh render+infer rather than reusing a cache generation
+            # that predates this release.
+            position_provider.invalidate()
     ok, used, reason, _ = _run_dwell(
         env, arm, lower_target, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline, target_object=target_object
     )
@@ -1909,6 +1981,7 @@ def run_handoff(
     target_object: str,
     step_budget: int = ik.DEFAULT_STEP_BUDGET,
     weld: WeldGrasp | None = None,
+    position_provider=None,
 ) -> SkillResult:
     """handoff(object, from_arm, to_arm): ADR-037's SEQUENTIAL CHOREOGRAPHY
     -- one arm moves at a time, the other is genuinely frozen (not merely
@@ -2022,6 +2095,14 @@ def run_handoff(
     transfer gate, no release calls) -- the older lift-margin/distance-only
     success check below is unchanged in that case.
 
+    `position_provider` (M10 Phase 5, ADR-046): threaded straight into
+    Phase 1's nested `run_pick` call, the ONLY targeting read this function
+    itself needs perception for (the transfer/receiving points are fixed
+    world coordinates, `HANDOFF_POSITION_XYZ`, never read from an object's
+    position). `initial_z` and `final_pos` below (this function's own
+    success check) stay oracle `env.data.xpos` reads unconditionally,
+    exactly like every other skill's success check (ADR-046's Correction 1).
+
     Success (with `weld` given): the object ends measurably closer to
     `to_arm`'s gripperframe site than `from_arm`'s, has been lifted since
     the handoff began, `weld.is_holding(to_arm) == body_name` while
@@ -2054,6 +2135,7 @@ def run_handoff(
     pick_budget = max(1, step_budget // 2)
     pick_result = run_pick(
         env, from_arm, target_object, step_budget=pick_budget, weld=weld, hold_ctrl_base=to_arm_hold,
+        position_provider=position_provider,
     )
     frames += pick_result.frames_used
     if not pick_result.success:
@@ -2136,6 +2218,13 @@ def run_handoff(
     # so a NEW frozen snapshot is taken here, the instant to_arm stops.
     if weld is not None:
         weld.release(from_arm)
+        if position_provider is not None:
+            # ADR-046: the object is now held by to_arm, not at rest -- get()
+            # would refuse to serve it regardless (held-object rule) -- but
+            # invalidate anyway so a DIFFERENT prop's next get() pays one
+            # fresh render+infer rather than reusing a pre-release cache
+            # generation.
+            position_provider.invalidate()
     to_arm_grip_hold = _hold_ctrl(env)
     ok, used, reason, _ = _run_dwell(
         env, from_arm, transfer_point, open_frac, min(GRIP_HOLD_FRAMES, remaining), baseline,

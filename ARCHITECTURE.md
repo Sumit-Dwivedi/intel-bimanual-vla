@@ -4067,6 +4067,142 @@ cites `7dcaaa6`.
 
 ---
 
+### ADR-046 — M10 Phase 5: PoseNet wired into the controller via cached per-skill inference, opt-in, oracle default -- 3 of 4 skills PASS with perception on, `handoff` FAILS and is reported not tuned; a per-step render-cost bug found and fixed along the way
+
+**Context.** M10 Phase 4 (ADR-045) produced a compiled, benchmarked OpenVINO
+IR that nothing in the control loop consumed yet. This module wires it in --
+but the four scripted skills back the entire 30-point bimanual-completion
+criterion, so the wiring had to be provably non-destructive to the oracle
+path before it could be trusted to add a second one. Full measured evidence
+lives in `docs/hardware/m10-phase5-integration.md`; this section is the
+design record.
+
+**Options considered for the targeting/verification split.**
+- (a) Replace every fork/bottle/mug position read with perception,
+  uniformly.
+- (b) Split by call site: replace only the reads that CHOOSE where to move
+  (targeting), leave every read that DECIDES success/failure (verification)
+  on oracle, unconditionally, in both modes.
+
+**Decision.** (b). If a skill grades itself with the same noisy estimate it
+acted on, success becomes unfalsifiable and a perception bug reads as a
+pass. Concretely: `run_pick`'s grasp-point read (`obj_pos0`) and
+`run_place`'s destination-offset read (`obj_xy`) take an optional
+`position_provider`; `run_pick`'s `final_z`, `run_place`'s `final_pos`, and
+`run_handoff`'s `initial_z`/`final_pos` stay direct `env.data.xpos` oracle
+reads, unconditionally. `run_open_drawer`'s drawer reads are untouched --
+the drawer is outside PoseNet's 3-prop scope (ADR-041) entirely.
+
+**Options considered for a held object's position.**
+- (a) Invalidate the cache after `attempt_grasp` succeeds (attach) or
+  `release` fires, uniformly, per the task brief's initial proposal.
+- (b) Invalidate only on release; have `CachedPropPositions.get()` itself
+  refuse to serve a perception estimate for any prop currently held by
+  either arm, falling through to oracle instead.
+
+**Decision.** (b). ADR-044 (M10 Phase 3) measured that PoseNet's z output
+carries no real signal: every training image shows a prop resting on the
+table, so z is a per-prop constant the network memorised. The moment an
+arm's weld lifts an object its TRUE z rises well above that constant -- the
+water bottle's own prior measurement (ADR-034) goes from a resting z=0.4400
+to a held z=0.6192, a ~180 mm rise -- while a FRESH render immediately after
+attach would get back the SAME confident resting-height guess, now more
+convincing than a stale cached value because it was just computed. Option
+(a)'s attach-time invalidation would therefore be actively harmful, not
+merely wasteful. Option (b)'s held-object check inside `get()` composes
+correctly with all three call sites that use it without any of them needing
+to duplicate the check themselves, and makes an attach-time invalidation
+unnecessary: a held object never reaches the cache at all, regardless of
+when it was last refreshed. Release-time invalidation IS implemented (the
+object is back at rest, exactly PoseNet's training distribution).
+
+**Opt-in wiring.** `ScriptedSkillExecutor(inference=None)` -- the default,
+and every pre-Phase-5 call site (`tests/test_skills.py`,
+`scripts/run_skill.py`) -- is byte-identical to this class's entire
+pre-Phase-5 behaviour: no `CachedPropPositions` is ever constructed, the
+`cameras=None` assertion is unchanged. Passing a constructed
+`PoseNetInference` opts one executor instance into perception for
+`pick`/`place`/`handoff` targeting only; the camera-set assertion then
+requires exactly `cameras=['posenet_cam']`, and the cache invalidates at the
+start of every `execute()` call so one skill never reuses a previous,
+different skill's cache generation.
+
+**A real cost bug, found and fixed during this module's own verification,
+not assumed away.** `TableSettingEnv(cameras=['posenet_cam'])` sets that
+camera as the env's INSTANCE default (ADR-022). `env.step()` with no
+`cameras=` argument falls back to that instance default. Every internal
+`env.step()` call inside `skills_scripted.py`'s waypoint/dwell helpers was
+written under oracle-only conditions (instance default always `None`) and
+never overrode this -- harmless there, but once the instance default became
+`['posenet_cam']` it meant EVERY physics step of EVERY waypoint rendered,
+not just the one render per skill this design intended. Measured: `pick(A,
+fork)` alone did not return in 12+ CPU-minutes (confirmed alive, not
+deadlocked, via climbing `Get-Process` CPU time) before being killed.
+**Fixed** by passing `cameras=[]` explicitly (an empty list, not `None`) at
+both `env.step()` call sites -- per `_resolve_cameras`'s own documented
+semantics this overrides the instance default for that call only. Verified
+to change nothing for oracle mode: `pytest tests/test_skills.py` (4 passed /
+4 failed) and `scripts/verify_adr038_skills.py` (all four numbers) both
+reproduced their exact pre-fix results afterward.
+
+**Result -- oracle mode: exactly reproduced the ADR-038 baseline.**
+`pick(A, fork)` z=0.3989, `place(A, fork, table)` z=0.3588, `pick(A,
+'bottle')` z=0.6192, `handoff(A->B, fork)` lateral sep=0.1946 m -- all four
+byte-identical.
+
+**Result -- vision mode (GPU FP16): 3 of 4 PASS.** `pick(A, fork)` final
+z=0.3905 (8.4 mm from baseline), `place(A, fork, table)` final z=0.3579
+(0.9 mm), `pick(A, 'bottle')` final z=0.6286 (9.4 mm) -- all within the
+"~10 mm expected noise" this module's task brief anticipated, all PASS.
+`place`'s near-zero delta is the direct, measured consequence of the
+held-object fallback: its targeting read IS wired to perception, but the
+object is always already held by the time it runs, so `get()` serves it
+from oracle at runtime every time -- only the upstream pick's few-mm
+perturbation survives into its final number. **`handoff(A->B, fork)`
+FAILS**: `phase 5 (from_arm retreat) did not clear the 0.1 m gate ...
+from_arm_retreat_dist=0.0540 m` (oracle baseline: 0.2263 m). This gate is
+computed purely from site positions against a fixed world-frame point -- no
+direct perceptual dependency -- yet a 2.2 mm grasp-point perturbation at
+Phase 1 (the only perceptual input anywhere in this call) propagates through
+`handoff`'s ~13-waypoint sequential choreography (already the most
+kinematically fragile skill in this repo per ADR-032 through ADR-038's
+five-revision history, several margins on what ADR-037 itself called a
+"joint-limit knife-edge") and erodes a 0.2263 m clearance down to 0.0540 m.
+**No threshold, gate, or waypoint constant was touched to make this pass.**
+A hybrid fallback (scripted `handoff`, perception-driven `pick`/`place`) is
+available and left undecided by this ADR.
+
+**Task 5, two more findings, neither a perception regression (both
+reproduce in oracle mode).** The brief's literal demo sentence does not
+parse under M05's frozen grammar (`hand` alone is not `hand
+off`/`handoff`/`pass`/`give`); and grounding the grammar-supported two-clause
+form produces `pick` then `handoff` as separate `SkillCall`s, which fails in
+sequence because `run_handoff`'s Phase 1 unconditionally re-picks the
+object, with no `already_held` branch the way `run_place` has one -- a
+pre-existing M06 gap, out of this module's scope. Worked around by grounding
+the single grammar-supported clause "Give the fork to arm B." (one
+`handoff` call, `from_arm` defaulting to "the other arm") -- PASSED:
+`is_holding('A') is None`, `is_holding('B') == 'fork'`. The rendered demo
+image does not clearly show which arm ends up holding the fork at its
+framing -- stated plainly rather than implied otherwise.
+
+**Consequences.** `bimanual.perception.posenet`'s `import torch` at module
+scope meant the new runtime modules (`inference.py`, `cached_access.py`)
+cannot import `PROP_ORDER` from it (`ov_env`, the only venv with both
+`mujoco` and `openvino`, has no `torch`) -- both duplicate the three
+constants instead, documented inline as a disclosed departure with no
+automatic sync if `posenet.py`'s values ever change. The GPU shader-cache
+warm-up cost (one observed cold compile: 12+ CPU-minutes; a second, warm
+compile on the same machine: 0.349 s) is real and environment-dependent,
+flagged for anyone deploying to a freshly imaged machine, and not fully
+separated in the measurement from the step-render bug investigated
+alongside it.
+
+**Source:** this commit ("M10 Phase 5: PoseNet wired into controller via
+cached per-skill inference (ADR-046, GPU FP16 runtime).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
