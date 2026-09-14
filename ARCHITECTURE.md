@@ -4729,6 +4729,80 @@ together.
 
 ---
 
+### ADR-051 — M06 handoff perturbation diagnostic: home-pose arm-angle noise is not tolerated at any tested magnitude (0/5 at +/-0.005 rad) — no robustness claim beyond exact determinism is made for `handoff`
+
+**Context.** M08 (ADR-049) reported `handoff(B, A, fork)` Track A 10/10, but
+disclosed that result as degenerate: `handoff`'s own placement envelope is a
+single point, so all ten trials were the identical deterministic scenario —
+that number measures determinism, not robustness. This diagnostic asks
+whether `handoff` tolerates a genuinely different kind of small perturbation:
+noise on each arm's HOME pose (`shoulder_lift`, `elbow_flex`, both arms)
+immediately after `env.reset()`, before the skill starts moving. **Diagnostic
+only — `skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`,
+`randomization.py`, `scenes/so101/`, `gen_dual_scene.py` were not touched.**
+
+**A physics-timestep sweep was proposed alongside this and deliberately NOT
+run.** No `timestep` is set anywhere in the scene XML or `gen_dual_scene.py`,
+so the model runs at MuJoCo's default (0.002 s), and every skill's step
+budget in this repo is a FRAME count tuned at that default (`handoff`'s
+6610 frames = 13.2 s at dt=0.002). Varying `dt` without rescaling the frame
+budget does not perturb the skill physically — it changes how much simulated
+time the same frame budget buys, plus integrator accuracy and contact
+resolution — and a near-certain failure there would only re-confirm "this
+skill is frame-budget-tuned for dt=0.002," which ADR-046/ADR-049 already
+establish, dressed up as a robustness result. Skipped for that reason, not
+for lack of time in the diagnostic's 60-minute cap.
+
+**Method.** 5 seeds (0-4), fresh `TableSettingEnv` + fresh `WeldGrasp(env)`
+per trial (ADR-047 reuse hazard), noise drawn per (magnitude, seed) from an
+independent `numpy.random.default_rng`, applied to `env.data.qpos` at each
+of the four joints' own `jnt_qposadr` slot, followed by `mujoco.mj_forward`
+(same re-derivation step `env.py`'s own randomizer branch already uses after
+perturbing a prop's qpos), then called receiver-first exactly as
+`scripts/verify_adr038_skills.py`'s own established direct-call pattern:
+`run_handoff(env, "B", "A", "fork", weld=weld)`. Widens 0.005 -> 0.01 -> 0.02
+rad only if the previous magnitude passes all 5 seeds. Full script:
+`scripts/probe_handoff_perturbation.py`; full per-trial results and the
+zero-noise sanity control: `docs/hardware/m10-handoff-perturbation.md`.
+
+**Result.** A zero-noise control (same direct-call harness, 5 seeds)
+reproduced the known oracle baseline exactly: `success=True`, 6610 frames,
+`from_arm_retreat_dist=0.2263 m` every time (ADR-046's own oracle number),
+confirming the harness is sound. At the SMALLEST tested magnitude
+(+/-0.005 rad, roughly +/-0.3 degrees on two joints per arm), **0/5 seeds
+passed**, and the ladder therefore did not widen to 0.01 or 0.02 — the
+breaking point is at or below 0.005 rad. All 5 failures were, to four
+decimal places, the IDENTICAL failure: Phase 3 (`to_arm` approach),
+IK residual 0.0875 m, 3155 frames, `cross_arm contacts=1` — despite five
+different random noise vectors (both sign and magnitude varying per seed).
+This is the same signature ADR-049 documented for `water_bottle` placement
+("any nonzero offset reproduces the identical phase-3 failure, only exactly
+zero reproduces baseline") — evidence that `handoff`'s Phase 3 cross-arm
+corridor (ADR-037's "joint-limit knife-edge") is a cliff with respect to
+home-pose noise too, not merely to prop placement, and not a harness bug
+(the matched-pattern zero-noise control rules that out).
+
+**Decision, on the interpretation bar fixed before the run (>10/15 supports
+a robustness claim in the demo video, <10/15 means none is made): result is
+0/5 (0/15 of the full possible grid, since widening never triggered) — well
+under the bar. No robustness claim is made for `handoff` beyond the exact
+determinism ADR-049 already disclosed.** The demo video and any submission
+prose may state that `handoff` reproduces deterministically at its exact
+tuned configuration; it must not claim tolerance to arm-pose noise, prop
+placement beyond a single point (ADR-049), or any other perturbation class
+not separately measured and passing.
+
+**Regression gate, re-verified on bm-ptl before this diagnostic's run:**
+`pytest tests/test_skills.py` reproduced `4 passed / 4 failed`, same four
+tests as ADR-047/048/049 (`test_open_drawer_reaches_near_limit`,
+`test_pick_plate_lifts_above_table`, `test_place_plate_returns_to_table_rest`,
+`test_handoff_mug_ends_held_by_arm_b`).
+
+**Source:** this commit ("M06 handoff: perturbation robustness measurement
+(diagnostic, no logic change).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

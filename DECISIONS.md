@@ -11,6 +11,54 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-051 — M06 handoff perturbation diagnostic: home-pose arm-angle noise is not tolerated at any tested magnitude (0/5 at +/-0.005 rad) — no robustness claim beyond exact determinism is made for `handoff`
+
+**Ratified:** Sept 14, 2026 · **Follows:** ADR-049 (M08, disclosed `handoff`
+Track A 10/10 as degenerate/determinism, not robustness).
+
+**Diagnostic only** — no change to `skills_scripted.py`, `grasp.py`, `ik.py`,
+`executor.py`, `env.py`, `randomization.py`, `scenes/so101/`, or
+`gen_dual_scene.py`. New files: `scripts/probe_handoff_perturbation.py`,
+`docs/hardware/m10-handoff-perturbation.md`.
+
+**Question.** Does `run_handoff(B, A, fork)` tolerate a small perturbation
+other than prop placement — specifically, +/-0.005/0.01/0.02 rad noise on
+each arm's home `shoulder_lift`/`elbow_flex`, applied to `qpos` after
+`env.reset()` then `mj_forward`, 5 seeds per magnitude, widening only if the
+previous magnitude passed all 5?
+
+**A proposed physics-timestep sweep (0.001/0.002/0.003 s) was explicitly NOT
+run.** No `timestep` is set in the scene, so the model runs at MuJoCo's
+default (0.002 s) and every skill's step budget is a FRAME count tuned at
+that default. Varying `dt` without rescaling the frame budget changes how
+much simulated time the fixed budget buys, not a physical perturbation of
+the skill — it would show "frame-budget-tuned for dt=0.002" (already known
+from ADR-046/049), not robustness.
+
+**Result.** A zero-noise control (same direct-call harness) reproduced the
+known oracle baseline exactly (success, 6610 frames,
+`from_arm_retreat_dist=0.2263 m`, matching ADR-046's own number) — the
+harness is sound. At the smallest tested magnitude, +/-0.005 rad, **0/5
+seeds passed**; the ladder did not widen further. All 5 failures were
+identical to four decimal places (Phase 3 `to_arm` approach, IK residual
+0.0875 m, 3155 frames, `cross_arm contacts=1`) despite five different random
+noise draws — the same "any nonzero perturbation reproduces the identical
+failure" cliff ADR-049 documented for `water_bottle` placement, now shown to
+extend to home-pose joint noise as well.
+
+**Decision, against the bar fixed before the run (>10/15 supports a
+robustness claim in the demo video, <10/15 means none is made): 0/5 (0/15 of
+the possible grid) — well under the bar. No robustness claim is made for
+`handoff` beyond the exact determinism ADR-049 already disclosed.** The demo
+video may state `handoff` reproduces deterministically at its exact tuned
+configuration; it must not claim tolerance to arm-pose noise or to prop
+placement beyond the single point ADR-049 measured.
+
+**Regression gate, bm-ptl, before this run:** `pytest tests/test_skills.py`
+reproduced `4 passed / 4 failed`, same four tests as ADR-047/048/049.
+
+---
+
 ## ADR-050 — M10 Phase 4 extension: INT8 PoseNet quantization via NNCF, benchmarked CPU/iGPU/NPU — 4x smaller than FP32 and 2-4x faster than FP16/FP32, but deviation (36-37 mm) is an order of magnitude above the model's own ground-truth MAE (2.6-3.2 mm)
 
 **Ratified:** Sept 14, 2026 · **Follows:** ADR-045 (M10 Phase 4, FP32/FP16 IR
