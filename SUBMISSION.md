@@ -102,62 +102,43 @@ still not reachable end-to-end.
 - [ ] Demo application platform: N/A (this is a local sim, not a hosted app) — clarify with lablab if in doubt
 - [ ] Application URL: link to GitHub repo README or a recorded demo page
 
-## Rubric Alignment (Intel + platform)
-Intel-specific (100 pts):
-- [x] End-to-end task completion & bimanual (30) — **MET.** `handoff(A→B, fork)`
-  executes end-to-end, verified by direct measurement on bm-ptl (sequential
-  choreography where one arm moves at a time while the other is held frozen,
-  ADR-037; render legibility fixes, ADR-038): arm A picks the fork, transfers it
-  to the handoff point, and retreats clear of the shared workspace, while arm B
-  approaches, grips, and ends holding it (`weld.is_holding('B')=='fork'`,
-  `weld.is_holding('A') is None`, `from_arm_clear=True`) — genuine two-arm
-  coordination, not two independent single-arm scripts. This follows the
-  sequential single-arm-at-a-time choreography described in Wan, Ramos, Yang,
-  Garrett 2025 (NVIDIA), "Learning to Plan & Schedule with Reinforcement-Learned
-  Bimanual Robot Skills", https://arxiv.org/html/2510.25634v1, and is consistent
-  with the collision-free bimanual trajectory planning approach in "Trajectory
-  planning system for bimanual robots: Achieving efficient collision-free
-  manipulation" (2025),
-  https://www.sciencedirect.com/science/article/pii/S0921889025002155 (title and
-  URL cited; no author name for this paper has been verified, so none is given).
-  Three further single-arm skills also complete end-to-end: `pick(A, fork)`,
-  `place(A, fork, table)`, `pick(A, water_bottle)`. Grasping itself is an
-  explicit weld-constraint abstraction, not friction-based contact (ADR-029,
-  disclosed per ADR-015) — see README's "Grasping Abstraction and Documented
-  Limitations". This is not a claim that the full brief-example command
-  completes: four other skill/arm/object combinations do not yet work (see the
-  Working/Not working lists above), and `pour` remains out of scope (ADR-023).
-  The 30-point criterion is read here as "bimanual, end-to-end task completion,"
-  which the measured `handoff` satisfies.
-- [ ] VLA / multi-modal reasoning (20) — text command → grounded skill plan works
-  (M04 CommandSource, M05 rule grounder, 43 tests, `docs/command-grammar.md`), but this
-  is a rule-based grounder, not a learned VLA model — ACT/policy training is cut
-  (ADR-023). No claim of learned multi-modal reasoning should be made.
-- [ ] OpenVINO & Core Ultra optimization (20) — Day 0 device access proven; **M03
-  complete Sept 12**: PyTorch→IR→compile→infer verified on CPU, GPU and NPU for a
-  hand-rolled ResNet18-scale encoder, evidence in `benchmarks/ov-smoke-notes.md`
-  (max abs deviation vs PyTorch: CPU 5.674362e-05, GPU 7.408857e-05, NPU 1.122952e-04;
-  NPU rejects a fully-dynamic batch shape with a hard process crash and requires
-  static/bounded shapes — see DECISIONS.md M03 / ADR-013). Note this smoke test used a
-  placeholder encoder, not the project's actual PoseNet (M10/M13) — that conversion has
-  not been done yet, so this criterion is not fully satisfied.
-- [ ] Robustness across 10 seeds (15) — **at risk**, not started; blocked on M06a
-  producing at least one working skill to run repeatedly across seeds.
-- [ ] Reproducibility (10) — `scripts/verify_env.py` and pinned environments exist (M01);
-  full-pipeline reproduction not yet demonstrable since M06a is incomplete.
-- [ ] Innovation (5) — no claim made; TODO.
+## Rubric Alignment (Intel + platform) — Evidence Map
 
-Platform-general:
-- [ ] Application of Technology
-- [ ] Presentation
-- [ ] Business Value
-- [ ] Originality
+Every row points to a file, ADR, or measured result a judge can open directly.
+An empty Evidence cell means no artifact exists yet — marked TODO, not
+asserted. Points and criteria wording are unchanged from the platform's own
+rubric; only the presentation is new.
 
-Speechmatics bonus:
-- [ ] Speech input wired to VLA text pipeline — M04 ships a `CommandSource` ABC with a
-  voice stub only (11 tests cover the abstraction and the text source); no real
-  Speechmatics integration exists yet.
-- [ ] Working demo clip with voice command — TODO, does not exist.
+### Intel-specific (100 pts)
+
+| Criterion (pts) | Status | Evidence | What it shows / where it stops |
+|---|---|---|---|
+| End-to-end task completion & bimanual (30) | **MET, narrowly** | ADR-037 (sequential one-arm-at-a-time choreography fix), ADR-038 (render legibility); `docs/images/m06-handoff-complete.png`; `docs/videos/m06-handoff-clip.mp4`; `run_demo.py` (reported 4/4 PASS, exit 0, bm-ptl) | `handoff(A→B, fork)` completes end-to-end with genuine two-arm coordination (`weld.is_holding('B')=='fork'`, `weld.is_holding('A') is None`, `from_arm_clear=True`), following the sequential choreography in Wan, Ramos, Yang, Garrett 2025 (NVIDIA), "Learning to Plan & Schedule with Reinforcement-Learned Bimanual Robot Skills", https://arxiv.org/html/2510.25634v1, and consistent with "Trajectory planning system for bimanual robots" (2025), https://www.sciencedirect.com/science/article/pii/S0921889025002155 (title/URL only; no verified author). Three further single-arm skills also complete end-to-end: `pick(A, fork)`, `place(A, fork, table)`, `pick(A, water_bottle)`. Grasping is an explicit MuJoCo weld-constraint abstraction, not friction contact (ADR-029, disclosed per ADR-015). Four other skill/arm/object combinations do not work (see Working/Not working lists above), and `pour` is out of scope (ADR-023), so the brief's own literal example command does not run end-to-end. **On the clip:** it is real and committed, but its first roughly two-thirds do not read as a handoff — the camera is pinned to the final gripper pose, so early frames show neither the fork nor a clear transfer; only the last ~0.5 s is legible. Cite the still image as the primary evidence and the clip as secondary, not the reverse. |
+| VLA / multi-modal reasoning (20) | Partial | M04 `CommandSource` ABC; M05 rule grounder; `tests/test_grounder.py` (43 tests); `docs/command-grammar.md` | Text command → grounded skill plan works and is the path the demo actually runs. This is a rule-based grounder, not a learned VLA model — ACT/policy training is cut (ADR-023). PoseNet perception is trained and benchmarked (M10) but is opt-in and **off by default** in the demo (oracle mode, ADR-046): the grounder is in the demo path, perception is not. Do not read this row as claiming perception-driven multi-modal reasoning. |
+| OpenVINO & Core Ultra optimization (20) | Partial | ADR-045 (PoseNet → OpenVINO IR, FP32/FP16, benchmarked CPU/iGPU/NPU) and ADR-050 (INT8 PoseNet quantization via NNCF, benchmarked CPU/iGPU/NPU); `benchmarks/ov-smoke-notes.md`; `docs/hardware/m10-phase4-benchmark.md` | The conversion pipeline is proven on all three devices twice over: a smoke test on a placeholder ResNet18-scale encoder (`ov-smoke-notes.md`, max abs deviation vs PyTorch 5.7e-05 to 1.1e-04) and the real PoseNet model in FP32/FP16 (ADR-045). INT8 was also converted and benchmarked (ADR-050) but its 36-37 mm deviation — an order of magnitude above PoseNet's own 2.6-3.2 mm ground-truth MAE — made it unfit to ship; see the Innovation row for why that is reported as a finding, not a gap. |
+| Robustness across 10 seeds (15) | Narrow, measured | ADR-049, `docs/hardware/m08-eval.md`; ADR-051 and its section 9, `docs/hardware/m10-handoff-perturbation.md` | Three skills — `pick(A, fork)`, `place(A, fork, table)`, `pick(A, water_bottle)` — tolerate roughly ±10-20 mm of their own target prop's placement noise, 10/10 across seeds (Track A, ADR-049). `handoff` is not robust by any measurement taken: it reproduces only at its single exact tuned configuration, and fails under prop displacement (Track B, 0/10, ADR-049), a 2.2 mm perception offset (ADR-046), and ±0.003 rad arm-angle noise (1/5, `docs/hardware/m10-handoff-perturbation.md` section 9). No robustness adjective should be attached to `handoff` anywhere in judge-facing copy. |
+| Reproducibility (10) | Met, for what ships | `scripts/verify_env.py`; `scripts/requirements-dev.txt` / `scripts/requirements-bmptl.txt`; `run_demo.py` (reported 4/4 PASS, exit 0, bm-ptl) | Pinned environments plus a single entry point reproduce the four working skills end-to-end. `pytest tests/test_skills.py` is **4 passed / 4 failed** — never describe the suite as passing; the four failures are the same already-diagnosed combinations, not a regression. |
+| Innovation (5) | Evidenced | ADR-029 (weld-constraint grasping abstraction), following the ADR-028 fix for MuJoCo issue #239's finger-pad mesh collapse; ADR-050 and `docs/hardware/m10-phase4-benchmark.md` (INT8 PoseNet quantization measured, then declined for shipping) | Two concrete instances, not one technique: an explicit, disclosed physics abstraction built only after diagnosing and fixing an upstream MuJoCo geometry bug, and a quantization pass that was measured against the model's own ground-truth error (36-37 mm vs. 2.6-3.2 mm MAE) and rejected on that evidence rather than shipped for its speedup alone. A measurement changing a decision is the rarer signal here. |
+
+### Platform-general
+
+No point values are published for these by the platform; no dedicated
+write-up exists yet for any of them beyond what the Intel-specific table
+above already documents.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Application of Technology | TODO | — |
+| Presentation | TODO | — |
+| Business Value | TODO | — |
+| Originality | TODO | — |
+
+### Speechmatics bonus
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Speech input wired to VLA text pipeline | Not done | M04 ships a `CommandSource` ABC with a voice stub only (11 tests cover the abstraction and the text source); no real Speechmatics integration exists. |
+| Working demo clip with voice command | Not done | TODO — does not exist. |
 
 ## Assets to Produce
 - [ ] `docs/video-script.md` — narrated walkthrough script. TODO. Should not be written
