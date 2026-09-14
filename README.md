@@ -5,6 +5,23 @@ Summit Hackathon (Sept 10–16, 2026). Two SO-101 arms in MuJoCo perform a
 language-conditioned table-setting task, with inference on Intel Core Ultra Series 3
 (Panther Lake) via OpenVINO 2026.3 across CPU, iGPU (Arc B390), and NPU (NPU5010).
 
+Licensed under the MIT License — see `LICENSE`.
+
+## Quickstart
+
+```bash
+./run_demo.sh
+```
+
+`run_demo.sh` is the project's entry point for reproducing the demo. Before
+running it, check your environment against `scripts/requirements-dev.txt`
+(laptop) or `scripts/requirements-bmptl.txt` (Intel target), and run
+`scripts/verify_env.py` to confirm the install. This is a simulation-only
+project — no physical robot is involved anywhere in the pipeline. See the
+Status section below for exactly which skill/arm/object combinations
+currently work end-to-end, and `SUBMISSION.md` for the full, unembellished
+submission checklist and rubric self-assessment.
+
 ## Status
 
 **In active development through Sept 16, 2026.** The final README — with reproduction
@@ -67,6 +84,8 @@ failure reasons) is tracked in `SUBMISSION.md`, updated as skills are verified.
 - Measurement artifacts in `docs/hardware/` — reachability envelopes, render costs,
   grasp diagnostics, device benchmarks
 - Decisions log in `DECISIONS.md`; architecture and rationale in `ARCHITECTURE.md`
+- Submission checklist and rubric self-assessment in `SUBMISSION.md` — tracks every
+  deliverable the platform requires and what currently satisfies it, TODO otherwise
 
 ## Environment
 
