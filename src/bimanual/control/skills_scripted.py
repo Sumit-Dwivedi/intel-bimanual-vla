@@ -482,7 +482,7 @@ TABLE_COLLISION_DEPTH_TOL_M = 0.001
 #: (the midpoint of the MEASURED shared reachable band, y in [-0.12, 0.10]
 #: m, `docs/hardware/m06-reachability-probe.md`'s "RE-MEASURED (ADR-026)"
 #: section) is unchanged -- only z moved.
-HANDOFF_POSITION_XYZ = (0.0, -0.01, 0.43)
+HANDOFF_POSITION_XYZ = (-0.035, 0.0, 0.49)  # ADR-060: Stage 2's (ADR-059) measured feasible centroid at 0.40 m base separation
 
 #: Gripper ctrl targets, expressed as a fraction of `armX_gripper`'s
 #: [low, high] `jnt_range` (so they scale automatically if the range ever

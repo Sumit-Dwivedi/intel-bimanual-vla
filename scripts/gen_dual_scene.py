@@ -350,13 +350,34 @@ FRONT_CAM_POS_STR = "%.4f %.4f %.4f" % FRONT_CAM_POS
 # grasp-point IK AND both arms' handoff-point IK, all under 0.005 m residual
 # -- so the search stopped there rather than continuing to a full 400 for no
 # benefit. See the report for the exact violation counts tried/found.
-HOME_SHOULDER_PAN = 0.054022898001139796
-HOME_SHOULDER_LIFT = -1.4813027413443594
+#
+# ---- ADR-060 (Redesign Stage 3, Step 0): swapped for a more robust pass ----
+# ADR-059's own candidate 1 was accepted after only 2 candidates were ever
+# scored -- too small a sample to tell "typical passing configuration" apart
+# from "lucky draw near a boundary". `scripts/validate_home_pose_stage3.py`
+# re-scored 200 candidates from the SAME `evaluate_candidate` criteria
+# (imported from `search_home_keyframe.py`, not reimplemented) WITHOUT
+# stopping at the first pass: 117/200 (58.5%) pass all five criteria --
+# comfortably above the near-degenerate 5% floor -- but ADR-059's own pose
+# ranked 91st of 117 by total summed IK residual across all 7 targets
+# (bottom quartile, residual 0.02451 m; top-quartile threshold 0.02093 m),
+# and its worst single-target residual (fork, 0.00489 m) sat uncomfortably
+# close to the 0.005 m gate. Per this stage's own decision rule ("ranks
+# poorly ... adopt the best candidate, re-run Stage 2's five-item gate"),
+# swapped to the 200-candidate run's best-scoring pass (index 11, total
+# residual 0.01780 m, worst single-target residual 0.00350 m -- comfortably
+# more margin on every target). Re-verified against
+# `scripts/verify_stage2_gate.py`'s full 5-item gate: ALL PASS (see
+# docs/hardware/redesign-skill-retest.md for the numbers). No change to
+# `ARM_GAP_Y`, prop placement, or the drawer removal -- this replaces ONLY
+# the home fold.
+HOME_SHOULDER_PAN = 0.15752951354904826
+HOME_SHOULDER_LIFT = -0.9930387740421327
 # elbow_flex's compiled range is -1.69..1.69 rad (read from the upstream
 # asset below and asserted against at generation time).
-HOME_ELBOW_FLEX = -0.46647495231644354
-HOME_WRIST_FLEX = 0.09897040413436309
-HOME_WRIST_ROLL = 0.17687383568459125
+HOME_ELBOW_FLEX = -0.9041594728051238
+HOME_WRIST_FLEX = 0.057312372361992936
+HOME_WRIST_ROLL = -0.24665855564066247
 # Gripper "open" end of its own range is resolved from the upstream asset
 # (not guessed): see `_gripper_open_value` below, which reads the joint's
 # own `range` attribute and returns its high end -- the same convention

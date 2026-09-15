@@ -11,6 +11,73 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-060 — Redesign Stage 3: home pose swapped after a 200-candidate robustness check; `HANDOFF_POSITION_XYZ` moved to Stage 2's measured centroid; eight-skill retest — 1 of 8 pass, 3 regressions, 2 boundaries resolved to a different mechanism, 1 boundary reconfirmed
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign` · `master` unchanged at
+`20e1012`.
+
+**Step 0.** ADR-059's home fold was accepted after only 2 candidates were
+ever scored. Re-scored 200 (`scripts/validate_home_pose_stage3.py`, reusing
+Stage 2's own `evaluate_candidate`, not reimplemented) without stopping at
+the first pass: 117/200 pass (58.5%, not near-degenerate). ADR-059's own
+pose ranks 91st of 117 by total-residual margin — bottom quartile. Per this
+stage's rule, swapped to the best of 200 (index 11, total residual 0.01780
+m vs. ADR-059's 0.02451 m); `verify_stage2_gate.py` re-run: **ALL 5 ITEMS
+PASS**.
+
+**Step 1.** `HANDOFF_POSITION_XYZ` moved from `(0.0, -0.01, 0.43)` to
+`(-0.035, 0.0, 0.49)` — Stage 2's own measured feasible centroid at 0.40 m
+separation, resolving the file-freeze contradiction ADR-059 flagged but
+could not resolve. Confirmed a single-line diff. Isolation test (corrected
+from the task's own verification text, which would have wrongly expected
+`frames_used=6610` to hold): with master's XML plus the new constant, the
+three constant-independent skills reproduce byte-identically (0.3989 /
+0.3588 / 0.6192); `handoff(A→B, fork)` changes as expected (lateral 0.1946
+m → 0.0399 m, `frames_used` 6610 → 3655) and now fails against the OLD
+geometry — correct, not a defect, since the constant was measured for the
+NEW geometry.
+
+**Step 2.** Eight-skill retest, seed 0, oracle, fresh env + fresh executor
+per skill (ADR-047). `cameras=[]` as literally specified raises
+`AssertionError` at the frozen `executor.py:212`; used `cameras=None`
+instead (functionally identical, matches every other oracle-mode script in
+this repo). **Result: 1/8 pass** (`pick(A, water_bottle)` only) vs. 4/9 on
+master (`open_drawer` excluded, removed in Stage 2). **3 regressions**
+(`pick(A, fork)`, `place(A, fork, table)`, `handoff(A→B, fork)`), one root
+cause: a waypoint-1 approach **collision** (cross-arm + arm-vs-table) at an
+otherwise fully IK-reachable pose — the 0.40 m separation's shared
+workspace band is only ~14x15 cm, and Stage 2's 5-item gate checked only
+static endpoint configs, never the swept approach path. A real,
+newly-surfaced gate-coverage gap.
+
+**Multi-seed diagnostics (ADR-056/057, `num_seeds=32`)** on all 4 distinct
+failure root causes: `pick(A, fork)` waypoint 1 residuals 0.0029-0.0099 m
+(no plateau — never an IK problem); `pick(A, mug)` waypoint 1 residuals
+0.0056-0.0106 m, no plateau, vs. master's own documented 0.0532 m at this
+target — **reachability fixed**, new blocker is a downstream grip/weld
+mechanism failure; `place(A, water_bottle, table)` destination residuals
+flat at 0.01502-0.01509 m across all 32 seeds — a textbook plateau,
+**genuine boundary reconfirmed** (master: 0.0138 m, same signature);
+`handoff(B→A, fork)` phase 1 residuals bimodal (half ~0.004-0.010 m, half
+~0.030-0.031 m) vs. master's 0.0954 m identical across 32/32 seeds — **now
+reachable by multiple configurations**, the one actually driven to brushes
+the plate by 0.3 mm, a local-minimum/routing signature, not a kinematic
+wall.
+
+**Consequences, stated plainly.** Headline pass count regressed, 4/9 (master)
+to 1/8 (redesign) — a real cost, traced to a newly-introduced collision
+class Stage 2's static-endpoint gate could not have caught. Underneath that
+headline: two previously-hard IK boundaries (mug pick, handoff B→A phase 1)
+are now confirmed reachable, blocked by more tractable problems instead;
+one boundary (water bottle place) is confirmed genuine on two different
+geometries by the same method. No skill logic changed to chase these
+numbers, per this stage's explicit rule. `grasp.py`, `ik.py`, `executor.py`,
+`env.py` confirmed byte-identical to `a80ad5f`. Full tables and
+per-diagnostic detail: `docs/hardware/redesign-skill-retest.md`; full ADR
+text: `ARCHITECTURE.md` ADR-060.
+
+---
+
 ## ADR-059 — Redesign Stage 2: base separation reduced 0.50 m -> 0.40 m by sweep; geometry replaced inside the measured workspace; home keyframe re-derived by search; drawer removed after a measured collision; supersedes ADR-021/ADR-025/ADR-026 on `redesign` only
 
 **Ratified:** Sept 15, 2026 · **Branch:** `redesign` · `master` unchanged at

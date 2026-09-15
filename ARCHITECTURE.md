@@ -5881,6 +5881,117 @@ geometry placed inside measured workspace, home keyframe regenerated
 
 ---
 
+### ADR-060 — Redesign Stage 3: home pose swapped after a 200-candidate robustness check; `HANDOFF_POSITION_XYZ` moved to Stage 2's measured centroid; eight-skill retest at the new geometry, **on the `redesign` branch only**
+
+**Recorded:** Sept 15, 2026 · **Branch:** `redesign` (`master` unchanged at
+`20e1012`). **Modifies:** `src/bimanual/control/skills_scripted.py` (ONE
+line, `HANDOFF_POSITION_XYZ`), `scripts/gen_dual_scene.py` (the five
+`HOME_*` constants), the regenerated `so101_dual_table.xml`, three new
+scripts (`scripts/validate_home_pose_stage3.py`,
+`scripts/stage3_eight_skill_retest.py`,
+`scripts/stage3_multiseed_diagnostic.py`), this file, `DECISIONS.md`,
+`docs/hardware/redesign-skill-retest.md`. **Does NOT modify** `grasp.py`,
+`ik.py`, `executor.py`, `env.py` — confirmed byte-identical to `a80ad5f` by
+`git diff --stat` on bm-ptl before this commit. Provenance: bm-ptl
+(ADR-047).
+
+**Step 0 — home-pose robustness.** ADR-059 accepted its home fold after
+scoring only 2 candidates. `scripts/validate_home_pose_stage3.py` re-scored
+200 candidates from Stage 2's own `evaluate_candidate` (imported, not
+reimplemented), without stopping at the first pass: **117/200 pass
+(58.5%)** — not near-degenerate. ADR-059's pose passes every criterion but
+ranks **91st of 117** by total-residual margin (bottom quartile, 0.02451 m
+vs. a 0.02093 m top-quartile threshold; worst single-target residual
+0.00489 m, uncomfortably close to the 0.005 m gate). Per this stage's own
+rule ("ranks poorly → adopt the best candidate, re-run the five-item
+gate"), **swapped** to candidate 11 (total residual 0.01780 m, worst
+single-target residual 0.00350 m):
+`shoulder_pan=0.15753, shoulder_lift=-0.99304, elbow_flex=-0.90416,
+wrist_flex=0.05731, wrist_roll=-0.24666`. `scripts/verify_stage2_gate.py`
+re-run against the regenerated scene: **ALL 5 ITEMS PASS**. Full numbers in
+`docs/hardware/redesign-skill-retest.md`.
+
+**Step 1 — handoff constant moved.** `HANDOFF_POSITION_XYZ` changed from
+`(0.0, -0.01, 0.43)` to Stage 2's own measured feasible centroid at 0.40 m
+separation, `(-0.035, 0.0, 0.49)` (ADR-059's sweep report,
+`docs/hardware/redesign-geometry.md`) — the single line the previous
+stage's file-freeze had left unresolved. Confirmed a single-line diff
+before committing. **Isolation test, corrected from the task's own
+verification text** (which would have wrongly expected handoff's
+`frames_used=6610` to hold — that number is handoff's own frame count,
+and both the transfer point and the geometry moved, so it is EXPECTED to
+change, not a regression signal): with master's XML (`git checkout
+20e1012 -- .../so101_dual_table.xml`, restored afterward, confirmed) plus
+the new constant, `scripts/verify_adr038_skills.py`'s three
+constant-independent skills reproduce byte-identically
+(`pick(A, fork)` 0.3989, `place(A, fork, table)` 0.3588,
+`pick(A, 'bottle')` 0.6192); `handoff(A→B, fork)` — which DOES read the
+constant — changed as expected (lateral 0.1946 m → 0.0399 m,
+`frames_used` 6610 → 3655) and now FAILS against the OLD 0.50 m geometry,
+which is the correct outcome for a constant measured for the NEW 0.40 m
+geometry, not a defect.
+
+**Step 2 — eight-skill retest.** Seed 0, oracle, fresh env + fresh executor
+per skill (ADR-047). **`cameras=[]` as literally specified in the task
+raises `AssertionError` at `executor.py:212`** (frozen, unmodified — oracle
+mode requires `TableSettingEnv(cameras=None)` exactly); used `cameras=None`
+instead, matching every other oracle-mode script in this repo, functionally
+identical (zero camera renders either way). **Result: 1 of 8 pass**
+(`pick(A, water_bottle)` only), versus 4 of 9 on master
+(`open_drawer` excluded, removed in Stage 2). **3 regressions**
+(`pick(A, fork)`, `place(A, fork, table)`, `handoff(A→B, fork)`) share one
+root cause: a waypoint-1 approach **collision** (cross-arm + arm-vs-table),
+not an IK failure — the new 0.40 m separation's shared workspace band is
+only ~14×15 cm (Stage 2's own measurement), and Stage 2's 5-item gate never
+checked the SWEPT approach path, only static endpoint configs. That is a
+real, newly-surfaced gap in that gate's coverage.
+
+For every one of the 4 distinct failure root causes (3 of the 8 results are
+downstream duplicates), `scripts/stage3_multiseed_diagnostic.py` ran the
+ADR-056/057 32-seed residual-distribution diagnostic:
+
+- `pick(A, fork)` waypoint 1: residuals **0.0029–0.0099 m at every
+  seed except one outlier** — never plateaus, because this was never an IK
+  problem; the collision happens at an otherwise fully-reachable pose.
+- `pick(A, mug)` waypoint 1: residuals **0.0056–0.0106 m**, no plateau.
+  Compare to master's OWN documented residual for this exact target,
+  **0.0532 m** (a genuine boundary there) — Stage 2's redesign **fixed**
+  mug's reachability outright; the new blocker
+  (`weld_attach_failed_after_300_frames`) is a downstream grip/weld
+  mechanism failure, not reachability.
+- `place(A, water_bottle, table)` destination: residuals **flat at
+  0.01502–0.01509 m across all 32 seeds** (variance ~3e-10) — a textbook
+  PLATEAU, i.e. still a genuine boundary, confirmed by the same method
+  that established it as genuine on master (0.0138 m there). Unfixed by
+  this redesign; very slightly worse (also sits at the table's x-extent
+  clamp).
+- `handoff(B→A, fork)` phase 1 (arm B picks fork): residuals **bimodal** —
+  roughly half the seeds at 0.0038–0.0100 m, half tightly clustered at
+  0.0303–0.0308 m. Compare to master's own documented residual for this
+  phase, **0.0954 m, 32/32 seeds identical** (ADR-057 Case 1, a hard
+  boundary there) — at the new geometry this is reachable by multiple
+  distinct configurations; the one `_run_waypoint`'s real physical drive
+  lands in happens to brush the plate by 0.3 mm. A local-minimum/routing
+  signature, not a kinematic wall.
+
+**Consequences.** Stated plainly, not softened: net skill count went from
+4/9 (master) to 1/8 (redesign) at seed 0 — a real regression in the
+headline pass count, traced to a genuine, newly-introduced collision class
+(tight shared-workspace approach paths) that Stage 2's static-endpoint gate
+could not have caught. Two previously-hard IK boundaries (mug pick,
+handoff B→A phase 1) are now confirmed-reachable and blocked by other,
+arguably more tractable problems (grip mechanism, approach routing) —
+real progress obscured by the headline number. One boundary
+(`place(A, water_bottle, table)`) is confirmed genuine twice over, on two
+different geometries, by the same method. No skill logic was changed to
+chase any of these numbers, per this stage's explicit rule. Full per-skill
+table, diagnostics, and verdicts: `docs/hardware/redesign-skill-retest.md`.
+
+**Source:** this commit ("Redesign Stage 3: eight-skill retest at 0.40 m
+geometry (ADR-060).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
