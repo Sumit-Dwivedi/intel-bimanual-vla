@@ -371,6 +371,28 @@ FRONT_CAM_POS_STR = "%.4f %.4f %.4f" % FRONT_CAM_POS
 # docs/hardware/redesign-skill-retest.md for the numbers). No change to
 # `ARM_GAP_Y`, prop placement, or the drawer removal -- this replaces ONLY
 # the home fold.
+# ---- ADR-061 (Redesign Stage 4, Step 3): a swept-path-scored home fold WAS
+# TRIED and REVERTED here -- reported, not hidden. `scripts/
+# search_home_keyframe_stage4.py` found a candidate (shoulder_pan=0.0883,
+# shoulder_lift=-1.5990, elbow_flex=-0.4966, wrist_flex=0.1613,
+# wrist_roll=-0.0473) that measurably reduced SWEPT-PATH violations (5/7 ->
+# 3/7 targets, both handoff directions newly clear) versus ADR-060's fold
+# below. Regenerating the scene with it and re-running the REAL eight-skill
+# functional retest (`scripts/stage4_eight_skill_retest.py`), however, found
+# 0/8 passing (down from ADR-060's 1/8) -- every skill now fails at GRIP
+# (`weld_attach_failed_after_300_frames`), including `pick(A, fork)`, whose
+# swept-path collision the new fold WAS measured to fix. Root cause,
+# reasoned from ADR-024: `ik.solve_position_ik` never controls END-EFFECTOR
+# ORIENTATION -- "whatever falls out of the redundant 5-joint solve is
+# accepted as-is". A different home fold seeds every downstream IK solve
+# from a different starting configuration, which changes which orientation
+# the redundant solver happens to land on at each grasp target, even when
+# the TARGET POSITION (what the swept-path gate scores) is identical and
+# collision-free. The swept-path gate has no way to see this -- it is a
+# position/collision check, not a grasp-orientation one -- so a home-fold
+# search driven ONLY by it can trade a real, working grasp angle for a
+# collision-clear but ungraspable one. Kept here as ADR-060's own fold,
+# UNCHANGED; the swept-path-scored alternative is not used.
 HOME_SHOULDER_PAN = 0.15752951354904826
 HOME_SHOULDER_LIFT = -0.9930387740421327
 # elbow_flex's compiled range is -1.69..1.69 rad (read from the upstream

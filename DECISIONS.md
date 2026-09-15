@@ -11,6 +11,113 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-061 — Redesign Stage 4: a validated swept-path collision gate built and hard-stop-checked against ground truth; 8-skill/41-waypoint diagnosis found 31 collisions, dominant category arm-vs-table by count; one geometry remedy (home-pose re-search scored by the gate) attempted, found to REGRESS real functional success (1/8 -> 0/8) and reverted; six-item gate 0/8, functional retest unchanged at 1/8
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign` · `master` unchanged at
+`20e1012`.
+
+**Step 1.** `scripts/check_swept_path.py`'s `swept_path_clear` interpolates
+in JOINT SPACE between a waypoint's start `qpos` and one IK solution at its
+target (never Cartesian-interpolate-and-resolve, per the task's explicit
+instruction that the latter models a different motion than the real
+controller executes), evaluates RAW `data.contact` at every step (never
+the ADR-058-distrusted `table_top` mesh filter), and reports contact pairs
+by geom name. Passed the mandatory ground-truth validation: on master's
+geometry, `pick(A, fork)` waypoint 1 reports CLEAR (worst_penetration
+-0.0019 m); on redesign's current geometry, the SAME check reports a
+COLLISION (worst_penetration -0.0114 m, cross-arm: `armA_wrist` vs
+`armB_upper_arm`/`armB_shoulder`) matching the collision CLASS Stage 3's
+real 500-step run independently reported. Two refinements were added
+beyond the literal single-IK-solution spec, both because the literal
+version measurably failed the ground-truth check otherwise (a hard-stop
+risk, not a style choice): (a) `num_endpoint_seeds=8` — a single
+unperturbed joint-space interpolation is provably collision-clear for
+`pick(A, fork)` waypoint 1 (0/101 steps), while the REAL closed loop (same
+start/target) drifts through the position-only solver's un-regularized
+null space (ADR-024) to a different branch and stalls in a genuine
+collision by step 168 — sampling several starting-seed perturbations (seed
+0 always unperturbed) is needed to see this; (b) `implausible_penetration_m
+=-0.15` — raw contact data occasionally reproduces the SAME convex-hull
+mesh artifact magnitude ADR-058/035 already documented (-0.39 m, -0.222 m)
+at certain interpolated poses; flagged as `suspected_artifact` and excluded
+from pass/fail rather than trusted at face value, a magnitude-only
+sanity bound, not a reintroduction of the distrusted filter.
+
+**Step 2.** `scripts/diagnose_swept_path.py` monkeypatches
+`skills_scripted._run_waypoint`/`_run_dwell`/`run_pick` (captures the real
+waypoint chain, never edits the frozen file) to check the FULL intended
+approach sequence of all 8 skills regardless of where each currently fails
+functionally: **31 of 41 waypoints collide.** Category tally: (a)
+arm-vs-prop 13, (b) arm-vs-table 18, (c) arm-vs-arm 7, (d) self-collision
+6. **Dominant by count: (b) arm-vs-table** — 18 occurrences, nearly all a
+shallow, consistent ~-0.006 m graze recurring at almost every
+descend-to-grasp/destination waypoint regardless of (x, y) position (a
+static-finger-pad-vs-table signature, not a single prop's placement).
+Flagged explicitly: count alone hides that (a) contains the single most
+severe violations measured (`pick(A, water_bottle)`'s wrist ramming
+`water_bottle_body` by -0.098 m, consistent across every sampled seed,
+already past `CRUSH_THRESHOLD_M`) and (c)/(d) concentrate almost entirely
+in `handoff`'s transfer-point approach and the first hop from home,
+consistent with ADR-058's own too-narrow-shared-band finding.
+
+**Step 3.** `scripts/verify_stage4_gate.py` extends Stage 2's 5-item gate
+with item 6 (full approach-sequence swept-path clear from home, reusing
+Step 2's own capture). On Stage 3's geometry: **0/8** — materially
+stricter than the 1/8 functional pass rate, since the gate's multi-seed
+sampling flags theoretical null-space branches the real single-seed run
+does not necessarily hit. Remedy attempted:
+`scripts/search_home_keyframe_stage4.py` re-runs `search_home_keyframe.py`'s
+own `evaluate_candidate` UNCHANGED plus a new swept-path score (300
+candidates tried, 187 passed static criteria, score distribution
+`{2:3, 3:47, 4:62, 5:54, 6:14, 7:7}` violations-of-7-targets at search
+fidelity). Best candidate, full-fidelity re-verified: 3/7 violations (down
+from Stage 3's fold's 5/7) — fork, spoon and BOTH handoff directions newly
+clear. **Regenerated into the scene and retested for real: functional
+success REGRESSED 1/8 -> 0/8**, every skill now failing at GRIP
+(`weld_attach_failed_after_300_frames`), including `pick(A, fork)`, whose
+specific collision the new fold WAS measured to fix. Root cause: the
+swept-path gate scores end-effector POSITION only; `ik.solve_position_ik`
+never controls orientation (ADR-024), so a different home fold changes
+which orientation the redundant solver lands on at each target even when
+the position is identical and collision-clear — **a real, previously
+unknown blind spot in position-only swept-path gates.** REVERTED (confirmed
+`src/bimanual/sim/assets/so101_dual_table.xml` restored byte-identical to
+redesign's committed geometry); the attempted fold is recorded in a comment
+in `scripts/gen_dual_scene.py`, not silently discarded. No further
+geometry change was attempted after this regression, given the freshly
+demonstrated risk of iterating against a gate with a known blind spot and
+this stage's remaining time. **Six-item gate: 0/8 on both geometries** —
+short of the task's own ≥6/8 target and of master's 4/9 functional count;
+per the task's explicit rule, reported as the signal to stop, not to keep
+iterating.
+
+**Step 4.** Full 8-skill retest, seed 0, oracle mode, `cameras=None`, fresh
+env + fresh executor per skill (ADR-047) — identical harness to Stage 3.
+Because Stage 4's net geometry change is nil (the one attempted change was
+reverted), results are, as expected and confirmed by direct re-run,
+byte-identical to Stage 3's: **1/8 pass.** `git diff master..redesign --
+src/bimanual/control/skills_scripted.py` still shows exactly the one
+`HANDOFF_POSITION_XYZ` line; `grasp.py`/`ik.py`/`executor.py`/`env.py`
+confirmed zero diff against master. Full tables and per-diagnostic detail:
+`docs/hardware/redesign-stage4.md`.
+
+**Consequences, stated plainly.** A real, validated gate-coverage gap
+(swept-path collision) that Stage 2 could not see is now built, checked
+against ground truth, and used to diagnose all 8 skills' full approach
+sequences, not just the 3 that happened to fail Stage 3's functional test.
+The one geometry remedy attempted was measured, not assumed, to make real
+behaviour WORSE despite improving the gate's own score — a finding worth
+having even though it did not move the headline number, because it
+identifies a class of fix (position-only geometry search) that cannot be
+trusted alone without a grasp-orientation check this stage's frozen files
+put out of scope. Net numbers: functional 1/8 (unchanged from Stage 3, still
+short of master's 4/9), six-item gate 0/8 (short of the ≥6/8 target).
+
+**Source:** this commit ("Redesign Stage 4: swept-path gate, geometry
+re-placed (ADR-061).").
+
+---
+
 ## ADR-060 — Redesign Stage 3: home pose swapped after a 200-candidate robustness check; `HANDOFF_POSITION_XYZ` moved to Stage 2's measured centroid; eight-skill retest — 1 of 8 pass, 3 regressions, 2 boundaries resolved to a different mechanism, 1 boundary reconfirmed
 
 **Ratified:** Sept 15, 2026 · **Branch:** `redesign` · `master` unchanged at
