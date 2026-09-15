@@ -11,6 +11,70 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-056 — Optional random-restart (multi-seed) capability added to `solve_position_ik`; `num_seeds=1` regression gate reproduces byte-identical on bm-ptl before/after; `num_seeds=32` measured against ADR-034's known-failing water-bottle place target finds NO improvement
+
+**Ratified:** Sept 15, 2026 · **Follows:** ADR-024 (the DLS solve wrapped
+here, unmodified), ADR-025 (pinch-point targeting, unmodified), ADR-035
+(the `2115a1e` warm-start diagnostic's local-minimum finding, 0.14633 m →
+0.00956 m across one 2 cm grid step — corrected here from the task
+brief's own "ADR-045" citation for this finding, which is actually M10
+Phase 4's unrelated PoseNet conversion entry), ADR-034 (the specific
+known-failing target this ADR's own measurement reuses).
+
+New keyword-only `num_seeds: int = 1` and `seed_noise_rad: float = 0.15`
+on `solve_position_ik`; `IKSolution` gained `winning_seed: int = 0`
+(defaulted, its one existing construction site unaffected). Seed 0 is
+always the unperturbed current configuration, run through the exact
+pre-existing statement sequence with no RNG constructed at `num_seeds=1`
+— both runtime callers (`skills_scripted.py:873`, `:1208`) call
+positionally with no keyword args and cannot reach either new parameter.
+Seeds 1..N-1 perturb this arm's 5 joints only by `U(-seed_noise_rad,
++seed_noise_rad)` rad (clipped to `jnt_range`), reusing the identical DLS
+loop; the lowest-residual result across all seeds wins. The RNG seed is
+derived from pure integer arithmetic on `ord(arm)` and the target's
+micron-rounded xyz — deliberately not Python's `hash()`, which salts
+strings per-process (`PYTHONHASHSEED`) and would break cross-machine
+reproducibility (ADR-047's own named risk).
+
+**Regression gate: PASSES, byte-identical on bm-ptl before/after**
+(modified `ik.py` `scp`'d into the working tree pre-commit, so the AFTER
+gate ran before this commit existed; only then committed and pushed from
+the laptop). `scripts/verify_adr038_skills.py`: fork z 0.3560 → 0.3989,
+place final z 0.3588, bottle z 0.4400 → 0.6192, handoff lateral 0.1946 m,
+`frames_used=6610` — all unchanged. `pytest tests/test_skills.py`: 4
+passed / 4 failed both runs, including the identical 0.0532 m residual in
+the same failing assertion.
+
+**Measurement, not a fix: `num_seeds=32` (CuRobo's own cited default) on
+ADR-034's `place(A, water_bottle, table)` destination-approach target
+(`[0.300, 0.00077, 0.430]`, x on the place path's own `+0.30` clip bound)
+finds NO improvement** — residual 0.0138 m at both `num_seeds=1` and
+`num_seeds=32`, `winning_seed=0` (none of 31 extra restarts beat the
+unperturbed seed), matching ADR-034's own figure exactly. This is
+evidence AGAINST the local-minimum reading at this specific point (more
+consistent with ADR-034's own clip-bound observation of a true reach
+limit) — not proof, since a wider noise radius or a different restart
+basis was not tried. New `scripts/probe_ik_num_seeds32.py`; not wired
+into `place` or any other skill, which still fails exactly as ADR-034
+documented.
+
+**References (user-supplied, cited as such — not fetched, not described
+beyond the claim attributed to each, same discipline as ADR-037/ADR-041):**
+MATLAB Robotics System Toolbox,
+https://www.mathworks.com/help/robotics/ug/inverse-kinematics-algorithms.html
+(random restart as standard practice; CuRobo's `num_seeds=32` default);
+https://arxiv.org/pdf/2606.15918 (local-minimum vs. true-reach-limit
+signature: genuine unreachability ~10 cm median, vs. this project's
+~1.4x-threshold misses); ManiBox, https://arxiv.org/pdf/2411.01850 (IK
+baseline context, 68.75% ± 5.10% on full workspace).
+
+**Not done:** no change to `skills_scripted.py`, `grasp.py`,
+`executor.py`, `env.py`, `randomization.py`, `scenes/so101/`,
+`gen_dual_scene.py`, `SUBMISSION.md`, or requirements files; `num_seeds`
+not wired into any skill. Full account: `ARCHITECTURE.md`.
+
+---
+
 ## ADR-055 — Perception-in-loop demo: `pick(A, fork)` run end to end with PoseNet driving its grasp-point targeting (M10 Phase 5 wiring, GPU FP16) — PASSES on oracle ground truth, reproducing ADR-046's own 8.4 mm outcome delta to within 0.03 mm
 
 **Ratified:** Sept 15, 2026 · **Follows:** ADR-046 (M10 Phase 5's

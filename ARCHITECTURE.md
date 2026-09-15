@@ -5351,6 +5351,156 @@ pick(A, fork) (ADR-055).").
 
 ---
 
+### ADR-056 — Optional random-restart (multi-seed) capability added to `solve_position_ik`; `num_seeds=1` regression gate reproduces byte-identical on bm-ptl before/after; `num_seeds=32` measured against ADR-034's known-failing water-bottle place target finds NO improvement, reported as evidence for a genuine reachability boundary there, not fixed
+
+**Ratified:** Sept 15, 2026 · **Modifies:** `src/bimanual/control/ik.py`
+only, plus this file, `DECISIONS.md`, and a new
+`scripts/probe_ik_num_seeds32.py`, per task scope. **Follows:** ADR-024
+(the position-only DLS solve this restart loop wraps, unmodified), ADR-025
+(pinch-point targeting, unmodified), ADR-035 (the `2115a1e` warm-start
+diagnostic's local-minimum finding — corrected here from the task brief's
+own citation of "ADR-045" for this finding, which is actually M10 Phase
+4's unrelated PoseNet OpenVINO conversion entry; same citation-correction
+discipline as ADR-055's own mid-batch number fix), ADR-034 (the specific
+known-failing `place(A, water_bottle, table)` destination-approach target
+this ADR's own measurement reuses, residual 0.0138 m against the 0.010 m
+tolerance).
+
+**What changed, and why it is backward compatible by construction.**
+`solve_position_ik(model, data, arm, target_pos, *, max_iters, tol,
+damping, step_scale)` already took every tunable after a bare `*` —
+keyword-only. Two new keyword-only parameters, `num_seeds: int = 1` and
+`seed_noise_rad: float = 0.15`, were added the same way. Both runtime
+callers (`skills_scripted.py:873`, inside `_drive_to_target`'s per-step IK
+call, and `:1208`) call `ik.solve_position_ik(env.model, env.data, arm,
+target)` positionally with no keyword arguments at all — confirmed by
+direct inspection of both call sites, not assumed from the function
+signature alone — so they cannot reach `num_seeds` or `seed_noise_rad` and
+are structurally unaffected, not merely empirically unaffected.
+`IKSolution` (a `@dataclass`) gained one new field, `winning_seed: int =
+0`, defaulted so its one existing construction site — confirmed the only
+one in the repo via `grep -rn "IKSolution("` — needed no change beyond
+adding the field.
+
+**Seed 0 is always the unperturbed current configuration — unchanged from
+every call before this ADR.** The refactor pulls the existing DLS loop
+into a nested `_solve_from(seed_overrides)` closure, called once
+unconditionally for seed 0 with `seed_overrides=None`. That code path runs
+the exact same statement sequence as the pre-ADR-056 function body
+(`scratch.qpos[:] = data.qpos`, zero `qvel`, one `mj_forward`, then the
+same iterate-until-tol-or-max_iters loop with identical tolerance,
+damping, and step_scale) — `num_seeds=1` never even constructs an RNG.
+This is what makes the regression gate below a legitimate byte-identical
+check rather than an approximate one.
+
+**Seeds 1..num_seeds-1** perturb the CURRENT qpos of this arm's 5
+positioning joints only (not the other arm, not the props) by
+`U(-seed_noise_rad, +seed_noise_rad)` radians per joint, clipped to that
+joint's own `jnt_range`, then re-run the identical `_solve_from` loop from
+that perturbed start. The lowest-`position_error_m` result across every
+seed tried (including seed 0) is returned, with its index recorded on
+`IKSolution.winning_seed`.
+
+**Reproducible seeding, deliberately not Python's `hash()`.** The restart
+draws come from one `numpy.random.default_rng(seed)` per call, where
+`seed = (ord(arm) * 1_000_003 + micron_x*7 + micron_y*13 + micron_z*17) %
+2**32` and `micron_*` are the target position's xyz rounded to the nearest
+micron. Python's built-in `hash()` on a string (`arm`) is salted
+per-process by `PYTHONHASHSEED` unless explicitly pinned, which would make
+the identical `(arm, target_pos)` call draw different perturbations on
+different machines, or even different runs on the same machine — exactly
+the cross-machine float divergence ADR-047 already names as a live risk in
+this project. The formula used instead is pure integer arithmetic with no
+string hashing, so it is deterministic across processes and machines by
+construction, not merely by not yet having been observed to differ.
+
+**Regression gate — PASSES, byte-identical before and after, on bm-ptl.**
+Procedure: the modified `ik.py` was `scp`'d directly into bm-ptl's working
+tree (not committed or pushed first), so the AFTER gate could run before
+this commit existed at all; only once it passed was the change committed
+and pushed from the laptop. `scripts/verify_adr038_skills.py`, BEFORE:
+pick(A, fork) fork z 0.3560 → 0.3989; place(A, fork, table) final z
+0.3588; pick(A, 'bottle') bottle z 0.4400 → 0.6192; handoff(A→B, fork)
+lateral 0.1946 m, `frames_used=6610`. AFTER: **identical to four decimal
+places on every one of those five numbers.** `pytest
+tests/test_skills.py`, BEFORE and AFTER: **4 passed / 4 failed**, both
+times, including the identical failing assertion in
+`test_handoff_mug_ends_held_by_arm_b` (`IK residual=0.0532 m >= 0.01 m`,
+same figure to four decimal places both runs) — confirmed line-by-line,
+not just pass/fail-count-matched.
+
+**Measurement, not a fix: `num_seeds=32` on ADR-034's own known-failing
+target finds no improvement.** New `scripts/probe_ik_num_seeds32.py`
+reproduces ADR-034's own diagnostic
+(`scripts/probe_place_waypoint1_diag.py`) target computation exactly:
+`pick(A, water_bottle)`, then `place`'s own `approach_above_dest` for the
+destination waypoint (`[0.300, 0.00077, 0.430]` at seed 0 — x sits exactly
+on `run_place`'s own `+0.30` safety clip bound, the same landing ADR-034
+already flagged as suggestive of a genuine reachability edge).
+`num_seeds=1`: residual **0.0138 m**, `converged=False`, `winning_seed=0`
+— matches ADR-034's own reported 0.0138 m exactly, confirming this probe
+measures the same failure. `num_seeds=32` (CuRobo's own cited default,
+see references below): residual **0.0138 m**, `converged=False`,
+`winning_seed=0` — **identical to four decimal places; none of the 31
+additional restarts, at `seed_noise_rad=0.15` rad, found a better
+configuration than the unperturbed seed 0.** This is reported as a data
+point AGAINST the local-minimum reading at this specific target, not for
+it: 32 restarts spanning ±0.15 rad per joint from the current pose finding
+literally nothing better is more consistent with a genuine kinematic
+reach limit at this exact point (consistent with ADR-034's own clip-bound
+observation) than with an escapable local minimum — though a wider
+`seed_noise_rad` or a restart basis other than "near the current pose"
+was not tried here, so this is evidence, not proof, either way. **Not
+wired into any skill** — `place(A, water_bottle, table)` still fails
+exactly as ADR-034 documented, unchanged, since `skills_scripted.py` was
+not touched.
+
+**This project's own evidence, not the citations below, drives the
+"local minima are real somewhere in this codebase" half of this ADR's
+motivation.** ADR-035's own warm-start diagnostic
+(`docs/hardware/m06-handoff-warmstart-diagnostic.md:16`, commit
+`2115a1e`) found the SAME target's residual jump from 0.14633 m (FAIL,
+home-seeded) to 0.00956 m (converged) across a single 2 cm step in y, with
+no target change — a ~15.3x discontinuity that is a local-minimum
+signature, not a workspace-boundary signature (a true edge would show the
+residual growing smoothly as the target approaches it, not swinging by an
+order of magnitude one grid step inside an already-converged region).
+That finding is what motivated adding `num_seeds` as a general-purpose
+tool; this ADR's own `num_seeds=32` measurement above shows the tool does
+not rescue every open failure in this repo (the water-bottle place target
+above looks like the other kind, a true limit) — the honest, disclosed
+result, not a claim that random restarts fix everything.
+
+**References (user-supplied, cited as such — not fetched, not verified,
+and not described beyond the specific claim the task attributed to each;
+same discipline as ADR-037's ScienceDirect citation and ADR-041's Syn4D
+citation):**
+- MATLAB Robotics System Toolbox docs,
+  https://www.mathworks.com/help/robotics/ug/inverse-kinematics-algorithms.html
+  — cited for random-restart IK being standard practice; CuRobo cited as
+  defaulting to `num_seeds=32` (the count `probe_ik_num_seeds32.py` uses,
+  for that reason and no other).
+- https://arxiv.org/pdf/2606.15918 — cited for a local-minimum-vs-true-
+  reach-limit signature: genuine unreachability said to miss by ~10 cm
+  median, against which the task frames this project's own misses (e.g.
+  ADR-034's 0.0138 m against a 0.010 m tolerance) as ~1.4x the threshold,
+  not ~10 cm.
+- ManiBox, https://arxiv.org/pdf/2411.01850 — cited for IK baseline
+  context: 68.75% ± 5.10% success on full workspace.
+
+**Not done.** No change to `skills_scripted.py`, `grasp.py`, `executor.py`,
+`env.py`, `randomization.py`, `scenes/so101/`, `gen_dual_scene.py`,
+`SUBMISSION.md`, or any requirements file. `num_seeds` is not wired into
+any skill's call site — `pick`, `place`, `handoff`, `open_drawer` all
+still call `solve_position_ik` with `num_seeds=1` (the implicit default
+via positional calls), so no skill's measured behaviour changes as a
+result of this commit.
+
+**Source:** this commit ("IK: optional multi-seed random restarts
+(ADR-056).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

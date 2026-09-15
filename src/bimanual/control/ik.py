@@ -51,6 +51,22 @@ the current subgoal, write the result as one step of actuator targets, let
 never mutate `env.data` directly -- only `env.step()` may advance the real
 simulation -- so every call works on a throwaway `mujoco.MjData` copy that
 starts from the real data's current `qpos` and is discarded afterward.
+
+**Optional random-restart multi-seed IK (ADR-056, opt-in).** The single-seed
+DLS solve above can converge to a local minimum instead of a true reach
+failure -- ADR-045's warm-start diagnostic found a 15x residual jump
+(0.14633 m to 0.00956 m) across one 2 cm grid step, which is a local-minimum
+signature, not what a workspace boundary looks like. `num_seeds` (default 1,
+a genuine no-op -- see below) reruns the SAME unmodified DLS loop from
+multiple starting joint configurations and keeps the lowest-error result.
+Seed 0 is always `data`'s current qpos, unperturbed -- identical to every
+call before ADR-056. Seeds 1..num_seeds-1 perturb that starting point by
+`U(-seed_noise_rad, +seed_noise_rad)` radians per joint (clipped to that
+joint's `jnt_range`), drawn from a `numpy.random.default_rng` seeded
+deterministically from `(arm, target_pos)` -- see `solve_position_ik`'s
+docstring for the exact derivation. Nothing about the DLS solver itself
+(tolerance, damping, iteration count, or the ADR-025 pinch-point targeting)
+changes; this only adds an outer loop that calls it more than once.
 """
 
 from __future__ import annotations
@@ -231,12 +247,22 @@ class IKSolution:
             exhausting `_IK_MAX_ITERS`).
         converged: True if `position_error_m < tol` when the solve stopped.
         iterations: Number of Newton/DLS iterations actually run.
+        winning_seed: Index (0..num_seeds-1) of the random-restart seed
+            (ADR-056) whose solve produced this result. Always 0 when
+            `num_seeds=1` (the default) -- seed 0 is always the unperturbed
+            current configuration, so a caller that never passes
+            `num_seeds` sees this field permanently at its default and
+            everything else about `IKSolution` unchanged. Defaulted here
+            so the one pre-ADR-056 construction site below, and any other
+            code that builds an `IKSolution` directly, keeps working
+            without naming this field.
     """
 
     joint_angles: np.ndarray
     position_error_m: float
     converged: bool
     iterations: int
+    winning_seed: int = 0
 
 
 def _name2id_or_raise(model, obj_type, name: str) -> int:
@@ -256,6 +282,8 @@ def solve_position_ik(
     tol: float = IK_POSITION_TOLERANCE_M,
     damping: float = _IK_DAMPING,
     step_scale: float = 1.0,
+    num_seeds: int = 1,
+    seed_noise_rad: float = 0.15,
 ) -> IKSolution:
     """Solve for the 5 joint angles of `arm` that place its PINCH POINT
     (ADR-025: the midpoint between the fixed and moving jaw bodies, computed
@@ -276,6 +304,36 @@ def solve_position_ik(
     the moving jaw's ACTUAL current position (e.g. mid-close) rather than
     wherever it was when the solve began.
 
+    **Random restarts (ADR-056, opt-in via `num_seeds`).** With
+    `num_seeds=1` (the default), this function does exactly what it always
+    did: one DLS solve from `data`'s current qpos, unperturbed. This is a
+    GENUINE no-op, not an approximate one -- the seed-0 code path below
+    performs the identical sequence of operations (same scratch-copy, same
+    loop, same arithmetic) that this function ran before ADR-056 existed.
+    With `num_seeds > 1`, seeds 1..num_seeds-1 additionally perturb the
+    starting joint angles by `U(-seed_noise_rad, +seed_noise_rad)` radians
+    per joint (clipped to that joint's `jnt_range`) and re-run the SAME
+    unmodified DLS loop from there; whichever seed (including seed 0) ends
+    with the lowest `position_error_m` is returned, and its index is
+    recorded on `IKSolution.winning_seed`. This does not change the solver
+    itself (same tolerance, damping, iteration count, pinch-point target) --
+    it only tries the existing solver from more starting points and keeps
+    the best result, which is standard practice for avoiding local minima
+    in numerical IK (see ADR-056 for citations and the reasoning that
+    motivated this).
+
+    Reproducibility: the perturbation draws come from a single
+    `numpy.random.default_rng` seeded deterministically from `(arm,
+    target_pos)` -- see the "Seed derivation" comment inline below for the
+    exact integer formula. Deliberately NOT Python's built-in `hash()`:
+    that salts string hashes with a per-process random value
+    (`PYTHONHASHSEED`) unless explicitly pinned, which would make the same
+    `(arm, target_pos)` pair draw different perturbations on different
+    runs/machines -- exactly the kind of cross-machine divergence ADR-047
+    warns about. The formula here uses only integer arithmetic on `ord(arm)`
+    and the target's micron-rounded coordinates, so the same call always
+    seeds the same way, on any machine, in any process.
+
     Args:
         model: Compiled `mujoco.MjModel` for the dual-arm scene.
         data: The live `mujoco.MjData` to read the CURRENT joint angles from
@@ -283,14 +341,24 @@ def solve_position_ik(
         arm: "A" or "B".
         target_pos: Length-3 array-like, world-frame target position.
         max_iters, tol, damping, step_scale: Solver tuning; default to the
-            module-level constants above.
+            module-level constants above. Unchanged by ADR-056.
+        num_seeds: Number of restart attempts, including seed 0 (always the
+            unperturbed current configuration). Default 1 -- no restarts,
+            byte-identical to pre-ADR-056 behaviour. Both runtime callers in
+            `skills_scripted.py` call this function positionally with no
+            keyword arguments, so they always get `num_seeds=1` and are
+            unaffected by this parameter's existence.
+        seed_noise_rad: Half-width, in radians, of the uniform per-joint
+            perturbation applied to seeds 1..num_seeds-1. Unused when
+            `num_seeds=1`.
 
     Returns:
         An `IKSolution`. Even when `converged` is False (max_iters
-        exhausted), `joint_angles` holds the best configuration found -- the
-        caller (a skill's closed control loop) commands it anyway and lets
-        the NEXT control step's fresh solve correct further, exactly like a
-        real visual/proprioceptive servo loop.
+        exhausted on every seed tried), `joint_angles` holds the
+        lowest-error configuration found -- the caller (a skill's closed
+        control loop) commands it anyway and lets the NEXT control step's
+        fresh solve correct further, exactly like a real
+        visual/proprioceptive servo loop.
     """
     fixed_jaw_id = _name2id_or_raise(model, mujoco.mjtObj.mjOBJ_BODY, fixed_jaw_body_name(arm))
     moving_jaw_id = _name2id_or_raise(model, mujoco.mjtObj.mjOBJ_BODY, moving_jaw_body_name(arm))
@@ -301,61 +369,124 @@ def solve_position_ik(
     qpos_adrs = [int(model.jnt_qposadr[j]) for j in joint_ids]
     joint_ranges = [tuple(model.jnt_range[j]) for j in joint_ids]
 
-    # Scratch copy: mirrors `data`'s current qpos so the solve starts from
-    # wherever the real arm physically is right now, but every update below
-    # touches only this throwaway copy. `env.step()` is the only thing
-    # allowed to advance the real simulation.
-    scratch = mujoco.MjData(model)
-    scratch.qpos[:] = data.qpos
-    scratch.qvel[:] = 0.0
-    mujoco.mj_forward(model, scratch)
-
     target = np.asarray(target_pos, dtype=np.float64).reshape(3)
     # Separate Jacobian buffers per body: mj_jacBody writes into whatever
     # array it is given, and we need both bodies' translational Jacobians
     # simultaneously to average them below. jacr_* (rotational) is computed
-    # by the same call but unused here (position-only IK).
+    # by the same call but unused here (position-only IK). Shared across
+    # every seed's solve below -- mj_jacBody fully overwrites these each
+    # call, so there is no stale state to worry about between seeds.
     jacp_fixed = np.zeros((3, model.nv))
     jacr_fixed = np.zeros((3, model.nv))
     jacp_moving = np.zeros((3, model.nv))
     jacr_moving = np.zeros((3, model.nv))
 
-    def _pinch_point() -> np.ndarray:
-        # The pinch point is defined as the midpoint of the two jaw bodies'
-        # world-frame origins (mj_jacBody / xpos both refer to a body's own
-        # frame origin, not its center of mass, so this is consistent).
-        return 0.5 * (scratch.xpos[fixed_jaw_id] + scratch.xpos[moving_jaw_id])
+    def _solve_from(seed_overrides: np.ndarray | None) -> IKSolution:
+        """Run ONE full DLS solve, exactly as `solve_position_ik` always
+        has, from a scratch `MjData` seeded with `data`'s current qpos.
 
-    iterations = 0
-    err = target - _pinch_point()
-    for iterations in range(1, max_iters + 1):
-        err = target - _pinch_point()
-        if np.linalg.norm(err) < tol:
-            break
-
-        mujoco.mj_jacBody(model, scratch, jacp_fixed, jacr_fixed, fixed_jaw_id)
-        mujoco.mj_jacBody(model, scratch, jacp_moving, jacr_moving, moving_jaw_id)
-        jacp = 0.5 * (jacp_fixed + jacp_moving)  # Jacobian of the midpoint
-        jac = jacp[:, dof_ids]  # (3, 5): this arm's columns only
-
-        # Damped least squares: delta_q = J^T (J J^T + lambda^2 I)^-1 err.
-        # The damping term keeps the solve well-conditioned near
-        # singularities (e.g. a fully extended elbow) instead of producing
-        # huge, unstable joint steps there.
-        lam2 = damping * damping
-        delta = jac.T @ np.linalg.solve(jac @ jac.T + lam2 * np.eye(3), err)
-
-        for k, qadr in enumerate(qpos_adrs):
-            lo, hi = joint_ranges[k]
-            new_q = scratch.qpos[qadr] + step_scale * delta[k]
-            scratch.qpos[qadr] = float(np.clip(new_q, lo, hi))
+        `seed_overrides=None` (seed 0, always) skips straight to the
+        forward pass with NO extra write to `scratch.qpos` beyond the plain
+        `scratch.qpos[:] = data.qpos` copy -- this is the exact statement
+        sequence that ran before ADR-056, unchanged. `seed_overrides`, when
+        given (seeds 1..num_seeds-1 only), is this arm's 5 perturbed joint
+        angles, written into `scratch.qpos` at this arm's own addresses
+        before the first forward pass -- every other DOF in the scene (the
+        other arm, the props) stays exactly at `data`'s current value.
+        """
+        scratch = mujoco.MjData(model)
+        scratch.qpos[:] = data.qpos
+        if seed_overrides is not None:
+            for k, qadr in enumerate(qpos_adrs):
+                scratch.qpos[qadr] = seed_overrides[k]
+        scratch.qvel[:] = 0.0
         mujoco.mj_forward(model, scratch)
 
-    final_err = float(np.linalg.norm(target - _pinch_point()))
-    joint_angles = np.array([scratch.qpos[a] for a in qpos_adrs], dtype=np.float64)
-    return IKSolution(
-        joint_angles=joint_angles,
-        position_error_m=final_err,
-        converged=final_err < tol,
-        iterations=iterations,
-    )
+        def _pinch_point() -> np.ndarray:
+            # The pinch point is defined as the midpoint of the two jaw
+            # bodies' world-frame origins (mj_jacBody / xpos both refer to
+            # a body's own frame origin, not its center of mass, so this is
+            # consistent).
+            return 0.5 * (scratch.xpos[fixed_jaw_id] + scratch.xpos[moving_jaw_id])
+
+        iterations = 0
+        err = target - _pinch_point()
+        for iterations in range(1, max_iters + 1):
+            err = target - _pinch_point()
+            if np.linalg.norm(err) < tol:
+                break
+
+            mujoco.mj_jacBody(model, scratch, jacp_fixed, jacr_fixed, fixed_jaw_id)
+            mujoco.mj_jacBody(model, scratch, jacp_moving, jacr_moving, moving_jaw_id)
+            jacp = 0.5 * (jacp_fixed + jacp_moving)  # Jacobian of the midpoint
+            jac = jacp[:, dof_ids]  # (3, 5): this arm's columns only
+
+            # Damped least squares: delta_q = J^T (J J^T + lambda^2 I)^-1 err.
+            # The damping term keeps the solve well-conditioned near
+            # singularities (e.g. a fully extended elbow) instead of
+            # producing huge, unstable joint steps there.
+            lam2 = damping * damping
+            delta = jac.T @ np.linalg.solve(jac @ jac.T + lam2 * np.eye(3), err)
+
+            for k, qadr in enumerate(qpos_adrs):
+                lo, hi = joint_ranges[k]
+                new_q = scratch.qpos[qadr] + step_scale * delta[k]
+                scratch.qpos[qadr] = float(np.clip(new_q, lo, hi))
+            mujoco.mj_forward(model, scratch)
+
+        final_err = float(np.linalg.norm(target - _pinch_point()))
+        joint_angles = np.array([scratch.qpos[a] for a in qpos_adrs], dtype=np.float64)
+        return IKSolution(
+            joint_angles=joint_angles,
+            position_error_m=final_err,
+            converged=final_err < tol,
+            iterations=iterations,
+        )
+
+    # Seed 0: always the unperturbed current configuration. Computed first
+    # and unconditionally, so `num_seeds=1` returns EXACTLY this result --
+    # no RNG is even constructed in that case.
+    best = _solve_from(None)
+    best.winning_seed = 0
+
+    if num_seeds > 1:
+        # Seed derivation (see docstring "Reproducibility" section): pure
+        # integer arithmetic on `ord(arm)` and the target's micron-rounded
+        # xyz, deliberately avoiding Python's randomized `hash()` on
+        # strings. Rounding to the nearest micron (1e6) means floating-point
+        # noise far below anything physically meaningful cannot change
+        # which perturbations get drawn.
+        target_micron = np.round(target * 1_000_000.0).astype(np.int64)
+        seed = int(
+            (
+                ord(arm) * 1_000_003
+                + int(target_micron[0]) * 7
+                + int(target_micron[1]) * 13
+                + int(target_micron[2]) * 17
+            )
+            % (2**32)
+        )
+        rng = np.random.default_rng(seed)
+        base_qpos = np.array([float(data.qpos[a]) for a in qpos_adrs], dtype=np.float64)
+
+        for seed_idx in range(1, num_seeds):
+            noise = rng.uniform(-seed_noise_rad, seed_noise_rad, size=len(qpos_adrs))
+            perturbed = np.array(
+                [
+                    float(
+                        np.clip(
+                            base_qpos[k] + noise[k],
+                            joint_ranges[k][0],
+                            joint_ranges[k][1],
+                        )
+                    )
+                    for k in range(len(qpos_adrs))
+                ],
+                dtype=np.float64,
+            )
+            candidate = _solve_from(perturbed)
+            if candidate.position_error_m < best.position_error_m:
+                candidate.winning_seed = seed_idx
+                best = candidate
+
+    return best
