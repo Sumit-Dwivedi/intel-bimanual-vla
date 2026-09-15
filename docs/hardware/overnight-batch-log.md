@@ -1,14 +1,72 @@
 # Overnight batch log
 
-Findings and process notes from the overnight fix batch (Fixes A-F,
-ADR-053 through ADR-057 per the batch brief's corrected numbering — see
-"ADR numbering" below) that would otherwise have been written directly
+Findings and process notes from the overnight fix batch (Fixes E, B, C,
+the mid-batch guard fix, and F — ADR-052 through ADR-055 after renumbering,
+see the "ADR numbering note" in the summary below) that would otherwise have been written directly
 into `SUBMISSION.md`. The batch's own standing rule is **"DO NOT modify
 `SUBMISSION.md` until morning-user reviews"**, and that rule governs every
 fix in the batch, including any individual fix's own instructions that say
 otherwise. This file exists so nothing found overnight is lost before that
 review happens — morning-user should read this file and fold anything
 relevant into `SUBMISSION.md` by hand.
+
+---
+
+## Batch summary — five fixes landed, Fix D declined
+
+| Fix | Status | Commit | Time | Finding |
+|---|---|---|---|---|
+| **E** — batch scaling | COMPLETED | `3f7f8cb` (ADR-052) | ~13 min / 90 cap | GPU FP16 reaches **5800 Hz at batch 16** (3.42x over batch 1). NPU accepted static batch 4/8/16 — the M03 `STATUS_ACCESS_VIOLATION` crash did **not** reproduce, because that was a fully-open dynamic `-1` batch dim, not a static reshape. |
+| **B** — 20-seed sweep | COMPLETED | `c12273b` (ADR-053) | ~27 min / 120 cap | **`pick(A, bottle)` is 9/20 (45%), not 60%.** Seeds 0-9 reproduced ADR-049 bit-for-bit; seeds 10-19 scored only 3/10. The 10-seed figure was an optimistic small sample. |
+| **C** — chained demo | COMPLETED (negative) | `8c22893` (no ADR, per rule) | ~9 min / 120 cap | Chain fails at step 2: `run_handoff` Phase 1 re-picked an object `from_arm` already held. Cause located at `skills_scripted.py:2136`. No ADR opened, per the batch's own "no ADR on failure" rule. |
+| **guard** — already-held fix | COMPLETED | `de2302b` (ADR-054) | ~17 min / 90 cap | User-authorised mid-batch. ADR-034's guard applied to `run_handoff` Phase 1. All four skills byte-identical **including `frames_used=6610`**. Chain now advances past step 2 and fails one phase later at a genuinely new Phase 3 cross-arm collision. |
+| **F** — perception in loop | COMPLETED | `a20645d` (ADR-055) | ~16 min / 150 cap | **PoseNet drove `pick(A, fork)` to success**, graded on oracle ground truth. 2.19 mm perception delta, GPU FP16 0.590 ms, 1.487 s wall clock. Independently reproduces ADR-046's 8.4 mm outcome delta to within 0.03 mm. Video committed. |
+| **D** — INT8 sensitivity | **NOT RUN — DECLINED** | — | 0 / 180 cap | Declined by the user on two grounds. First, **ADR-050 already establishes INT8 as unsuitable** (36-37 mm deviation against the model's own 2.6-3.2 mm MAE); per-layer sensitivity would refine that explanation without changing the conclusion, since INT8 is not shipping either way. Second, it was the only remaining fix that **installs NNCF** — and unattended package installs are the single failure mode that has repeatedly threatened `ov_env`/`train_env` integrity across this project. Declining it removed that risk from an unattended run. |
+
+**ADR numbering note.** The batch brief numbered these ADR-053 through
+ADR-057. ADR-052 was actually free (highest existing was ADR-051), so the
+sequence shifted down by one: E=052, B=053, guard=054, F=055. Fix C opened
+no ADR because it failed, and Fix D was not run. No gap was left and no
+number was reused.
+
+---
+
+## Fix E — Batch scaling: throughput vs batch across CPU/iGPU/NPU (ADR-052)
+
+**Status:** COMPLETED · **Commit:** `3f7f8cb` · **Time:** ~13 min of a
+90-minute cap. Committed before this log file existed, which is why its
+detail appears here rather than being appended live like the later fixes.
+
+Benchmarked PoseNet FP16 at batch 1/4/8/16 on all three devices. The saved
+IR is static batch-1 (ADR-045), so it was reshaped via
+`core.read_model()` + `model.reshape({0: [N,3,224,224]})` before
+`compile_model` rather than reconverted.
+
+| Device | batch 1 | batch 16 | throughput gain |
+|---|---|---|---|
+| GPU | 0.59 ms / 1697 Hz | 2.76 ms / **5800 Hz** | **3.42x** |
+| NPU | 1.13 ms / 887 Hz | 10.83 ms / 1478 Hz | 1.67x |
+| CPU | 6.38 ms / 157 Hz | 69.25 ms / 231 Hz | 1.47x |
+
+GPU scales best by a wide margin. Batch-1 figures reproduce Phase 4's
+published table within run-to-run noise, which is a useful reproducibility
+signal in its own right.
+
+**A prediction that did not hold, recorded because it matters for anyone
+reading M03's warning.** All twelve (device, batch) combinations succeeded,
+**including NPU at batch 4/8/16**. The destructive `STATUS_ACCESS_VIOLATION`
+that M03 recorded — and that destroyed already-successful results written at
+the end of a run — did not reproduce. The reason is specific: M03's crash was
+on a **fully-open dynamic `-1` batch dimension**, whereas a static reshape to
+a fixed N is a narrower case this NPU/driver/OpenVINO build tolerates. The
+subprocess-per-combination isolation and immediate-write discipline were
+exercised on every row and never triggered; that the defence was unnecessary
+this time is not evidence it was unnecessary to build.
+
+Also corrected along the way: the M03 crash is documented in `DECISIONS.md`'s
+M03 entry, not verbatim in `docs/hardware/bmptl-verification.md` as the task
+brief stated. Both files were checked directly and the discrepancy is noted in
+ADR-052.
 
 ---
 
@@ -393,3 +451,117 @@ from bm-ptl-sourced PNGs) were committed and pushed from the laptop only
 standard pull-only PAT fetch (`git fetch ... master` then `git reset
 --hard FETCH_HEAD`) so laptop, origin and bm-ptl end this fix synced and
 clean.
+
+---
+
+## Final verification (end of batch)
+
+All run on **bm-ptl**, which is authoritative per ADR-047's cross-machine
+float divergence (the laptop reports 0.3987 where bm-ptl reports 0.3989 —
+pre-existing, unrelated to any batch work).
+
+**Environment integrity — both venvs clean and correctly isolated:**
+
+```
+[ov_env]     mujoco=3.2.7   openvino=2026.3.1  numpy=2.4.6  torch=absent
+[train_env]  mujoco=absent  openvino=2026.3.1  numpy=2.4.6  torch=2.14.0+xpu
+```
+
+`ov_env` still has no torch and `train_env` still has no mujoco, which is the
+separation ADR-042/ADR-043 established deliberately. Nothing was installed or
+upgraded anywhere during the batch.
+
+**Regression gate — byte-identical to the documented baseline:**
+
+```
+pick(A, fork)          fork z 0.3560 -> 0.3989
+place(A, fork, table)  released, final z 0.3588
+pick(A, bottle)        bottle z 0.4400 -> 0.6192
+handoff(A->B, fork)    lateral 0.1946 m, vertical 0.0046 m, frames_used=6610
+pytest tests/test_skills.py   4 passed / 4 failed (same four tests)
+```
+
+`frames_used=6610` is checked deliberately, not incidentally: if ADR-054's
+guard were firing in the standalone path, handoff would skip its own pick,
+still report success, and the frame count would collapse. It did not.
+
+**Sync:** laptop, `origin/master` and bm-ptl all at the same HEAD, all trees
+clean.
+
+---
+
+## For morning review
+
+### 1. A material inaccuracy in SUBMISSION.md — highest priority
+
+`SUBMISSION.md:119` (the Robustness row of the evidence map) reads:
+
+> Three skills — pick(A, fork), place(A, fork, table), pick(A, water_bottle)
+> — tolerate roughly +/-10-20 mm of their own target prop's placement noise,
+> **10/10 across seeds** (Track A, ADR-049).
+
+**pick(A, water_bottle) was never 10/10.** ADR-049's Track A measured it at
+**6/10**, and Fix B's 20-seed sweep now puts it at **9/20 (45%)**. The
+sentence groups three skills under a figure that is true for only two of
+them. This predates the batch — it came in with the evidence map — and it
+sits in the scored document, so it is worth fixing first. SUBMISSION.md was
+deliberately left untouched overnight per the batch rule.
+
+Suggested correction: pick(A, fork) and place(A, fork, table) at 20/20
+(Fix B), pick(A, water_bottle) at 9/20 (45%), citing ADR-053 alongside
+ADR-049.
+
+### 2. Every file that still states the stale bottle figure
+
+Most are correct as historical records. Two are worth acting on.
+
+| File | Line | Status |
+|---|---|---|
+| `SUBMISSION.md` | 119 | **Wrong — see item 1.** |
+| `docs/hardware/m08-eval.md` | 164, 241, 347 | **Worth a forward pointer.** The original M08 report, deliberately not modified. But it contains **no reference to the extended eval**, so a reader who opens only this file takes away 60%. A one-line cross-reference to `m08-extended-eval.md` would close that. |
+| `docs/hardware/m07-envelopes.md` | 270, 302 | Historical — M07's own 10-seed envelope measurement. Correct in context. |
+| `ARCHITECTURE.md` / `DECISIONS.md` | ADR-049 entries | Historical — correct as the record of what ADR-049 measured. |
+| `ARCHITECTURE.md` / `DECISIONS.md` | ADR-053 entries | Already show 9/20 (45%) against 6/10 (60%) explicitly. Correct. |
+| `docs/hardware/m08-extended-eval.md` | 123 | The supersession itself. Correct. |
+| `README.md` | — | States no success rate. Nothing to change. |
+
+### 3. New artifacts available for video and slides
+
+- **`docs/videos/perception-demo.mp4`** (70 KB) — PoseNet driving
+  `pick(A, fork)` on the Intel Arc B390. The strongest new asset: it shows
+  perception-driven control on Intel silicon, which nothing else in the repo
+  demonstrates visually.
+- **Batch scaling table** in `docs/hardware/m10-phase4-benchmark.md` — GPU
+  FP16 at **5800 Hz, batch 16**. A better headline number than the batch-1
+  1465 Hz currently quoted.
+- **`docs/videos/m06-handoff-clip.mp4`** (503 KB) — committed earlier, still
+  carrying the known caveat that only its last ~0.5 s reads as a handoff
+  (camera pinned to the final gripper pose). Use the still as primary.
+- **`scripts/chained_demo.py`** — not a success artifact, but a clean
+  reproduction of the composition limit, worth having if a judge asks whether
+  the skills compose.
+
+### 4. WIP branches to delete
+
+`fix-B-wip` exists **both locally and on `origin`**. Its work is fully merged
+into `c12273b`, so both copies are safe to delete:
+
+```
+git branch -D fix-B-wip
+git push origin --delete fix-B-wip
+```
+
+No other `fix-*-wip` branches were created — the remaining fixes each
+completed inside their caps without needing a checkpoint.
+
+### 5. Standing caveats unchanged by this batch
+
+- `handoff` still tolerates nothing: 0/10 under prop displacement (ADR-049),
+  fails at a 2.2 mm perception offset (ADR-046), 1/5 at +/-0.003 rad
+  arm-angle noise (ADR-051 section 9). No robustness adjective belongs on it.
+- The chain still does not compose end to end. ADR-054 moved the failure from
+  step 2 to a Phase 3 cross-arm collision; that is progress in diagnosis, not
+  a working chain.
+- PoseNet remains **opt-in**; the demo path still uses oracle positions by
+  default (ADR-046). Fix F demonstrates perception working, it does not make
+  it the default.
