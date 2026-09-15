@@ -5773,6 +5773,114 @@ measurement.").
 
 ---
 
+### ADR-059 — Redesign Stage 2: base separation swept and reduced to 0.40 m (from 0.50 m), all geometry replaced inside the measured workspace, home keyframe re-derived by search; drawer removed after a measured footprint collision; supersedes ADR-021 (base placement) and ADR-025/ADR-026 (home keyframe) **on the `redesign` branch only**
+
+**Recorded:** Sept 15, 2026 · **Branch:** `redesign` (`master` unchanged at
+`20e1012`). **Modifies:** `scripts/gen_dual_scene.py`, the generated
+`src/bimanual/sim/assets/so101_dual_table.xml`, two new probe scripts
+(`scripts/sweep_base_separation.py`, `scripts/search_home_keyframe.py`,
+`scripts/verify_stage2_gate.py`), this file, `DECISIONS.md`,
+`docs/hardware/redesign-geometry.md`. **Does NOT modify**
+`skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`, `env.py`, per this
+stage's explicit rules. Provenance: bm-ptl (ADR-047).
+
+**Context.** ADR-058 (Stage 1) measured, empirically, that the current
+0.50 m base separation has NO contiguous both-arms-reachable region >= 10 x
+10 cm at any tested height — the largest is a band ~4 cm x 32 cm, short
+axis never exceeding ~9 cm. Tracing `scripts/measure_workspace.py:291`'s
+`grid[y, x]` construction shows the **short axis is Y**, the same axis the
+two bases are separated along — so reducing base separation is the
+correctly-targeted fix, not a guess (had the short axis been X, this would
+not have helped).
+
+**Step 1 — sweep.** `scripts/sweep_base_separation.py` regenerated a
+scratch scene per candidate separation (0.50 down to 0.15 m in eight
+steps, monkeypatching `gen_dual_scene.ARM_GAP_Y`/`DEST`, the scratch XML
+deleted after every use — no intermediate scene committed) and re-ran the
+both-arms intersection at **N=300000/arm** (the density Stage 1's own
+densification check required for a trustworthy answer). Selection rule:
+largest separation with >=1 z-slice (z>=0.40 m) producing a contiguous
+rectangle >= 12x12 cm. Result: 0.50 m and 0.45 m both have ZERO qualifying
+slices (confirming Stage 1's finding was not a fluke of the exact heights
+tested); **0.40 m is the largest separation that qualifies** (two slices:
+z=0.43 -> 15x13 cm, z=0.49 -> 14x15 cm). Full per-separation table in
+`docs/hardware/redesign-geometry.md`.
+
+**Step 2 — geometry.** `ARM_GAP_Y` 0.25 -> 0.20 (0.40 m separation). Every
+prop (`plate`, `mug`, `fork`, `spoon`, `bottle`) shifted in Y by exactly the
+Y-delta of its assigned grasping arm's base (`plate`/`fork`/`bottle` -> arm
+A, `mug`/`spoon` -> arm B — a documented assumption, not read from a
+TaskPlan for these specific props), which provably preserves each prop's
+position relative to its own arm's frame, and therefore its single-arm
+reachability margin, without re-deriving it from the point cloud —
+confirmed by Step 4 item 3 below. **`HANDOFF_POSITION_XYZ` was NOT
+updated**: the task's Step 2 text groups it with the `gen_dual_scene.py`
+edits, but it is actually defined in the FROZEN `skills_scripted.py`. This
+contradiction is flagged, not silently resolved by breaking either rule;
+the existing constant was verified (Step 4) to still pass at the new
+separation, and the sweep's own candidate centroid
+`(-0.035, 0.000, 0.49)` is recorded in the report for a future pass once
+the planner resolves the conflict.
+
+**Drawer: REMOVED.** Stage 1's z-sliced tables only ever covered z>=0.35 m
+(tabletop and up) — the drawer's old sub-tabletop position (z=0.28) was
+never measured by that analysis at all. "Raise to tabletop height"
+(`DRAWER_HOUSING_Z = TABLE_TOP_Z + 0.05`) was tried first and compiled, but
+measured 13 contacts >1 mm against `plate`/`fork`/`spoon`'s rest positions
+(the raised housing's footprint overlaps the shared prop band) — resolving
+that and re-verifying the full gate again did not fit the remaining time
+under this stage's hard 120-minute cap, so the drawer (body, joint, camera)
+is removed rather than shipped with a known collision. `open_drawer` is not
+supported by this scene; this is a real, stated capability loss.
+
+**Step 3 — home keyframe by search.** `scripts/search_home_keyframe.py`
+samples candidate (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex,
+wrist_roll) 5-tuples (identical on both arms, per ADR-026's own same-sign
+finding), scoring each via `mj_forward` + direct `data.contact` enumeration
+(self-collision, cross-arm contact, table penetration >1 mm, arm-vs-prop
+contact) plus IK convergence (<0.005 m) from that pose to every prop's
+grasp point and the handoff point. ADR-026's own fold
+`(0, -1.2, -1.6, 0, 0)` was tried first (candidate 0) and did NOT pass at
+the new separation — confirming it needed re-deriving. Candidate 1 (the
+first random draw) passed every criterion simultaneously; the search
+stopped after **2 candidates**:
+`(shoulder_pan=0.05402, shoulder_lift=-1.48130, elbow_flex=-0.46647,
+wrist_flex=0.09897, wrist_roll=0.17687)`.
+
+**Step 4 — verification gate, ALL PASS.** `scripts/verify_stage2_gate.py`
+against the real generated scene and its actual `home` keyframe (via
+`TableSettingEnv.reset()`), contacts read directly from `data.contact`
+(never the ADR-058-distrusted mesh filter):
+1. Model compiles: PASS.
+2. Home keyframe, zero contacts >1 mm: PASS (0 found).
+3. Every prop's grasp point, IK residual <0.005 m from home: PASS (plate
+   0.00306, mug 0.00467, fork 0.00489, spoon 0.00201, bottle 0.00230).
+4. Handoff point, both arms, each seeded from its OWN approach/hover pose
+   (not home): PASS (arm A 0.00403, arm B 0.00378).
+5. Both arms' handoff-converged configs applied simultaneously via one
+   `mj_forward`, zero cross-arm contact below -0.005 m: PASS (0
+   violations) — this is the condition Step 1's sweep explicitly does NOT
+   test (no simultaneous-occupancy check there) and the one the task
+   flagged as the likeliest failure; it held.
+
+**Consequences.** Base separation is now 0.40 m; single-arm workspace and
+per-prop reach margins are unchanged by construction (Step 2's
+shift-preserves-relative-position argument, confirmed by item 3). The
+both-arms shared band is now a real >=12x12 cm region above z=0.40 m,
+where Stage 1 proved none existed at any height at 0.50 m. Costs, stated
+plainly: `open_drawer` is unsupported (drawer removed); the handoff
+target constant was not moved to the sweep's own preferred centroid
+because of the file-freeze conflict above (deferred to the planner); no
+skill was executed in this stage (`skills_scripted.py` etc. untouched,
+regression numbers not expected to reproduce and not chased, per this
+stage's own rules).
+
+**Source:** this commit ("Redesign Stage 2: base separation 0.40 m,
+geometry placed inside measured workspace, home keyframe regenerated
+(ADR-059).").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

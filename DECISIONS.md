@@ -11,6 +11,57 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-059 — Redesign Stage 2: base separation reduced 0.50 m -> 0.40 m by sweep; geometry replaced inside the measured workspace; home keyframe re-derived by search; drawer removed after a measured collision; supersedes ADR-021/ADR-025/ADR-026 on `redesign` only
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign` · `master` unchanged at
+`20e1012`.
+
+The axis question was resolved by tracing code, not inference:
+`scripts/measure_workspace.py:291`'s `grid[y, x]` construction means
+ADR-058's "4 x 32 cm" band is 4 cm in **Y** — the same axis the arm bases
+are separated along — so a base-separation sweep was the correctly-targeted
+instrument.
+
+`scripts/sweep_base_separation.py` swept separation from 0.50 m down to
+0.15 m (N=300000/arm, scratch scenes deleted after every use, none
+committed) and found **0.40 m is the LARGEST separation with a contiguous
+both-arms region >= 12x12 cm above z=0.40 m** (0.50 m and 0.45 m both have
+zero qualifying slices, confirming ADR-058 was not an artifact of the exact
+heights it tested).
+
+`ARM_GAP_Y` moved 0.25 -> 0.20. All five props shifted in Y by their
+assigned grasping arm's own base delta (preserves each prop's reachability
+margin by construction — confirmed empirically, not just argued).
+`HANDOFF_POSITION_XYZ` was **not** updated: the task text asked for it to
+be set in `gen_dual_scene.py`, but it actually lives in the frozen
+`skills_scripted.py` — flagged as a contradiction rather than resolved by
+breaking either rule; the existing constant still passes at the new
+separation. The drawer is **removed**: raising it to tabletop height
+compiled but collided with three props' rest positions (13 contacts >1 mm,
+measured), and there was no time left under the 120-minute cap to relocate
+and re-verify. The home keyframe was found by search
+(`scripts/search_home_keyframe.py`): ADR-026's old fold failed at the new
+separation (candidate 0), the very next randomly-drawn candidate passed
+every criterion (zero self/cross-arm/table/prop contact, all prop and
+handoff IK targets <0.005 m).
+
+**Verification gate, `scripts/verify_stage2_gate.py`, ALL FIVE ITEMS
+PASS**, including item 5 (both arms' handoff-converged configs applied
+simultaneously, zero cross-arm contact below -0.005 m) — the condition
+Step 1's sweep does not test and the task flagged as the likeliest
+failure.
+
+Full sweep table, before/after positions, IK residuals and the drawer
+collision detail: `docs/hardware/redesign-geometry.md`. No skill was run in
+this stage; `verify_adr038_skills.py` is not expected to reproduce master's
+numbers here and was not chased, per this stage's own rules.
+
+**Source:** this commit ("Redesign Stage 2: base separation 0.40 m,
+geometry placed inside measured workspace, home keyframe regenerated
+(ADR-059).").
+
+---
+
 ## ADR-058 — Redesign Stage 1: empirical per-arm workspace measurement; RAW cloud authoritative over the table_top penetration filter; NO contiguous 10x10 cm both-arms region exists at any tested height, at the current base separation
 
 **Ratified:** Sept 15, 2026 · **Branch:** `redesign` · **Measures only —
