@@ -33,6 +33,7 @@ block regardless of outcome, and the restore is itself verified via
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -129,7 +130,19 @@ def main() -> int:
         results["check2_redesign_geometry"] = _run_check("CHECK 2: redesign geometry (current HEAD)")
 
         # ---- Check 1: swap in master's XML, run, then restore. ----
-        master_xml = _git(["show", "master:src/bimanual/sim/assets/so101_dual_table.xml"])
+        # `MASTER_REF` env var override (default "master"): needed on
+        # bm-ptl, where the repo's SSH recipe (`git fetch ... redesign` +
+        # `git reset --hard FETCH_HEAD`, never `git checkout -b redesign`)
+        # never keeps a local "master" ref honest -- observed there to
+        # silently point at whatever redesign commit was last reset onto,
+        # and `origin/master` observed stale (an M01-era commit, since only
+        # "redesign" gets fetched by that recipe). On the laptop, "master"
+        # is the real thing (verified via `git rev-parse master` before
+        # every commit per this stage's own rule) and this override is
+        # never needed.
+        master_ref = os.environ.get("MASTER_REF", "master")
+        print(f"reading master's XML from ref {master_ref!r} (MASTER_REF env override if set)")
+        master_xml = _git(["show", f"{master_ref}:src/bimanual/sim/assets/so101_dual_table.xml"])
         XML_PATH.write_text(master_xml, newline="\n", encoding="utf-8")
         swapped = True
         results["check1_master_geometry"] = _run_check("CHECK 1: master geometry (temporarily checked out)")
