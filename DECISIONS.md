@@ -11,6 +11,59 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-058 — Redesign Stage 1: empirical per-arm workspace measurement; RAW cloud authoritative over the table_top penetration filter; NO contiguous 10x10 cm both-arms region exists at any tested height, at the current base separation
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign` · **Measures only —
+changes nothing in `src/`, `scenes/so101/`, or any generated file.**
+
+`scripts/measure_workspace.py` sampled N=50000 configurations per arm,
+uniformly over each of the 5 IK-controlled joints' actual `model.jnt_range`
+(ADR-016: the jaw joint contributes nothing to pose and is excluded),
+recording the ADR-025 pinch point after `mj_forward`. Per-sample cost was
+measured on a small batch first (0.063-0.065 ms/sample) and projected
+(6.4 s total) before committing to the full run, per the task's own
+instruction — the full run took 3.4 s + 5.0 s, far under the 90-minute cap.
+
+Two things were checked before trusting the result, both because the task
+explicitly required it:
+
+1. **The `table_top` collision filter.** A known mesh-collision artifact
+   (ADR-035 Part 3, a -0.22211 m false-positive penetration depth on a
+   converged, sensible pose) was sanity-checked against four independently
+   known-good targets. `fork_at_rest` for arm A — a target `pick(A, fork)`
+   picks successfully every regression run — reported a **-0.39050 m**
+   false penetration and was rejected by both the naive 1mm bar and a loose
+   2cm bar. The filter is not trusted; the **RAW (unfiltered) cloud is
+   authoritative** for every number in the report.
+2. **Sampling density.** The primary N=50000 intersection grids were
+   visibly sparse (salt-and-pepper), risking a false "no shared region"
+   read from Monte Carlo gaps rather than real gaps. A 6x-denser
+   cross-check (N=300000, same method, fresh seeds) confirmed the shared
+   region is real and stable in shape: a long, thin band (short axis
+   2-9 cm, long axis up to 46 cm) at every one of 13 tested heights
+   (z = 0.35-0.59 m), never a square.
+
+**Result: no contiguous both-arms-reachable region of at least 10 cm x
+10 cm exists at any tested height, at the current base separation.** The
+largest is ~4 cm x 32 cm (z=0.51 m). This does not contradict
+ADR-032/035/048's near-single-point findings — this measurement checks a
+strictly weaker condition (each arm's own reach alone, no cross-arm
+collision check at all) and even that already fails the 10x10 cm bar
+everywhere; adding the missing collision constraint back can only shrink
+the true handoff-feasible region further. The conclusion for Stage 2: the
+shared region's short axis is fundamentally too narrow at any height
+tested, before any collision constraint is even applied — no per-prop or
+per-target repositioning fixes this; relocating one or both arm bases is
+the change with the leverage to widen it. No placement decision is made
+here.
+
+Regression gate confirmed unchanged on bm-ptl:
+`scripts/verify_adr038_skills.py` → `0.3989 / 0.3588 / 0.6192 / 0.1946`,
+`frames_used=6610`; `pytest tests/test_skills.py` → 4 passed / 4 failed,
+same tests, same reasons.
+
+---
+
 ## ADR-057 — Multi-seed IK diagnostic: every genuine IK-convergence failure measured is Case 1 (variance ≈ 0, one basin — a genuine boundary, not rescuable by multi-seed); a fifth target's documented "failure" turns out not to be an IK failure at all — Commit 3's retry-with-perturbed-target wrapper is not supported by this data
 
 **Ratified:** Sept 15, 2026 · **Follows:** ADR-056 (the `num_seeds`

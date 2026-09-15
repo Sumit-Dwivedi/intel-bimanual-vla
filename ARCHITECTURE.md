@@ -5641,6 +5641,138 @@ local minima (ADR-057).").
 
 ---
 
+### ADR-058 — Redesign Stage 1: empirical per-arm workspace measurement (N=50000, plus a 6x densification cross-check); RAW cloud declared authoritative over the table_top penetration filter; NO contiguous 10x10 cm both-arms region exists at any tested height, at the current base separation
+
+**Recorded:** Sept 15, 2026 · **Branch:** `redesign` (does not touch `master`). ·
+**Modifies:** nothing in `src/`, `scenes/so101/`, `gen_dual_scene.py`, the
+generated XML, or any requirements file — a new, read-only measurement
+script (`scripts/measure_workspace.py`), this file, `DECISIONS.md`, and
+`docs/hardware/redesign-workspace-measurement.md`. **Geometry-only series,
+Stage 1: measures, changes nothing.** Provenance: bm-ptl (ADR-047
+cross-machine float divergence — every number below is measured there, not
+on the developer's laptop, which cannot import MuJoCo at all under
+ADR-020).
+
+**Context.** Every reachability finding to date (ADR-025, ADR-032, ADR-035,
+ADR-048, ADR-057) was measured incidentally, chasing one specific skill
+failure, against a handful of hand-picked grid points. None of them answer
+the question Stage 2 (arm-base placement, the most consequential change
+available in this series) needs: what does each arm's ACTUAL reachable
+volume look like, and how much of it overlaps the other arm's, at the
+current layout?
+
+**What was measured.** `scripts/measure_workspace.py`, per arm
+independently: N=50000 configurations sampled uniformly over each of the 5
+IK-controlled joints' `model.jnt_range` (read from the compiled model, not
+assumed — table in the report). ADR-016's DoF split is honored: the 6th
+actuator (`armX_gripper`, the jaw) is excluded, exactly the 5 joints
+`bimanual.control.ik.arm_joint_names` already uses for IK. Recorded point:
+the ADR-025 pinch point (midpoint of `armX_gripper` and
+`armX_moving_jaw_so101_v1` body origins via `mj_forward` + `data.xpos`),
+not the `armX_gripperframe` site (measured ~8-9 cm away, would describe the
+wrong cloud). Per-sample cost measured on a 500-sample calibration batch
+BEFORE committing to the full run, per the task's own instruction: 0.063-
+0.065 ms/sample, projecting 6.4 s for the full N=50000 x 2 arms — measured
+actual: 3.4 s (arm A) + 5.0 s (arm B). Nowhere close to the 90-minute cap;
+no reduction of N was needed.
+
+**Decision 1 — the table_top penetration filter's naive 1mm bar (and even a
+loose 2cm bar) is NOT trusted; the RAW (unfiltered) cloud is authoritative.**
+The task's own caveat (ADR-035 Part 3: a `table_top`-vs-arm-mesh contact
+reporting -0.22211 m depth on a converged, physically sensible pose — a
+convex-hull mesh artifact) was checked directly, not assumed away: a
+sanity check solved IK toward four independently-known-good targets
+(`fork_at_rest`, `mug_at_rest`, `bottle_at_rest` — ADR-025's own
+primary-probe targets — and the current `HANDOFF_POSITION_XYZ`) for both
+arms. `fork_at_rest` for arm A converges cleanly (residual 0.00907 m,
+matching `pick(A, fork)`'s own regression-gate residual to four decimal
+places) yet reports a **-0.39050 m** `table_top` contact — bigger than the
+artifact ADR-035 already found, on a target this exact skill successfully
+picks every regression run. A filter that rejects a skill's own working,
+regression-gated target is not measuring reachability; it is reproducing a
+known mesh-collision bug. This is corroborated structurally: the raw and
+1mm-filtered clouds disagree substantially at z=0.35-0.43 m (nearest
+`TABLE_SURFACE_Z=0.35`, exactly where the artifact fires) and are
+byte-identical from z=0.45 m up (where the arm is no longer near the table
+and the artifact cannot fire) — the filter's damage is concentrated exactly
+where the known bug lives. Per-arm rejection at the naive bar: arm A
+9473/50000 (18.9%), arm B 9643/50000 (19.3%) — not trivial, and now
+explained rather than merely noted. **Every bound/grid/intersection number
+this ADR relies on uses the RAW cloud**; the filtered clouds are reported
+in full in the doc for comparison only.
+
+**Decision 2 — N=50000's own intersection answer was cross-checked against
+a sampling-density confound before being trusted, per this task's own
+"if it comes back large/small, check it" instruction.** The primary
+N=50000 run's intersection grids are visibly salt-and-pepper (a few
+samples per occupied 1cm cell on average is enough to fix bounds — a
+min/max is density-insensitive — but not enough to trust a single-cell gap
+as a genuine hole), and its own best-rectangle answer (8 cm x 1 cm at
+z=0.43) risked being read as "no shared region exists" for the wrong
+reason. A 6x-denser supplementary run (N=300000 per arm, same method, same
+filter, fresh RNG seeds, `--densify-n`, purely a cross-check — it does not
+replace the reported N=50000 numbers) resolved this: at every one of the
+13 z-slices (0.35-0.59 m, 2 cm steps) the true shared region is large in
+raw cell count (800-1100 of ~2600-2700 per-arm cells, ~40%) but
+consistently **band-shaped**, not square — largest rectangles ranging from
+2x46 cm (z=0.57) to 24x3 cm (z=0.47) to the overall best, 4x32 cm (z=0.51,
+identical for the raw and 1mm-filtered clouds at that height). The
+qualitative shape (long-and-thin, never square) was stable across a 6x
+density change, which is the evidence this is a real property of two
+overlapping annular reach-shells (neither arm can reach its own base), not
+sampling noise.
+
+**Result — the explicit question: NO.** There is no contiguous
+both-arms-reachable region of at least 10 cm x 10 cm at ANY tested height,
+at the current base separation (arm A `y=-0.25`, arm B `y=+0.25`). The
+largest that exists is the ~4 cm x 32 cm band at z=0.51 m — substantial in
+area, useless as a working zone because its short axis never exceeds ~9 cm
+at any height. **This does not contradict ADR-032/035/048's near-single-
+point findings; it explains them from one level up.** Those measurements
+additionally required simultaneous, collision-free occupancy of BOTH arms
+at once and found essentially zero width. This measurement checks a
+strictly weaker condition — each arm's own kinematic reach, independently,
+never checked against the other arm's actual (rather than home-fixed)
+position at all — and even that more permissive condition already fails
+the 10x10 cm bar everywhere. Adding back the missing cross-arm collision
+constraint can only shrink the true handoff-feasible region further, never
+grow it. Per the task's own calibration warning ("if your intersection
+comes back large... check it before reporting"): the check was run (both
+the filter sanity check and the density cross-check), and the answer
+holds up under both.
+
+**Consequences for Stage 2.** The shared region's problem is not
+mis-placement of a prop, a drawer, or the single `HANDOFF_POSITION_XYZ`
+constant within an otherwise-adequate overlap — no per-target adjustment
+fixes a short axis that never exceeds ~9 cm at any of 13 tested heights,
+before any collision constraint is even applied. Relocating one or both
+arm bases (ADR-021's original ~0.30 m reach / 0.50 m base-gap assumption,
+never verified against the compiled model) is the change with the leverage
+to widen this band. This ADR does not choose a new placement — that is a
+separate, targeted sweep now that the SHAPE of the problem (not merely its
+existence) is measured — but it closes, with evidence, the question of
+whether the current separation might already be adequate: it is not, at
+any height, by a wide margin.
+
+**Regression gate: unchanged, confirmed on bm-ptl before and after this
+measurement (no source file this gate depends on was touched).**
+`scripts/verify_adr038_skills.py`: `0.3989 / 0.3588 / 0.6192 / 0.1946`,
+`frames_used=6610` — byte-identical to the figures this task specified in
+advance. `pytest tests/test_skills.py`: 4 passed / 4 failed, the same four
+tests failing for the same documented reasons (including the identical
+`IK residual=0.0532 m` handoff-mug failure ADR-057 already cites).
+
+**Not done.** No change to `ik.py`, `skills_scripted.py`, `grasp.py`,
+`executor.py`, `env.py`, `gen_dual_scene.py`, any generated XML,
+`scenes/so101/`, or any requirements file. No arm-base relocation decided
+or implemented — that is explicitly out of this stage's scope per the
+task brief, and is the natural next step this measurement feeds.
+
+**Source:** this commit ("Redesign Stage 1: empirical workspace
+measurement.").
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
