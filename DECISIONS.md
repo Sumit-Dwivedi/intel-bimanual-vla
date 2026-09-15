@@ -11,6 +11,41 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-070 — v2 Stage 1: geometric closed-form top-down IK for SO-101 (`ik_geometric.py`), separate from `ik.py`, plus its mandatory validation
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from
+`master` at `238cfed`; unrelated to the archived `redesign` branch, whose
+own highest ADR is 062) · **New:** `src/bimanual/control/ik_geometric.py`,
+`scripts/v2_validate_ik.py`, `docs/hardware/v2-topdown-workspace.md` ·
+**Does not modify:** `ik.py`, `skills_scripted.py`, `grasp.py`, `env.py`,
+`scenes/so101/` (ADR-016) · **Follows:** ADR-025 (pinch-point definition,
+reused unmodified), ADR-024 (the position-only limitation this closed form
+works around for top-down grasps specifically).
+
+Full context, the two closed-form bugs this development process caught and
+fixed (an arm-B-specific sign error, and an angle-periodicity wrap), the
+measured constants, and the complete validation writeup are in
+`ARCHITECTURE.md`'s ADR-070 entry and `docs/hardware/v2-topdown-workspace.md`
+— not duplicated here per this file's own mirroring convention. Headline
+numbers, all measured on bm-ptl:
+
+- Round-trip position error over 500 random reachable targets: mean
+  2.19e-16 m, max 5.90e-16 m (gate: mean < 2 mm, max < 5 mm — **PASS**,
+  machine precision as expected of a genuine closed form).
+- Orientation (wrist_flex-anchor→pinch vs straight down), same 500
+  targets: min dot 0.998258 (gate: > 0.995 — **PASS**).
+- Top-down reachable workspace is 35-53% of the position-only workspace
+  measured on the `redesign` branch (that branch's own ADR-058, a genuine
+  numbering collision with this branch's Speechmatics ADR-058 — flagged
+  per the task brief's own warning about it), smaller at every height
+  tested, as a strictly stronger constraint requires.
+- One brief-provided constant (the `wrist_roll` axis) did not match the
+  live compiled model; traced to a reference-frame mismatch in how it was
+  originally measured, not a defect in the model or this module — see the
+  ARCHITECTURE.md entry for the full trace.
+
+---
+
 ## ADR-058 — Speechmatics voice input wired end to end (M15): `VoiceCommandSource` finished, `run_demo.py --voice` added — three disclosed, user-authorised deviations from the written plan, none silent
 
 **Ratified:** Sept 15, 2026 · **Closes:** M15 (previously unscheduled/droppable,

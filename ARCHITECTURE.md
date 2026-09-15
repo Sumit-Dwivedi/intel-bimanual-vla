@@ -5754,6 +5754,122 @@ in captured output).
 
 ---
 
+### ADR-070 — v2 Stage 1: geometric closed-form top-down IK for SO-101 (`ik_geometric.py`), separate from `ik.py`, plus its mandatory validation
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from `master`
+at `238cfed`; unrelated to the archived `redesign` branch, ADR-062 there) ·
+**New:** `src/bimanual/control/ik_geometric.py`,
+`scripts/v2_validate_ik.py`, `docs/hardware/v2-topdown-workspace.md` ·
+**Does not modify:** `ik.py`, `skills_scripted.py`, `grasp.py`, `env.py`,
+`scenes/so101/` (ADR-016) · **Follows:** ADR-025 (pinch-point definition,
+reused unmodified), ADR-024 (the position-only-solve limitation this
+closed form works around for the top-down-grasp case specifically).
+
+**Context.** `ik.py`'s damped-least-squares solver is general (any
+reachable position, any starting pose) but position-only — orientation
+"falls out" unconstrained (ADR-024). v2 Stage 1's brief asked for the
+opposite trade: a solver restricted to top-down grasps only, but exact
+(closed-form, not iterative) for that restricted family, as a foundation
+for later v2 stages. `ik.py` is left untouched; this is a second, separate
+solver, not a rewrite.
+
+**Kinematic structure exploited.** Measured (not assumed) via
+`mujoco.mj_forward` on a scratch `MjData`: `shoulder_lift`, `elbow_flex`
+and `wrist_flex` share one rotation axis (world-x-aligned, sign differs by
+arm — see the caught bug below), making them a classic planar 3R chain;
+`shoulder_pan` rotates about a vertical axis; `wrist_roll`'s axis is
+tilted and the ADR-025 pinch point sits off that axis by ~1.6 cm
+(perpendicular component), which is why a perfect top-down approach is not
+achievable for arbitrary yaw (see the module's "Yaw and the lateral
+offset" docstring section) — the validation gate (min dot > 0.995) reflects
+this honestly rather than asserting an impossible exact 1.0.
+
+**Two lateral offsets, both solved in closed form.** (1) The 3R sub-chain's
+own plane sits ~0.018 m off the `shoulder_pan` axis; (2) the pinch point
+sits ~1.6 cm off the `wrist_roll` axis. Both are folded into one constant
+`d` (computed once `wrist_roll`'s angle is fixed from `yaw`), and
+`shoulder_pan` is solved via the standard shoulder-offset / "left-arm-
+right-arm" closed form (`r_perp = sqrt(dist_to_pan_axis**2 - d**2)`, then
+`atan2`) rather than a naive `atan2(target_y, target_x)`.
+
+**One brief-provided constant contradicted the live model, and the
+contradiction is explained, not just noted.** The brief's `wrist_roll`
+axis (`[0, 0.942, -0.335]`) does not match what `_calibrate()` measures at
+the true all-zero pose (`[0, -1, 0]`, arm A). Traced to a reference-frame
+mismatch: `scripts/v2_probe_kinematics.py`'s own sign-check section
+(present before this stage, reused for cross-checking) perturbs joints
+from whatever pose `data.qpos` already holds at that point in the script —
+by then the scene's compiled "home" keyframe
+(`shoulder_lift=-1.2, elbow_flex=-1.6`), not zero — so the axis it reports
+for `wrist_roll` is rotated by that ~2.8 rad of accumulated upstream
+rotation away from the true zero-pose value the brief's other numbers (all
+independently verified to 5 decimal places) were measured at. Every other
+brief-provided constant (all five anchors, both link lengths, the tool
+offset, the pinch point itself) matched the live model exactly.
+`ik_geometric.py` does not depend on the brief's numbers regardless — every
+constant is measured fresh via `_calibrate()`.
+
+**A second, genuinely caught bug: an arm-specific sign error.** An
+intermediate version of the 2-link law-of-cosines algebra hardcoded a sign
+tuned by eye against arm A's own measured axis (`[-1, 0, 0]`). Arm B's
+mirrored asset measures to `[+1, 0, 0]` — sign flipped, not just position —
+and the hardcoded formula silently used the wrong rotation sense for arm B
+only: every joint-range check still passed (a five-angle answer was still
+returned) but the pose did not reach the target (round-trip error ~0.2-0.3
+m for arm B, ~0 for arm A). Caught by this module's own local
+self-consistency test against the real compiled model (§8's laptop-MuJoCo
+note explains how that was possible) BEFORE the bm-ptl run, by testing
+both arms rather than only arm A. Fixed by routing the "absolute link
+angle" computation through a general axis-aware helper
+(`_chain_angle`/`_signed_angle_about_axis`) that derives the correct
+rotation sense from the measured axis vector itself, for either sign.
+
+**Periodicity bug, also caught and fixed.** `theta5_star` (the calibrated
+`wrist_roll` angle used when `yaw=0.0`) comes out of an `atan2`-based
+closed form as `~4.01` rad on arm A — numerically outside `wrist_roll`'s
+own `[-2.74, 2.84]` range, even though `4.01 - 2*pi ~= -2.27` rad is the
+identical physical rotation and IS inside range. `_wrap_to_range()` (tries
+`angle + 2*pi*k` for small integer `k`, keeps whichever lands in the
+joint's own range) is applied to every one of the five solved angles, not
+just this one, since any of them can come out of `atan2` shifted by a full
+turn.
+
+**Validation (mandatory, on bm-ptl; full numbers, ASCII maps and the
+comparison methodology in `docs/hardware/v2-topdown-workspace.md`):**
+
+| gate | measured | threshold | result |
+|---|---:|---|---|
+| round-trip position error, mean (500 targets) | 2.185716e-16 m | < 2e-3 m | PASS |
+| round-trip position error, max | 5.900916e-16 m | < 5e-3 m | PASS |
+| orientation dot (wrist_flex-anchor→pinch vs (0,0,-1)), min | 0.998258 | > 0.995 | PASS |
+
+Workspace map (1 cm grid, three heights, exhaustive per-cell closed-form
+test — no Monte Carlo sampling, unlike the comparison baseline below):
+top-down reachable footprint is 1257-1485 cells (of 7875) per arm across
+the three heights tested. Compared against the redesign branch's
+position-only workspace measurement (redesign branch ADR-058 — **not**
+this branch's ADR-058, the unrelated Speechmatics ADR; flagged explicitly
+per the numbering collision the task brief warned about) at its densified
+(N=300000/arm) sample count: top-down reachability is **35-53% of the
+position-only footprint**, shrinking with height — smaller at every height
+tested, as a strictly stronger constraint must be. An initial comparison
+against that source's first-reported, sparser N=50000 table appeared
+LARGER (a red flag by the task's own stated rule); investigated rather than
+reported, and traced to that specific baseline's own documented
+under-sampling (its own report already found the identical measurement
+roughly doubled at 6x the sample density) rather than to a defect in this
+module — switching to the correct (denser) baseline resolved it cleanly.
+
+**Consequences.** v2 Stage 2+ can build directly on
+`solve_topdown_ik(model, data, arm, target_xyz, yaw=0.0) -> np.ndarray |
+None` as an exact, fast (no iteration) primitive for top-down grasp
+targets, with a documented, measured (not assumed) reachable envelope.
+`ik.py`/`skills_scripted.py`/`grasp.py`/`env.py` and `scenes/so101/` are
+all untouched, so every one of master's existing tests and regression
+gates against those files is unaffected by this stage.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
