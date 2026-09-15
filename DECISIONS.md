@@ -11,6 +11,80 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-062 — Redesign branch verdict: `master` ships unchanged; `redesign` archived as a measured design alternative, hypothesis partially confirmed and rejected on net functional evidence
+
+**Recorded:** Sept 15, 2026 · **Branch:** `redesign` (archived, not merged) ·
+**Closes:** ADR-058 (workspace measurement), ADR-059 (base separation + home
+keyframe), ADR-060 (eight-skill retest), ADR-061 (swept-path gate) ·
+**Full report:** `docs/hardware/redesign-verdict.md`
+
+**Hypothesis.** Day 1 geometry — 0.5 m base separation (ADR-021), prop
+placement (ADR-026) — was fixed before the reachable workspace was ever
+measured. Four persistent skill failures were hypothesised to be downstream of
+that placement rather than of skill logic. Worth testing because ADR-057 had
+already excluded the solver: 32 random restarts from ±0.15 rad converged to
+identical residuals at four separate targets, i.e. genuine kinematic
+boundaries, not local minima.
+
+**Confirmed, for two of three walls.** At 0.40 m separation, `pick(A, mug)`'s
+residuals no longer plateau (master: hard boundary at 0.0532 m) and
+`handoff(B→A, fork)` became bimodal (master: hard boundary at 0.0954 m). Both
+were real walls and both dissolved. Stage 1 also established structurally why
+the handoff corridor had always been fragile: at 0.5 m separation there is **no
+contiguous both-arms-reachable region of 10 × 10 cm at any height** in
+0.35-0.59 m; the largest is 4 × 32 cm, thin along y — the separation axis.
+
+**Rejected, on net functional evidence.** `place(A, water_bottle, table)`
+plateaus at ~0.0150 m regardless of separation — genuinely irreducible. And the
+net result is **1 of 8 skills passing versus master's 4 of 9**, with three
+previously-working skills regressing on waypoint-1 approach collisions.
+
+**The gate gap.** Stage 2's five-item gate verified endpoint reachability and
+handoff co-occupancy but never the swept approach path. Geometry can be
+reachable at every endpoint and still collide en route: Stage 4 measured **31 of
+41 waypoints colliding**, category (b) arm-vs-table dominant by count (18,
+mostly ~6 mm grazes) and category (a) arm-vs-prop holding the worst single
+violation (water bottle, −0.098 m). A placement gate must test the trajectory,
+not the endpoints.
+
+**The finding that closes the approach, and the reason this is not merely
+running out of budget.** A home pose optimised against the swept-path gate
+improved the gate score from 5/7 to 3/7 violations and **regressed functional
+success from 1/8 to 0/8**, every skill failing at GRIP. Cause: the gate cannot
+see grasp orientation, because `ik.solve_position_ik` is position-only by
+design (ADR-024; the SO-101's 5 pose-controlling joints cannot generally
+satisfy a 6-DoF task, ADR-016). A configuration can be collision-optimal and
+grasp-useless simultaneously. **Optimising geometry against a position-only
+metric can move you away from working grasps**, and further placement search
+cannot fix that while orientation is uncontrolled. The remedy was reverted
+rather than kept for its better gate score.
+
+**Instrument corrections that prevented false results.** (1) Stage 1's
+`table_top` penetration filter falsely flagged `pick(A, fork)`'s own working
+grasp target at **−0.39 m**; the raw cloud was declared authoritative, without
+which every downstream stage would have inherited a carved-away workspace.
+(2) The swept-path gate needed multi-seed endpoint sampling (the redundant
+5-DoF-to-3-DoF null space drifts to different, sometimes colliding, branches)
+and an implausible-penetration bound — the convex-hull mesh artifact of ADR-035
+and ADR-058 appearing a **third** independent time — before it could pass
+two-sided validation against known-good behaviour. (3) Stage 3 re-scored 200
+home-pose candidates and found Stage 2's adopted pose ranked **91st of 117**
+passing; it was swapped per rule.
+
+**Decision.** `master` ships unchanged at `20e1012`. `redesign` is pushed and
+preserved — not merged, not deleted; the branch is the evidence. Across all
+five stages `skills_scripted.py` changed by exactly one line
+(`HANDOFF_POSITION_XYZ`, geometry not logic) and `grasp.py`, `ik.py`,
+`executor.py`, `env.py` were never touched, so every skill result was measured
+against unchanged control code.
+
+**A continuation would require** orientation-aware IK — a 6-DoF task spec, or a
+constrained position-plus-approach-axis mode leaving roll free. The SO-101
+cannot generally satisfy full 6-DoF, so this needs solver task-modes or
+different hardware. Out of scope; recorded for whoever continues.
+
+---
+
 ## ADR-061 — Redesign Stage 4: a validated swept-path collision gate built and hard-stop-checked against ground truth; 8-skill/41-waypoint diagnosis found 31 collisions, dominant category arm-vs-table by count; one geometry remedy (home-pose re-search scored by the gate) attempted, found to REGRESS real functional success (1/8 -> 0/8) and reverted; six-item gate 0/8, functional retest unchanged at 1/8
 
 **Ratified:** Sept 15, 2026 · **Branch:** `redesign` · `master` unchanged at
