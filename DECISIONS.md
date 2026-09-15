@@ -11,6 +11,92 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-057 — Multi-seed IK diagnostic: every genuine IK-convergence failure measured is Case 1 (variance ≈ 0, one basin — a genuine boundary, not rescuable by multi-seed); a fifth target's documented "failure" turns out not to be an IK failure at all — Commit 3's retry-with-perturbed-target wrapper is not supported by this data
+
+**Ratified:** Sept 15, 2026 · **Follows:** ADR-056 (the `num_seeds`
+random-restart capability this diagnostic exercises via five separate
+targets, unmodified by this commit) · **Diagnostic only — no skill or
+solver change.** New file: `scripts/probe_multiseed_diagnostic.py`. Full
+account, per-target tables and the raw 32-value residual lists:
+`docs/hardware/m11-multiseed-diagnostic.md`.
+
+**Why a new script instead of just calling `solve_position_ik(...,
+num_seeds=32)` again.** `solve_position_ik` returns only the BEST of its
+internal restarts — there is no way to recover the other 31 residuals
+from its return value. The probe reconstructs each perturbed starting
+configuration itself (a scratch `MjData` with the target arm's 5 joints
+overridden) and calls `ik.solve_position_ik(..., num_seeds=1)` from each
+one — so every one of the 32 residuals is still produced by `ik.py`'s own
+unmodified DLS loop, just invoked from outside 32 times instead of once
+from inside. The RNG seed derivation and the per-seed `uniform(size=5)`
+draw sequence are reproduced verbatim from `ik.py`'s own formula, so the
+distribution measured is provably the SAME one `num_seeds=32` samples
+internally (`numpy.random.default_rng`'s stream is sequential and
+deterministic, so slicing one 32-long list at `[:1]/[:8]/[:32]`
+reproduces `num_seeds=1/8/32` exactly).
+
+**Five targets measured, applying the task's own three-case interpretation
+rule (variance ≈ 0/one value = genuine boundary; variance > 0 with a
+sub-threshold best = local minimum, rescuable; variance > 0 with every
+mode still above threshold = multi-modal-but-infeasible, not rescuable by
+multi-seed but worth recording the spread for a target-perturbation
+retry):**
+
+| target | documented residual | Case |
+|---|---:|---|
+| (a) `place(A, water_bottle, table)` destination approach | 0.0138 m (ADR-034/056) | **1 — genuine boundary** (sanity-check match to ADR-056's own published number) |
+| (b) `pick(A, mug)` waypoint-1 approach | 0.0532 m (this repo's own currently-failing `test_handoff_mug_ends_held_by_arm_b`) | **1 — genuine boundary** |
+| (c) `handoff(B→A, fork)` Phase 1 pick approach | 0.0954 m (ADR-037) | **1 — genuine boundary** |
+| (d) chain Phase 3 `to_arm` approach | 0.0875 m (overnight-batch-log.md, ADR-054) | **1 — genuine boundary** |
+| (e) `pick(A, water_bottle)` at ADR-053's 7 failing seeds (10-19 range) | `weld_attach_failed_after_300_frames` | **not applicable** — IK already converges (residual < 0.010 m) at EVERY seed and EVERY `num_seeds` level; the documented failure is downstream, in the grasp/weld mechanism, not in IK |
+
+At (a)-(d), variance across all 32 restart seeds is 9-21 orders of
+magnitude below any physically meaningful scale, and every seed —
+including, for (c) and (d), the ACTUAL terminal qpos of a real, physically
+driven 500-step waypoint attempt, not merely an analytic starting state —
+converges to the identical residual. (d) is the target most likely a
+priori to show pose-history-dependent local-minimum behaviour (it exists
+ONLY because ADR-054's `already_held` guard skips Phase 1, per
+overnight-batch-log.md's own "likely mechanism" paragraph) and it does
+not.
+
+**(e) is a distinct, fourth finding, not a Case-1/2/3 instance.**
+`docs/hardware/m08-extended-eval.md`'s own seed table's `frames_used=1300`
+at every one of the 7 failing seeds is arithmetically waypoint 1 (≤500)
+plus waypoint 2 (≤500) both already converging, then GRIP (300) exhausting
+its budget with no weld attach — confirmed directly here: waypoint 1's own
+one-shot residual is below 0.010 m at every seed, at every `num_seeds`
+level (though with real, non-noise variance, 1e-6 to 1e-7, unlike (a)-(d)
+— up to 32 genuinely distinct converged values). Neither multi-seed
+(perturbs the solver's start) nor a target-perturbation retry (perturbs
+the target) can influence a grasp-mechanism failure that only engages
+after the arm has already arrived at a converged pose.
+
+**Verdict: Commit 3's retry-with-perturbed-target wrapper is NOT supported
+by this data.** Zero Case-2 or Case-3 instances were found across all five
+targets measured. Proceeding would require a NEW, not-yet-run measurement
+that actually perturbs a target position and finds a lower residual —
+this diagnostic did not attempt that (out of scope: measurement only,
+starting-point perturbation only, per ADR-056's own mechanism).
+
+**Regression gate: PASSES, byte-identical before and after, on bm-ptl.**
+`scripts/verify_adr038_skills.py`: `0.3989 / 0.3588 / 0.6192 / 0.1946`,
+`frames_used=6610`, unchanged. `pytest tests/test_skills.py`: 4 passed / 4
+failed both runs, including the identical `IK residual=0.0532 m` failure
+this ADR's own target (b) reuses. Expected: neither `ik.py` nor
+`skills_scripted.py` was touched — only a new, non-imported-elsewhere
+probe script and a new doc were added.
+
+**Not done.** No change to `ik.py`, `skills_scripted.py`, `grasp.py`,
+`executor.py`, `env.py`, `randomization.py`, `scenes/so101/`,
+`gen_dual_scene.py`, `SUBMISSION.md`, or any requirements file.
+`num_seeds` remains un-wired into any skill's call site.
+
+**Source:** this commit ("Multi-seed IK diagnostic: which failures are
+local minima (ADR-057).").
+
+---
+
 ## ADR-056 — Optional random-restart (multi-seed) capability added to `solve_position_ik`; `num_seeds=1` regression gate reproduces byte-identical on bm-ptl before/after; `num_seeds=32` measured against ADR-034's known-failing water-bottle place target finds NO improvement
 
 **Ratified:** Sept 15, 2026 · **Follows:** ADR-024 (the DLS solve wrapped
