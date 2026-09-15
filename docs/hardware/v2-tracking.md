@@ -144,3 +144,61 @@ Ablation 1 -- BOTH arms fully frozen, nothing driven at all, same snapshot-once 
 
 total wall clock: 0.6 s
 ```
+
+## Orchestrator verification and a correction to the headline metric
+
+Independently re-measured (same 2.0 s move, target
+`[0.3, -0.6, -1.0, 0.4, 0.2]` on arm A from the home keyframe).
+
+### The peak-tracking-error ratio is not the number to quote
+
+The "spline 0.001754 rad vs direct 1.599738 rad" comparison is correctly
+measured, but it should not be quoted as a ~900x tracking improvement. For a
+one-shot direct command the commanded value steps to the target at t=0 while
+the arm is still at its start, so peak `|actual - commanded|` is **the size of
+the move, by construction** -- here the 1.6 rad elbow displacement. It measures
+the step, not the controller.
+
+### The number that does predict Stage 4
+
+What made master's motion knock props off the table is how fast the arm
+actually moves. Measured from `qpos`, not from the command:
+
+| | peak ACTUAL velocity | peak ACTUAL acceleration | final error |
+|---|---|---|---|
+| Spline, 2.0 s | **0.451 rad/s** | **9.9 rad/s^2** | 0.00014 rad |
+| Direct, one-shot | **5.350 rad/s** | **211.4 rad/s^2** | 0.00014 rad |
+
+**11.9x lower peak velocity and 21x lower peak acceleration**, to the same
+final accuracy. That is the honest claim for this stage, and it is the
+quantity Stage 4's criteria (b)-(d) are sensitive to.
+
+Cross-check: the spline's measured peak actual velocity (0.451 rad/s) matches
+the closed form `1.5 * delta / T` = 1.5 * 0.6 / 2.0 = 0.450 rad/s to three
+decimals, confirming the commanded profile is tracked faithfully rather than
+merely issued.
+
+### Idle-arm drift: gate FAIL confirmed, and the gate is mis-specified
+
+Independently reproduced. Held arm B during a 1000-step move of arm A:
+
+| step | 0 | 12 | 50 | 100 | 200 | 500 | 999 |
+|---|---|---|---|---|---|---|---|
+| drift (rad) | 0.000000 | **0.001110** | 0.000778 | 0.000775 | 0.000774 | 0.000774 | 0.000774 |
+
+The maximum is at **step 12 of 1000** and it settles to **exactly 0.000774**
+by step ~200, holding there for the remaining 800 steps. Not monotonic. This
+is a damped transient, and 0.000774 is precisely ADR-037's recorded
+steady-state figure, so the freeze mechanism is implemented correctly.
+
+**The gate, not the implementation, is wrong.** ADR-037's 0.000774 was sampled
+at PHASE BOUNDARIES, which can never observe a transient at step 12. A
+`< 0.001 rad` *continuous-maximum* gate is therefore not achievable by any
+snapshot-once PD hold: the instant a gravity-loaded joint is snapshotted its
+position error is zero, so it must sag slightly before the PD term restores it.
+
+Recommended restatement, for whoever sets the Stage 4/5 gates: gate the
+**post-transient (settled) drift at < 0.001 rad**, which passes at 0.000774,
+and record the bounded start-up transient (0.001110 rad, decayed within ~200
+steps) as a disclosed property. The builder was right to report this as a FAIL
+rather than loosen it unilaterally.
