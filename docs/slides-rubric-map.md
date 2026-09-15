@@ -6,7 +6,7 @@ was verified present before commit.
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| End-to-end + bimanual (30) | 4 skills; `handoff(A→B)` verified, 4/4 PASS | `run_demo.py`, `docs/images/m06-handoff-complete.png` |
+| End-to-end + bimanual (30) | 4 skills; `handoff(A→B)` verified, 4/4 PASS; pick+handoff+place in one 40 s take | `docs/videos/full-sequence-demo.mp4`, `run_demo.py`, `docs/images/m06-handoff-complete.png` |
 | VLA / multi-modal (20) | Text + voice grounding; perception demoed | 43 grounder tests, ADR-058 (voice), ADR-055 (perception) |
 | OpenVINO on Core Ultra (20) | 3 devices × 3 precisions + batch scaling | `docs/hardware/m10-phase4-benchmark.md` |
 | Robustness (15) | 20-seed eval, per-skill rates | `docs/hardware/m08-extended-eval.md` |
@@ -26,6 +26,7 @@ was verified present before commit.
   `pick(A, water_bottle)` **9/20 (45%)**; `handoff` 20/20 but **degenerate** —
   its envelope is a single point, so that figure measures determinism, not
   robustness, and must never be quoted bare.
+- Full-sequence video: pick + handoff + place in **one continuous 40.0 s take**, as **two** calls (`run_handoff`, whose Phase 1 *is* the pick, then `run_place`). The three-call form still fails at handoff Phase 3 — do not claim "any order composes". Two non-target props (mug, water bottle) are knocked over on camera; say so before a judge asks.
 - `pytest tests/test_skills.py` is **4 passed / 4 failed** — never describe the
   suite as passing.
 

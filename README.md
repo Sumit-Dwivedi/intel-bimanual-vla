@@ -22,6 +22,37 @@ Status section below for exactly which skill/arm/object combinations
 currently work end-to-end, and `SUBMISSION.md` for the full, unembellished
 submission checklist and rubric self-assessment.
 
+## Demo Video
+
+`docs/videos/full-sequence-demo.mp4` — one continuous, fixed-camera take of the
+full manipulation sequence: arm A picks the fork, hands it to arm B, and arm B
+places it on the table. 40.0 s, 1280x720, 30 fps, 4.2 MiB. No cuts, no camera
+moves, no speed changes: 8410 physics steps rendered every 7th step.
+
+Reproduce on bm-ptl with:
+
+```bash
+python scripts/render_full_sequence.py --seed 3 --stride 7 --distance 1.05
+```
+
+**It is two skill calls, not three.** `run_handoff`'s own Phase 1 *is* a nested
+`run_pick`, so `run_handoff(env, "B", "A", "fork")` already performs the pick and
+the transfer; `run_place(env, "B", "fork", "table")` then completes the sequence.
+Both report success (handoff 6610 steps, place 1800). The literal three-call form
+`pick` -> `handoff` -> `place` does NOT work — see the composition note in
+`SUBMISSION.md`.
+
+**Two things in the take are worth naming rather than leaving a viewer to wonder.**
+The green mug is knocked onto its side early in the run, and the blue water bottle
+is nudged and eventually falls off the table. Neither is the target object, and
+neither changes the measured outcome — the scripted skills plan only around the
+object they are acting on and have no collision avoidance for other props. The
+fork task itself completes: the fork ends at z=0.3537 on a table surface at
+z=0.35, with the weld released.
+
+`docs/videos/m06-handoff-clip.mp4` is retained but superseded as primary evidence:
+it is a 2.0 s close-up in which only the last ~0.5 s reads as a handoff.
+
 ## Status
 
 **In active development through Sept 16, 2026.** The final README — with reproduction
