@@ -66,8 +66,11 @@ apply):
   solver cannot reach it at all, at any tested height, by either arm — the
   direct cost of an exact top-down solver's smaller reachable set
   (ADR-070's own 35–53% figure).
-- **Fork handoff grasp points defined:** `P_from=(-0.03, 0.0, 0.40)` (arm
-  A), `P_to=(0.03, 0.0, 0.40)` (arm B) — 6 cm apart along world +x (the
+- **Fork handoff grasp points defined:** `P_from=(-0.03, 0.0, 0.46)` (arm
+  A), `P_to=(0.03, 0.0, 0.46)` (arm B) — 6 cm apart along world +x (the
+
+> **z corrected 0.40 -> 0.46 by orchestrator verification.** At z=0.40 the two arms placed at their handoff points simultaneously drive `armB_gripper` -0.0023 m into the `drawer` (and the `mug` at y=0), failing Stage 4 criterion (c). Measured clean band is z=0.435-0.485; 0.46 is its midpoint. Cross-arm contacts are zero throughout, so co-occupancy itself is sound.
+
   fork's own long axis; `fork.xquat` is identity), grasp yaw = π/2 (jaws
   across the shaft). Both reachable by their own arm at yaw=0.0 and
   yaw=π/2, with the tightest measured margin to either arm's own

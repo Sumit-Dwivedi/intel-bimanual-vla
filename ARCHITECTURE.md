@@ -6130,8 +6130,11 @@ exchange for the closed-form, sub-millimetre grasp accuracy it buys on the
 props it CAN reach (fork/mug/plate), consistent with ADR-070's own
 already-measured 35–53% workspace shrink versus the position-only solver.
 
-**Part D — fork handoff grasp points.** `P_from = (-0.03, 0.0, 0.40)` (arm
-A), `P_to = (0.03, 0.0, 0.40)` (arm B) — 6 cm apart along world +x, the
+**Part D — fork handoff grasp points.** `P_from = (-0.03, 0.0, 0.46)` (arm
+A), `P_to = (0.03, 0.0, 0.46)` (arm B) — 6 cm apart along world +x, the
+
+> **z corrected 0.40 -> 0.46 by orchestrator verification.** At z=0.40 the two arms placed at their handoff points simultaneously drive `armB_gripper` -0.0023 m into the `drawer` (and the `mug` at y=0), failing Stage 4 criterion (c). Measured clean band is z=0.435-0.485; 0.46 is its midpoint. Cross-arm contacts are zero throughout, so co-occupancy itself is sound.
+
 fork's own long axis (`fork.xquat` is the identity quaternion in
 `gen_dual_scene.py`'s `<body name="fork">`, which carries no `quat=`
 override, so the fork's local +x — the axis both its `fork_handle` and

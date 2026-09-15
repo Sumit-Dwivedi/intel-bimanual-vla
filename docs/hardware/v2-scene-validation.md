@@ -244,6 +244,21 @@ happens to exclude the one prop placed furthest from both arms' bases.
 
 ### D -- fork handoff grasp points
 
+> **CORRECTED by orchestrator verification (supersedes z=0.40 below).**
+> Stage 3 confirmed each handoff point was individually REACHABLE but never
+> placed BOTH arms at their points at once and checked the scene. At z=0.40
+> that test fails: `armB_gripper` penetrates the `drawer` by **-0.0023 m**,
+> and at y=0 the `mug` is struck as well (-0.0152 m) — Stage 4's criterion
+> (c) fails above 1 mm. Measured clean-and-reachable band, points 6 cm apart
+> in x at y=0, yaw=pi/2: **z = 0.435 to 0.485** (z<=0.430 contacts the table,
+> z>=0.490 is unreachable). The handoff line is therefore moved to
+> **z = 0.46**, the midpoint, with 2.5 cm margin on both sides.
+> **Cross-arm contacts are ZERO across the entire band**, including at z=0.40
+> — the two-arm co-occupancy that defeated master (Phase 3) and v1 is
+> genuinely solved by top-down IK. Only the height was wrong.
+
+
+
 `P_from = (-0.03, 0.0, 0.40)` (arm A), `P_to = (0.03, 0.0, 0.40)` (arm B) --
 6 cm apart along world +x, the fork's own long axis (`fork.xquat` is the
 identity quaternion in `gen_dual_scene.py`'s `<body name="fork">`, no
