@@ -1,5 +1,13 @@
 # M08 — formal 10-seed robustness evaluation of the four working skills (ADR-049)
 
+> **Superseded in part (added Sept 15).** `pick(A, water_bottle)`'s 6/10
+> below was extended to 20 seeds in `docs/hardware/m08-extended-eval.md`
+> (ADR-053), which measures **9/20 (45%)** — seeds 0-9 reproduced
+> bit-for-bit, so the 10-seed figure was small-sample optimism rather than
+> a behavioural change. `pick(A, fork)` and `place(A, fork, table)` extend
+> to 20/20. The 10-seed figures on this page are retained unchanged as the
+> original record of what ADR-049 measured.
+
 **Recorded:** Sept 14, 2026 · HEAD at start: `42c9e22` (M07, ADR-048).
 **Provenance.** Every number below ran on bm-ptl,
 `C:\Users\devcloud\project\ov_env\Scripts\python.exe` (`mujoco==3.2.7`).
