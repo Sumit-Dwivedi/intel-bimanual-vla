@@ -6017,6 +6017,154 @@ are all untouched.
 
 ---
 
+### ADR-072 — v2 Stage 3: home pose and scene geometry validated under top-down IK — home pose KEPT unmodified, water_bottle scoped out (disclosed regression), handoff grasp points defined with measured margins
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from
+`master` at `238cfed`) · **New:** `scripts/v2_validate_scene.py`,
+`docs/hardware/v2-scene-validation.md` · **Does not modify:** `ik.py`,
+`skills_scripted.py`, `grasp.py`, `env.py`, `executor.py`, `scenes/so101/`,
+`ik_geometric.py` (ADR-070), `motion.py` (ADR-071), `scripts/gen_dual_scene.py`
+(no prop was moved — see Part C below) · **Follows:** ADR-026 (the "home"
+keyframe this stage validates rather than replaces), ADR-070 (the top-down
+solver this stage's every reachability answer is measured with), ADR-047
+(bm-ptl authoritative for cross-machine floating-point questions), ADR-038
+(the prop-move regression precedent Part C's decision is built on).
+
+**Context.** This stage's own task brief opened with a premise this ADR
+finds, on re-measurement, to be backwards: it asked to replace the current
+"home" keyframe with Lab 8's all-zeros single-arm home, describing the
+CURRENT home as "the extended pose". Re-measured directly on this session
+(both laptop and bm-ptl, byte-identical — no physics stepping is involved
+in any measurement below, so ADR-047's float-divergence risk does not
+apply here): the CURRENT home (`shoulder_lift=-1.2, elbow_flex=-1.6`,
+ADR-026) is the FOLDED, collision-free pose; all-zeros is the EXTENDED
+pose that interpenetrates (23 total contacts, 19 armA↔armB, deepest
+-0.0597 m — matching the task brief's own figures exactly; ADR-026's
+original count, 34/29, predates ADR-028's jaw-mesh-collision changes and is
+superseded, not contradicted, by this fresher measurement of the same
+pose). This stage's job, correctly scoped despite the brief's inverted
+framing, is to VALIDATE the existing home pose and scene against the
+stricter top-down solver's own criteria, not to swap poses on the brief's
+say-so.
+
+**Part A — home-pose verdict: KEPT, unmodified.** Four criteria, measured
+by `scripts/v2_validate_scene.py` (full numbers and ASCII-style log in
+`docs/hardware/v2-scene-validation.md`):
+
+| gate | measured | result |
+|---|---|---|
+| no self-collision (armA, armB each vs. themselves) | 0, 0 contacts | PASS |
+| no arm-vs-table/drawer contact | 0 contacts | PASS |
+| no cross-arm contact | 0 contacts | PASS |
+| pinch point above table (both arms) | z=0.5882 m vs table 0.35 m, margin +0.2382 m | PASS |
+| both arms clear of every prop's approach column (measured per-prop radius, 15 cm column) | plate +0.109 m, mug +0.022 m, water_bottle +0.123 m — PASS; fork -0.009 m, spoon -0.033 m — FAIL | disclosed, see below |
+
+The first four rows are unambiguous, MuJoCo-verified real-contact measures
+and all pass cleanly with exact zero counts (only 4 benign prop-on-table
+contacts exist at this pose). The fifth is a self-defined heuristic — the
+task brief specifies a 15 cm approach column but no radius, so this stage
+tried two methodologies (one constant sized to the largest prop, and one
+measured per-prop from each object's own geometry via `model.geom_rbound`)
+and kept the more defensible one (per-prop). Under it, the fork and spoon
+show a small negative margin, traced (not left opaque) to the OTHER arm's
+own folded `*_shoulder` mesh, which at this pose swings to world
+`(≈0, ±0.184, 0.406)` — inward toward the table's y=0 centreline and within
+the fork/spoon's overhead column, both horizontally (10–14 cm) and
+vertically. This is a genuine, measured PROXIMITY under a conservative
+bounding-sphere proxy, not an actual contact (the real contact solver
+already reports zero here) — reported as a disclosed limitation for a
+later stage's motion sequencing to be mindful of, not treated as grounds to
+destabilize the pose. **Decision: KEEP the current home keyframe, no
+change.** Justification beyond the clean 4-of-5 result: ADR-026 already
+searched this pose space (every sign combination of
+`shoulder_lift`/`elbow_flex`, rendered and contact-counted) and found
+exactly one better-or-equal candidate — the current one; the only other
+symmetric option it tried is strictly worse (13 self-collisions/arm plus a
+table penetration), so there is no adjustment available that would clear
+the heuristic's near-miss without reintroducing a real, MuJoCo-verified
+collision instead.
+
+**Part B — prop reachability and handoff corridor: CONFIRMED on bm-ptl, one
+diagnostic-number discrepancy disclosed.** The hover-reachability table
+(fork/mug/plate reachable by both arms at every tested height, 0–10 cm) and
+the 5-height handoff-corridor sweep (93/89/75/21/0 cells at z=0.38/0.42/
+0.45/0.50/0.55, with x/y extents matching to the centimetre) reproduce the
+task's own reported numbers exactly, on bm-ptl. Per the task's explicit
+instruction, the arm-separation sweep itself was **deliberately not run** —
+the confirmed corridor is wide enough (12 cm y-extent at the two best
+heights, vs. 4 cm under the OLD position-only IK on the archived `redesign`
+branch) that the contingency for widening the base gap is not triggered.
+One number underneath does not match: this stage's own diagnostic of WHY
+`water_bottle` is unreachable (reusing `solve_topdown_ik`'s own internal
+shoulder-offset-circle projection) measures a required planar reach of
+0.3046 m against a 2-link annulus max of 0.2510 m, vs. the task's own
+0.271 m / ~0.249 m — the verdict is identical (unreachable, both arms,
+every height, a genuine horizontal-reach problem) but the intermediate
+numbers differ by several centimetres, most likely because this
+diagnostic's projection already subtracts the ADR-070-documented ~2 cm
+lateral offset that a simpler straight-line measurement would not. Flagged
+rather than silently reconciled.
+
+**Part C — water_bottle: SCOPED OUT of v2, not moved. A real, disclosed
+regression versus master.** Two options were available (move `BOTTLE_POS`
+inward in `gen_dual_scene.py`, or scope bottle skills out). **Decision:
+scope out; the prop is not moved and the scene is not regenerated.**
+Reasoning: `gen_dual_scene.py` already carries a directly relevant,
+documented precedent (ADR-038 fix 3) in which moving four props' positions
+for an unrelated, cosmetic reason broke a previously-working `handoff` at a
+phase a per-prop bisection could not isolate to any single moved prop —
+only reverting all four fixed it. Moving `BOTTLE_POS` again carries the
+same demonstrated risk of an unrelated regression elsewhere in the scene,
+and this stage's time budget does not include the full-skill regression
+sweep that would be needed to responsibly rule that out. Scoping out is
+acceptable because `pour` (the only skill that uses `water_bottle`) is
+already `PLAN.md`'s own rung-2 cut-ladder item — the first skill dropped if
+any schedule gate is missed — and ADR-011/ADR-017 already disclose it as a
+tilt-pose-only skill with no fluid simulation. **The regression, stated
+plainly, not buried:** master's own baseline (`ik.py`'s position-only
+solver, no top-down constraint) reached `water_bottle` imperfectly but
+non-trivially (`pick(A, water_bottle)`, 9/20). Under this branch's top-down
+solver, `water_bottle` is unreachable by either arm at any tested hover
+height — a direct, real cost of adopting an exact top-down solver in
+exchange for the closed-form, sub-millimetre grasp accuracy it buys on the
+props it CAN reach (fork/mug/plate), consistent with ADR-070's own
+already-measured 35–53% workspace shrink versus the position-only solver.
+
+**Part D — fork handoff grasp points.** `P_from = (-0.03, 0.0, 0.40)` (arm
+A), `P_to = (0.03, 0.0, 0.40)` (arm B) — 6 cm apart along world +x, the
+fork's own long axis (`fork.xquat` is the identity quaternion in
+`gen_dual_scene.py`'s `<body name="fork">`, which carries no `quat=`
+override, so the fork's local +x — the axis both its `fork_handle` and
+`fork_head` geoms run along — IS world +x). Both points sit inside the
+widest measured corridor band (z=0.38–0.42, |y|≤0.06), at y=0 (the
+corridor's centre). Grasp yaw for the fork = fork heading (0, since it
+lies along world +x) + 90° = π/2, so the jaws close ACROSS the shaft, not
+along it. Both points are reachable by their own assigned arm at both
+yaw=0.0 (the solver's best top-down alignment) and yaw=π/2 (the real fork
+grasp orientation). Measured margins to each arm's own top-down-reachable
+boundary (four cardinal directions, 2 mm search resolution): the tightest
+direction for either point, either yaw, is **0.066–0.068 m** (toward the
+OTHER arm's side) — more than double the required ≥3 cm margin; the other
+three directions clear by 0.15–0.22 m. Gripper-vs-gripper physical
+collision between the two arms at this handoff pose is NOT checked here
+(that needs an actual grasp/weld simulation, out of this stage's scope) —
+only kinematic reachability with a workspace-boundary margin, which is
+what this stage asked for.
+
+**Consequences.** The scene (`scenes/so101/`, `gen_dual_scene.py`'s
+generated `so101_dual_table.xml`) and the home keyframe (ADR-026) are
+UNCHANGED by this stage — every file this stage was told not to modify
+stays untouched, verified by `git diff --stat` showing no changes outside
+`scripts/v2_validate_scene.py`, `docs/hardware/v2-scene-validation.md`,
+this entry and its `DECISIONS.md` mirror. A later v2 stage that implements
+the actual fork-handoff sequence (using `ik_geometric.solve_topdown_ik` +
+`motion.move_to_config`) can use `P_from`/`P_to` directly. A later stage
+that revisits `water_bottle`/`pour` must either accept the top-down solver
+cannot reach it as placed, or reopen Part C's decision with a proper
+regression sweep this stage's budget did not include.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

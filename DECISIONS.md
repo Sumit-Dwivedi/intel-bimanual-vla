@@ -11,6 +11,71 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-072 — v2 Stage 3: home pose and scene geometry validated under top-down IK — home KEPT unmodified, water_bottle scoped out (disclosed regression), handoff grasp points defined with measured margins
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from
+`master` at `238cfed`) · **New:** `scripts/v2_validate_scene.py`,
+`docs/hardware/v2-scene-validation.md` · **Does not modify:** `ik.py`,
+`skills_scripted.py`, `grasp.py`, `env.py`, `executor.py`, `scenes/so101/`,
+`ik_geometric.py`, `motion.py`, `scripts/gen_dual_scene.py` (no prop
+moved) · **Follows:** ADR-026 (the home keyframe this validates rather
+than replaces), ADR-070 (the top-down solver every reachability number
+here is measured with).
+
+Full context, the traced approach-column near-miss (fork/spoon vs. the
+other arm's folded shoulder mesh), the ADR-038 prop-move precedent behind
+the water_bottle decision, and the complete validation writeup are in
+`ARCHITECTURE.md`'s ADR-072 entry and `docs/hardware/v2-scene-validation.md`
+— not duplicated here. Headline findings, all measured on bm-ptl and
+reproduced byte-identical on the laptop (no physics stepping is involved
+in any measurement here, so ADR-047's float-divergence concern does not
+apply):
+
+- **Task brief's premise was backwards, and independently reconfirmed:**
+  the CURRENT home (`shoulder_lift=-1.2, elbow_flex=-1.6`, ADR-026) is the
+  FOLDED, collision-free pose; Lab 8's all-zeros suggestion is the EXTENDED
+  one that interpenetrates — 23 total contacts, 19 armA↔armB, deepest
+  -0.0597 m, matching the task's own figures exactly.
+- **Home-pose verdict: KEPT, unmodified.** All 4 MuJoCo-verified gates
+  (self-collision, arm-vs-table, cross-arm, pinch-point height) PASS with
+  exact zero counts (self/cross/table) and a +0.238 m pinch-point margin.
+  A 5th, self-defined heuristic (approach-column clearance, radius
+  unspecified by the task) shows a small negative margin for fork/spoon
+  only, traced to the OTHER arm's own folded shoulder mesh swinging near
+  their overhead column — a measured proximity under a conservative
+  bounding-sphere proxy, not an actual contact (the real solver reports
+  zero) — disclosed as a limitation, not treated as grounds to change a
+  pose ADR-026 already showed has no better symmetric alternative.
+- **Prop reachability / handoff corridor: CONFIRMED on bm-ptl**, exact
+  match to the task's own tables (fork/mug/plate reachable at every tested
+  height by both arms; water_bottle unreachable at every height by both
+  arms; corridor 93/89/75/21/0 cells at z=0.38/0.42/0.45/0.50/0.55,
+  extents matching to the centimetre). Per instruction, the arm-separation
+  sweep was deliberately NOT run — the confirmed 12 cm corridor is wide
+  enough that its contingency is not triggered. One water_bottle
+  diagnostic sub-number (required planar reach) differs from the task's
+  own figure by several cm though the reachability verdict itself matches
+  exactly — flagged, not silently reconciled.
+- **water_bottle: SCOPED OUT of v2, prop NOT moved.** `gen_dual_scene.py`
+  already documents a directly relevant precedent (ADR-038 fix 3: moving
+  props broke a working `handoff` for a reason a per-prop bisection could
+  not isolate) that makes moving `BOTTLE_POS` a real, undischarged risk
+  this stage's budget cannot responsibly clear. Disclosed regression versus
+  master, stated plainly: master's `ik.py` reached `water_bottle`
+  imperfectly (`pick(A, water_bottle)`, 9/20); this branch's top-down
+  solver cannot reach it at all, at any tested height, by either arm — the
+  direct cost of an exact top-down solver's smaller reachable set
+  (ADR-070's own 35–53% figure).
+- **Fork handoff grasp points defined:** `P_from=(-0.03, 0.0, 0.40)` (arm
+  A), `P_to=(0.03, 0.0, 0.40)` (arm B) — 6 cm apart along world +x (the
+  fork's own long axis; `fork.xquat` is identity), grasp yaw = π/2 (jaws
+  across the shaft). Both reachable by their own arm at yaw=0.0 and
+  yaw=π/2, with the tightest measured margin to either arm's own
+  reachable boundary at 0.066–0.068 m — more than double the required
+  ≥3 cm gate.
+
+---
+
 ## ADR-071 — v2 Stage 2: cubic-spline joint-space motion primitive (`motion.py`), plus its mandatory tracking/velocity/acceleration/idle-arm-drift validation — a real, investigated gate miss on idle-arm drift, reported rather than worked around
 
 **Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from
