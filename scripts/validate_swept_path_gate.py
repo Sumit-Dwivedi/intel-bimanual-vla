@@ -94,10 +94,27 @@ def _run_check(label: str) -> dict:
 
 def main() -> int:
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"])
+    commit = _git(["rev-parse", "--short", "HEAD"])
+    commit_subject = _git(["log", "-1", "--format=%s"])
+    # bm-ptl's own clone (per this stage's SSH recipe: `git fetch ... redesign`
+    # then `git reset --hard FETCH_HEAD`, never `git checkout -b redesign`)
+    # keeps whatever LOCAL branch name it already had -- observed to be
+    # literally "master" there even though its CONTENT is redesign's tip.
+    # The safety property that matters is the COMMIT, not the local name, so
+    # this is a loud warning (never silent), not a hard stop, when the name
+    # differs but the commit subject is clearly a redesign-stage commit.
     if branch != "redesign":
-        print(f"REFUSING to run: current branch is {branch!r}, expected 'redesign'.")
-        return 2
-    print(f"branch: {branch} (confirmed)")
+        if "Redesign Stage" in commit_subject:
+            print(f"WARNING: local branch name is {branch!r}, not 'redesign' -- but HEAD "
+                  f"({commit}) is {commit_subject!r}, a redesign-stage commit (this matches "
+                  f"bm-ptl's own fetch+reset recipe, which never renames the local branch). "
+                  f"Proceeding.")
+        else:
+            print(f"REFUSING to run: current branch is {branch!r} at {commit} "
+                  f"({commit_subject!r}), which does not look like a redesign-stage commit.")
+            return 2
+    else:
+        print(f"branch: {branch} (confirmed)")
 
     dirty_before = _git(["status", "--porcelain", "--", str(XML_PATH)])
     if dirty_before:
