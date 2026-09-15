@@ -65,6 +65,22 @@ Usage:
     python run_demo.py
     python run_demo.py --seed 3
     ./run_demo.sh --seed 3
+    python run_demo.py --voice data/voice/give_fork_to_arm_b.wav
+
+`--voice PATH` (M15/ADR-058) replaces the four-skill oracle sequence above
+with a single voice-driven one: `VoiceCommandSource` (Speechmatics,
+`src/bimanual/command/voice_source.py`) transcribes the WAV file, the
+transcript is printed, `RuleGrounder` (M05) grounds it into a `TaskPlan`,
+and every grounded `SkillCall` runs -- via the SAME `run_step`/`print_result`
+/`print_summary` machinery step 4-6 above already use, so a voice-driven
+run is reported in the identical format, not a bespoke one. With no
+`--voice` flag, none of this new code path is imported or run at all, and
+this script's original behaviour (steps 1-7 above) is unchanged -- see
+`docs/hardware/voice-transcription-probe.md` for why "Give the fork to arm
+B" specifically is the phrase this path is verified against (also the
+phrase `scripts/run_grounded_demo.py`, M10 Phase 5, already established as
+the grammar-correct, composition-correct substitute for the brief's own
+unparseable literal example).
 """
 
 from __future__ import annotations
@@ -414,7 +430,13 @@ def print_summary(results: list[dict]) -> int:
     print("=" * 72)
     print("6. SUMMARY")
     print("=" * 72)
-    print(f"  Skills completed: {n_pass}/4")
+    # `len(results)` (not a hardcoded 4) -- the default path always passes
+    # exactly 4 results so this was previously indistinguishable from the
+    # literal "4" it replaces, but M15's --voice path (run_voice_demo) can
+    # call this with a different-length plan, and the hardcoded value would
+    # silently print a wrong denominator (found via `--voice`'s own single-
+    # skill "Give the fork to arm B" plan printing "1/4" instead of "1/1").
+    print(f"  Skills completed: {n_pass}/{len(results)}")
     for r in results:
         print(f"    [{'PASS' if r['success'] else 'FAIL'}] {r['label']}")
     print()
@@ -422,6 +444,139 @@ def print_summary(results: list[dict]) -> int:
     print(f"  10-seed robustness evaluation (Track A own-prop / Track B multi-prop): {DOC_ROBUSTNESS}")
     print()
     return n_pass
+
+
+# ---------------------------------------------------------------------------
+# --voice: transcribe -> ground -> execute, reported via the SAME
+# run_step/print_result/print_summary functions steps 4-6 above use (M15,
+# ADR-058). Nothing in here runs, or is even imported, unless --voice is
+# passed -- see main()'s branch above.
+# ---------------------------------------------------------------------------
+def _voice_step(skill_call, object_body_name: dict) -> DemoStep:
+    """Build a `DemoStep` for one grounded `SkillCall` from voice input.
+
+    Mirrors `build_plan`'s DemoSteps above, but generically -- a voice
+    command is not one of the four fixed, pre-measured skills `build_plan`
+    knows the placement envelope for, so this always runs at the FIXED
+    default scene layout (`randomizer=None`), the same honest choice
+    `build_plan` already makes for `handoff` (see that function's
+    docstring). `target_prop` is resolved through
+    `bimanual.control.skills_scripted.OBJECT_BODY_NAME` -- the same
+    canonical "SkillCall.target_object" -> "MuJoCo body name" table
+    `skills_scripted.py`'s own skill implementations use (e.g.
+    `SkillCall.target_object="bottle"` reads MuJoCo body `water_bottle`) --
+    rather than assuming the two names are always equal.
+    """
+    target_prop = object_body_name.get(skill_call.target_object, skill_call.target_object)
+    return DemoStep(
+        label=f"{skill_call.skill}({skill_call.arm}, {skill_call.target_object})",
+        skill_call=skill_call,
+        randomizer=None,
+        target_prop=target_prop,
+        z_label=f"{target_prop} z",
+        seed_note=(
+            "voice-grounded command; fixed default scene layout (no measured "
+            "per-skill envelope is looked up for an arbitrary grounded plan)."
+        ),
+    )
+
+
+def run_voice_demo(audio_path: Path, seed: int) -> int:
+    """Transcribe `audio_path`, ground it, execute it, report it.
+
+    Returns 0 iff transcription, grounding, AND every grounded skill all
+    succeed -- matching `main()`'s own exit-code contract for the default
+    path (0 iff every skill in the plan passed).
+    """
+    # Deferred imports, same rationale as main()'s own deferred block:
+    # keep a hard mujoco import failure inside check_environment()'s own
+    # clear message, not a raw traceback here. voice_source.py itself does
+    # NOT need mujoco (it is pure stdlib + network) but this function goes
+    # on to execute the grounded plan in MuJoCo, so the same deferral
+    # applies to it as a whole.
+    from bimanual.command.voice_source import VoiceCommandSource, VoiceTranscriptionError
+    from bimanual.control import skills_scripted as sk
+    from bimanual.control.executor import ScriptedSkillExecutor
+    from bimanual.language.grounder import UngroundedCommandError
+    from bimanual.language.rule_grounder import RuleGrounder
+    from bimanual.sim.env import TableSettingEnv
+
+    # OBJECT_BODY_NAME (SkillCall.target_object -> MuJoCo body name, e.g.
+    # "bottle" -> "water_bottle") lives on skills_scripted, not executor --
+    # see that module's own "Object vocabulary" comment.
+    object_body_name = sk.OBJECT_BODY_NAME
+
+    print("=" * 72)
+    print("VOICE INPUT (Speechmatics, M15/ADR-058)")
+    print("=" * 72)
+    print(f"  audio file: {audio_path}")
+
+    # Construction does the entire (necessarily blocking) Speechmatics
+    # round trip eagerly -- see voice_source.py's module docstring. Any
+    # failure here (missing key, auth, network, timeout, bad/empty audio)
+    # is one of VoiceTranscriptionError's subclasses, never a raw
+    # exception -- caught here so a voice failure is a clear, reported
+    # message and a non-zero exit, not a crash or traceback.
+    try:
+        source = VoiceCommandSource(audio_file=audio_path)
+    except VoiceTranscriptionError as exc:
+        print(f"  FAILED ({type(exc).__name__}): {exc}")
+        print()
+        print("FATAL: --voice was given but transcription did not succeed (see message above).")
+        return 1
+
+    event = source.poll()
+    source.close()
+    # Not expected in practice (construction already either produced an
+    # event or raised) -- guarded anyway because poll() is typed to return
+    # CommandEvent | None and this function must not assume otherwise.
+    if event is None:
+        print("  Voice source produced no command (empty poll() immediately after construction).")
+        return 1
+
+    # The transcript is printed -- and nothing about the API key is: the
+    # key itself lives only inside voice_source.py's in-process HTTP calls
+    # and is never part of a CommandEvent, this print, or any exception
+    # message anywhere in this path.
+    print(f"  transcript ({event.source_id}, confidence={event.confidence}): {event.text!r}")
+    print()
+
+    grounder = RuleGrounder()
+    try:
+        plan = grounder.ground(event)
+    except UngroundedCommandError as exc:
+        print(f"  GROUNDING FAILED: {exc}")
+        print(f"  (see docs/command-grammar.md for what RuleGrounder accepts)")
+        return 1
+
+    if plan.is_empty():
+        print("  Transcript grounded to an EMPTY plan (blank/whitespace-only command). Nothing to execute.")
+        return 1
+
+    print(f"  grounded to {len(plan)} skill call(s):")
+    for call in plan:
+        print(f"    {call.skill}(arm={call.arm}, target={call.target_object}, params={call.params})")
+    print()
+
+    print("=" * 72)
+    print("EXECUTION (oracle mode, ADR-046 default; fresh env+executor per skill, ADR-047)")
+    print("=" * 72)
+    # Each grounded skill runs as its own independent episode (same
+    # fresh-env-per-skill pattern as run_step's callers above, ADR-047) --
+    # NOT as a single chained TaskPlan. For a multi-skill voice command this
+    # means the skills do not compose into one continuous episode; see
+    # SUBMISSION.md's own documented composition caveat for why that is a
+    # disclosed limitation of this project's `handoff` implementation, not
+    # something this script papers over.
+    results = [
+        run_step(_voice_step(call, object_body_name), seed, TableSettingEnv, ScriptedSkillExecutor, sk)
+        for call in plan
+    ]
+    for r in results:
+        print_result(r)
+
+    n_pass = print_summary(results)
+    return 0 if n_pass == len(results) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +605,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip step 1 (environment check). Not recommended -- present for debugging only.",
     )
+    parser.add_argument(
+        "--voice",
+        type=Path,
+        default=None,
+        metavar="WAV_PATH",
+        help=(
+            "Transcribe WAV_PATH via Speechmatics (M15/ADR-058) and run the grounded "
+            "command instead of the default four-skill oracle sequence. Requires an "
+            "`ai_infra` value in a repo-root .env -- see README.md's Voice Input "
+            "section. Ignores --seed for placement randomization (voice-grounded "
+            "plans run at the fixed default scene layout; --seed still selects which "
+            "of oracle mode's deterministic resets is used). See "
+            "docs/command-grammar.md for what phrasing RuleGrounder accepts, and "
+            "docs/hardware/voice-transcription-probe.md for why 'Give the fork to "
+            "arm B' is the phrase this path is verified against."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.skip_env_check:
@@ -460,6 +632,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if not check_assets():
         return 1
+
+    # --voice replaces steps 3-6 above with a single voice-driven run; see
+    # this module's docstring. Checked here, AFTER the env/asset checks
+    # above (both still apply -- mujoco is required either way) and BEFORE
+    # the standard oracle-mode imports below, so a --voice run and a
+    # no-args run share steps 1-2 byte-for-byte and diverge only from here.
+    if args.voice is not None:
+        return run_voice_demo(args.voice, args.seed)
 
     # Every import below touches mujoco (directly or transitively) and is
     # deferred to this point deliberately: check_environment() above is

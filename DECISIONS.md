@@ -11,6 +11,153 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-058 — Speechmatics voice input wired end to end (M15): `VoiceCommandSource` finished, `run_demo.py --voice` added — three disclosed, user-authorised deviations from the written plan, none silent
+
+**Ratified:** Sept 15, 2026 · **Closes:** M15 (previously unscheduled/droppable,
+`PLAN.md`) · **Follows:** ADR-002 (the `CommandSource` seam this fills in),
+ADR-019 (credential handling this narrows one detail of) · **Modifies:**
+`src/bimanual/command/voice_source.py` (extends the M04 stub, same
+`audio_file: Path` constructor signature, same `poll()`/`close()` shape),
+`run_demo.py` (adds `--voice PATH`, plus an unrelated pre-existing bug fix,
+below), `tests/test_command_source.py` (updated for real, network-mocked
+behaviour). **New:** `docs/hardware/voice-transcription-probe.md`,
+`data/voice/` (gitignored WAV files, `.gitkeep` tracked).
+
+**What this closes.** `PLAN.md`'s M15 (Speechmatics voice input) was the
+lowest rung of the cut ladder, unscheduled as of Sept 12 and pre-committed
+dropped if the Day-5 20:00 gate was missed. It was not built during the
+originally planned window. This entry records it being finished afterward,
+at the user's explicit direction, against a live Speechmatics key. The
+`CommandSource`/`CommandEvent` seam (ADR-002) needed zero changes — exactly
+the point of building that abstraction in M04 before a real credential
+existed.
+
+**Non-blocking `poll()`, resolved by construction-time eager transcription.**
+`CommandSource.poll()` (`source.py`) must not block; a Speechmatics batch
+job genuinely takes several seconds. `VoiceCommandSource.__init__` now runs
+the entire submit -> poll-status -> fetch-transcript round trip eagerly,
+once, exactly as `TextCommandSource` already reads its own (cheaper) input
+eagerly at construction (`text_source.py`) and exactly as `source.py`'s own
+docstring anticipated ("waiting must happen elsewhere ... e.g. eagerly at
+construction time"). `poll()` itself only pops a one-slot buffer. Measured:
+construction ~3-3.5 s (network-bound, expected); `poll()` <0.0001 s.
+
+**Deviation 1 — execution location.** `ARCHITECTURE.md:131` ("CommandSource:
+voice | only here (laptop) | never [bm-ptl]") and `CONSTRAINTS.md:40`
+describe voice as laptop-side. The user directed this integration to be
+exercised end to end **on bm-ptl** instead, because MuJoCo only runs there
+(ADR-020) and shuttling a transcript between the laptop and bm-ptl for
+every run was judged not worth the friction for a bonus feature. This is a
+deliberate, user-authorised deviation, stated here plainly rather than
+silently contradicting either document. `VoiceCommandSource` itself has no
+platform check (it is pure stdlib + network, see Deviation 3 below) — the
+deviation is in where `run_demo.py --voice` is actually run, not in the
+code.
+
+**Deviation 2 — credential variable name.** ADR-019 specified
+`SPEECHMATICS_API_KEY`. The repository's actual `.env` (present before this
+task started, confirmed gitignored and untracked on both the laptop and
+bm-ptl) uses the variable name **`ai_infra`**. `voice_source.py` reads
+`ai_infra`, not `SPEECHMATICS_API_KEY`. ADR-019's *mechanism* — gitignored
+`.env`, read from a file/environment rather than a literal, fail loudly if
+absent — is unchanged and is exactly what `VoiceCommandSource` does
+(`MissingApiKeyError` if the variable is absent or blank). Only the literal
+name differs from what was originally written down.
+
+**Deviation 3 — `operating_point="enhanced"`, not `"standard"`.**
+`CONSTRAINTS.md:40` says "Standard model". Measured directly
+(`docs/hardware/voice-transcription-probe.md`): on this integration's own
+verified demo phrase, **"Give the fork to arm B"**,
+`operating_point="standard"` transcribed the trailing single-letter arm ID
+as the word "be" on every audio variant tried (plain TTS reading, and a
+paused/spelled-out one) — `Give the fork to arm be` — which
+`RuleGrounder`'s `to\s+arm\s+[ab]$` pattern (`rule_grounder.py`) cannot
+match. `operating_point="enhanced"` transcribed it correctly
+(`Give the fork to arm B`) on the first try. Both operating points are
+Speechmatics' own generic hosted service — neither is a custom-trained
+model — so this does not touch `CONSTRAINTS.md:45`'s "no custom novel
+architectures" line; the only real cost is Speechmatics' own higher price
+for the "enhanced" tier. Punctuation is also disabled
+(`punctuation_overrides: {"permitted_marks": []}`) for an independent
+reason: the default punctuation model split the same sentence into two
+("...arm. Be."), which the grammar's single-clause pattern would not match
+either way.
+
+**Test phrase.** "Give the fork to arm B" — not the brief's own literal
+example command, which does not parse under `RuleGrounder`'s frozen grammar
+(the same finding `scripts/run_grounded_demo.py`, M10 Phase 5, already
+made and documented; this phrase is that same script's own
+grammar-correct, composition-correct substitute, reused here rather than
+re-derived). It grounds to exactly one `SkillCall`:
+`handoff(arm="B", target_object="fork", params={"from_arm": "A"})` — the
+same call `run_demo.py`'s own default 4-skill sequence already runs and
+has already verified passes.
+
+**Environment: no `voice_env` needed, `ov_env`/`train_env` untouched.**
+`voice_source.py` is implemented against the standard library only
+(`urllib.request`, `json`, `wave`, `uuid`) — no `speechmatics-python` SDK,
+no `requests`. The pre-flight for this task had already proven plain
+`urllib` reaches the Speechmatics API; this integration confirms the SDK
+was unnecessary for a batch-transcription client this small, so no new
+virtual environment was created. `run_demo.py --voice` runs in the SAME
+`ov_env` the no-args path already uses. Re-verified after this change,
+on bm-ptl: `ov_env` — `mujoco==3.2.7`, `openvino==2026.3.1`,
+`numpy==2.4.6` (unchanged); `train_env` — `torch==2.14.0+xpu`,
+`openvino==2026.3.1` (unchanged, and untouched by this work entirely).
+
+**Incidental bug fix, disclosed.** `run_demo.py`'s `print_summary` printed
+a hardcoded `f"{n_pass}/4"`, invisible as a bug while every caller always
+passed exactly 4 results. `--voice`'s single-skill plan exposed it
+(printed "1/4" instead of "1/1"). Fixed to `f"{n_pass}/{len(results)}"`;
+for the unchanged 4-skill default path this is byte-identical (`len(results)
+== 4` there always), verified below.
+
+**Regression gate (bm-ptl, `ov_env`), before and after, byte-identical:**
+`python run_demo.py` — 4/4 PASS, exit 0, `pick(A, fork)`/`place(A, fork,
+table)`/`pick(A, bottle)`/`handoff(A→B, fork)` all PASS with the same
+frames/z values as `run_demo.py`'s own established baseline, ~24.8-24.9 s
+both runs.
+
+**`--voice` run (bm-ptl, `ov_env`, `data/voice/give_fork_to_arm_b.wav` —
+Windows SAPI-synthesized speech, not a placeholder file, sent to the real
+Speechmatics API):** transcript `'Give the fork to arm B'`
+(`source_id=voice_speechmatics`, `confidence=0.983`); grounded to
+`handoff(arm=B, target=fork, params={'from_arm': 'A'})`; executed and
+**PASSED** (`frames=6610`, `fork z=0.5498`, `lateral_separation=0.1946 m` —
+identical numbers to the same handoff step in the default 4-skill run,
+confirming this is the same underlying skill call, not a different one that
+happens to also pass); `Skills completed: 1/1`; exit 0; ~20.6 s. The real
+32-character `ai_infra` key was confirmed, by an in-process substring check
+against the full captured stdout+stderr (the check script itself never
+printed the key), to **not** appear anywhere in the output.
+
+**Tests.** `tests/test_command_source.py`: 19/19 passed (both on the
+laptop and on bm-ptl's `ov_env`), 0.15-0.29 s — every `VoiceCommandSource`
+test monkeypatches `urllib.request.urlopen` with a fake Speechmatics
+server and a temporary `.env`, so the suite never touches the real network
+or the real key. Covers: successful transcription; `poll()` near-instant
+after construction; missing key -> `MissingApiKeyError` (no network
+attempted); malformed WAV -> `InvalidAudioError` (no network attempted);
+HTTP 401 -> `AuthenticationError`; `URLError` -> `NetworkUnreachableError`;
+stuck-`running` job -> `JobTimeoutError`; `rejected` job ->
+`InvalidAudioError`; zero-word transcript -> `EmptyTranscriptError`; and
+the M04 Liskov parity test (`TextCommandSource`/`VoiceCommandSource`
+against the same `CommandSource` contract), updated to the real
+implementation rather than the retired stub. The M04 audio-terms grep gate
+(`grep -ri "audio|pcm|wav|microphone" src/bimanual/language
+src/bimanual/policy`) still returns zero matches.
+`pytest tests/test_skills.py` (bm-ptl): unchanged, 4 passed / 4 failed,
+same four tests and reasons as the documented baseline — this work did not
+touch `skills_scripted.py`, `grasp.py`, `ik.py`, `executor.py`,
+`scenes/so101/`, or `gen_dual_scene.py`.
+
+**Full technical account:** `src/bimanual/command/voice_source.py`'s own
+module docstring (design rationale for every point above) and
+`docs/hardware/voice-transcription-probe.md` (the operating-point
+measurement in full).
+
+---
+
 ## ADR-057 — Multi-seed IK diagnostic: every genuine IK-convergence failure measured is Case 1 (variance ≈ 0, one basin — a genuine boundary, not rescuable by multi-seed); a fifth target's documented "failure" turns out not to be an IK failure at all — Commit 3's retry-with-perturbed-target wrapper is not supported by this data
 
 **Ratified:** Sept 15, 2026 · **Follows:** ADR-056 (the `num_seeds`

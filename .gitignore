@@ -22,6 +22,15 @@ checkpoints/*.bin
 # subdirectories specifically so dataset_meta.json is not swept up with them.
 data/posenet/images/
 data/posenet/labels/
+
+# M15 (Speechmatics voice input, ADR-058): local WAV files used with
+# `run_demo.py --voice` / `VoiceCommandSource` are not committed -- arbitrary
+# size, no reproducibility value beyond the transcript the demo already
+# prints, and (unlike the scene assets) not needed for anyone else to
+# reproduce a text-driven run. The directory itself is kept via .gitkeep so
+# `data/voice/` exists in a fresh clone for README's Voice Input usage.
+data/voice/*.wav
+!data/voice/.gitkeep
 *.mp4
 *.avi
 # Exception: committed demo clip evidence (Fix B), small handful of MB,

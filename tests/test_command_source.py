@@ -1,4 +1,6 @@
-"""Tests for the CommandSource abstraction (PLAN.md M04).
+"""Tests for the CommandSource abstraction (PLAN.md M04) and its two
+implementations, including the real Speechmatics wiring added in M15
+(`voice_source.py`, ADR-058).
 
 Covers M04's three done-when criteria:
   1. Normal text, empty string, whitespace-only, and an unknown-word
@@ -6,14 +8,21 @@ Covers M04's three done-when criteria:
   2. (Structural, not a pytest test -- see the grep gate the Builder report
      runs separately: `grep -ri "audio|pcm|wav|microphone"
      src/bimanual/language src/bimanual/policy` must return no matches.)
-  3. TextCommandSource and the stub VoiceCommandSource both satisfy the
-     same CommandSource abstract base -- proven here by parameterising a
-     single test over both, not by writing two separate tests.
+  3. TextCommandSource and VoiceCommandSource both satisfy the same
+     CommandSource abstract base -- proven here by parameterising a single
+     test over both, not by writing two separate tests.
+
+The VoiceCommandSource tests below never touch the real network or the
+real `.env`/API key -- see that section's own header comment.
 """
 
 from __future__ import annotations
 
 import io
+import json
+import time
+import urllib.error
+import wave
 from pathlib import Path
 
 import pytest
@@ -24,6 +33,7 @@ from bimanual.command import (
     TextCommandSource,
     VoiceCommandSource,
 )
+from bimanual.command import voice_source
 
 
 # ---------------------------------------------------------------------------
@@ -148,31 +158,241 @@ def test_close_is_idempotent_and_poll_returns_none_after_close():
 
 
 # ---------------------------------------------------------------------------
-# VoiceCommandSource stub: right shape, no Speechmatics wiring
+# VoiceCommandSource: real Speechmatics wiring (M15/ADR-058), network mocked
 # ---------------------------------------------------------------------------
+#
+# These tests never touch the real network or the real .env/API key -- every
+# test here monkeypatches `urllib.request.urlopen` with a fake Speechmatics
+# server (see `_FakeResponse`/`_fake_urlopen_returning`) and points
+# `VoiceCommandSource` at a temporary `.env` (see `_write_env`). This keeps
+# the suite fast and offline while still exercising the real
+# request/response/error-translation code paths in `voice_source.py`, not a
+# stand-in for them.
 
 
-def test_voice_stub_emits_placeholder_transcription_with_confidence(
-    tmp_path: Path,
+def _write_wav(path: Path, seconds: float = 0.1) -> None:
+    """Write a minimal, genuinely valid mono 16 kHz WAV file (silence)."""
+    n_frames = int(16000 * seconds)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * n_frames)
+
+
+def _write_env(path: Path, api_key: str | None = "fake-test-key") -> Path:
+    """Write a temporary `.env` (or an empty one if `api_key` is None)."""
+    env_file = path / ".env"
+    env_file.write_text(f"ai_infra={api_key}\n" if api_key else "", encoding="utf-8")
+    return env_file
+
+
+class _FakeHTTPResponse:
+    """Enough of `http.client.HTTPResponse` for `voice_source._call` to use:
+    a context manager whose `.read()` returns pre-canned JSON bytes."""
+
+    def __init__(self, payload: dict) -> None:
+        self._data = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self) -> "_FakeHTTPResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+
+def _words_as_speechmatics_results(text: str) -> list[dict]:
+    """Turn plain text into Speechmatics json-v2-shaped word results."""
+    return [
+        {"type": "word", "alternatives": [{"content": w, "confidence": 0.9}]}
+        for w in text.split()
+    ]
+
+
+def _install_fake_speechmatics(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    transcript_results: list[dict],
+    job_status: str = "done",
+) -> None:
+    """Monkeypatch urlopen with a fake server: submit -> poll -> transcript."""
+
+    def fake_urlopen(request, timeout=None):  # noqa: ANN001 -- test double
+        url = request.full_url
+        if url == voice_source._JOBS_URL:
+            return _FakeHTTPResponse({"id": "job123"})
+        if url == f"{voice_source._JOBS_URL}/job123":
+            return _FakeHTTPResponse({"job": {"status": job_status}})
+        if url.startswith(f"{voice_source._JOBS_URL}/job123/transcript"):
+            return _FakeHTTPResponse({"results": transcript_results})
+        raise AssertionError(f"unexpected URL in test: {url}")
+
+    monkeypatch.setattr(voice_source.urllib.request, "urlopen", fake_urlopen)
+
+
+def test_voice_source_transcribes_via_speechmatics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    fake_audio = tmp_path / "command.wav"
-    fake_audio.write_bytes(b"")  # stub never reads this file's contents
+    """A real (mocked) Speechmatics round trip produces a populated event."""
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path)
+    _install_fake_speechmatics(
+        monkeypatch,
+        transcript_results=_words_as_speechmatics_results("open the top drawer"),
+    )
 
-    source = VoiceCommandSource(audio_file=fake_audio)
+    source = VoiceCommandSource(audio_file=wav, env_path=env_file)
     event = source.poll()
 
     assert event is not None
-    assert isinstance(event.text, str) and len(event.text) > 0
-    assert event.source_id == "voice_stub"
-    # The voice path must populate confidence (unlike text, which cannot).
+    assert event.text == "open the top drawer"
+    assert event.source_id == "voice_speechmatics"
     assert event.confidence is not None
     assert 0.0 <= event.confidence <= 1.0
-    assert event.raw_meta["audio_file"] == str(fake_audio)
-    assert event.raw_meta["wired"] is False  # Speechmatics (M15) not attached
+    assert event.raw_meta["audio_file"] == str(wav)
+    assert event.raw_meta["wired"] is True  # unlike the old M04 stub
+    assert event.raw_meta["job_id"] == "job123"
 
-    # A stub transcribes the file once; a second poll yields nothing new.
+    # One transcription per construction; a second poll yields nothing new.
     assert source.poll() is None
     source.close()
+    source.close()  # idempotent
+    assert source.poll() is None  # None after close, per the ABC contract
+
+
+def test_voice_source_poll_is_near_instant_after_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """poll() itself must not block -- PLAN.md M15 done-when 2.
+
+    The (necessarily slower, network-bound) work happens in __init__; see
+    voice_source.py's module docstring, "Non-blocking poll(), honestly".
+    This times poll() alone, after construction has already finished.
+    """
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path)
+    _install_fake_speechmatics(
+        monkeypatch, transcript_results=_words_as_speechmatics_results("pick up the plate")
+    )
+
+    source = VoiceCommandSource(audio_file=wav, env_path=env_file)
+
+    start = time.monotonic()
+    source.poll()
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.05  # generous; a buffer pop, not a network call
+    source.close()
+
+
+def test_voice_source_missing_key_raises_before_any_network_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """No `ai_infra` value -> MissingApiKeyError, and no network attempted."""
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path, api_key=None)  # blank .env
+
+    def fail_if_called(request, timeout=None):  # noqa: ANN001
+        raise AssertionError("network must not be touched when the key is missing")
+
+    monkeypatch.setattr(voice_source.urllib.request, "urlopen", fail_if_called)
+
+    with pytest.raises(voice_source.MissingApiKeyError):
+        VoiceCommandSource(audio_file=wav, env_path=env_file)
+
+
+def test_voice_source_malformed_wav_raises_before_any_network_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A non-WAV file -> InvalidAudioError, and no network attempted."""
+    not_a_wav = tmp_path / "command.wav"
+    not_a_wav.write_bytes(b"this is not a wav file")
+    env_file = _write_env(tmp_path)
+
+    def fail_if_called(request, timeout=None):  # noqa: ANN001
+        raise AssertionError("network must not be touched for an unreadable WAV")
+
+    monkeypatch.setattr(voice_source.urllib.request, "urlopen", fail_if_called)
+
+    with pytest.raises(voice_source.InvalidAudioError):
+        VoiceCommandSource(audio_file=not_a_wav, env_path=env_file)
+
+
+def test_voice_source_auth_rejection_raises_authentication_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path)
+
+    def fake_urlopen(request, timeout=None):  # noqa: ANN001
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", hdrs=None, fp=None)
+
+    monkeypatch.setattr(voice_source.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(voice_source.AuthenticationError):
+        VoiceCommandSource(audio_file=wav, env_path=env_file)
+
+
+def test_voice_source_network_unreachable_raises_network_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path)
+
+    def fake_urlopen(request, timeout=None):  # noqa: ANN001
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr(voice_source.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(voice_source.NetworkUnreachableError):
+        VoiceCommandSource(audio_file=wav, env_path=env_file)
+
+
+def test_voice_source_job_timeout_raises_job_timeout_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A job stuck at "running" forever must raise, not hang the test suite."""
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path)
+    _install_fake_speechmatics(monkeypatch, transcript_results=[], job_status="running")
+
+    with pytest.raises(voice_source.JobTimeoutError):
+        VoiceCommandSource(
+            audio_file=wav, env_path=env_file, timeout_s=0.05, poll_interval_s=0.01
+        )
+
+
+def test_voice_source_rejected_job_raises_invalid_audio_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path)
+    _install_fake_speechmatics(monkeypatch, transcript_results=[], job_status="rejected")
+
+    with pytest.raises(voice_source.InvalidAudioError):
+        VoiceCommandSource(audio_file=wav, env_path=env_file)
+
+
+def test_voice_source_empty_transcript_raises_empty_transcript_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path)
+    _install_fake_speechmatics(monkeypatch, transcript_results=[])  # no words at all
+
+    with pytest.raises(voice_source.EmptyTranscriptError):
+        VoiceCommandSource(audio_file=wav, env_path=env_file)
 
 
 # ---------------------------------------------------------------------------
@@ -180,26 +400,28 @@ def test_voice_stub_emits_placeholder_transcription_with_confidence(
 # ---------------------------------------------------------------------------
 
 
-def _make_text_source() -> CommandSource:
+def _make_text_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CommandSource:
+    del tmp_path, monkeypatch  # unused by this factory; shared signature only
     return TextCommandSource(text="open the top drawer")
 
 
-def _make_voice_source(tmp_path: Path) -> CommandSource:
-    fake_audio = tmp_path / "command.wav"
-    fake_audio.write_bytes(b"")
-    return VoiceCommandSource(audio_file=fake_audio)
+def _make_voice_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CommandSource:
+    wav = tmp_path / "command.wav"
+    _write_wav(wav)
+    env_file = _write_env(tmp_path)
+    _install_fake_speechmatics(
+        monkeypatch, transcript_results=_words_as_speechmatics_results("open the top drawer")
+    )
+    return VoiceCommandSource(audio_file=wav, env_path=env_file)
 
 
 @pytest.mark.parametrize(
     "source_factory",
-    [
-        lambda tmp_path: _make_text_source(),
-        lambda tmp_path: _make_voice_source(tmp_path),
-    ],
+    [_make_text_source, _make_voice_source],
     ids=["TextCommandSource", "VoiceCommandSource"],
 )
 def test_both_implementations_satisfy_the_same_command_source_contract(
-    source_factory, tmp_path: Path
+    source_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """Proves the abstraction holds: a caller can treat either the same way.
 
@@ -208,7 +430,7 @@ def test_both_implementations_satisfy_the_same_command_source_contract(
     file that both classes are exercised through the same code path with
     no branch on which one it is.
     """
-    source: CommandSource = source_factory(tmp_path)
+    source: CommandSource = source_factory(tmp_path, monkeypatch)
 
     # Both implementations satisfy the abstract base.
     assert isinstance(source, CommandSource)

@@ -10,7 +10,15 @@ Complete and evidenced: M01 (repo scaffold, pinned envs, `scripts/verify_env.py`
 M02 (dual-arm MuJoCo scene, `TableSettingEnv`, opt-in rendering — ADR-022), M03
 (OpenVINO conversion smoke test on CPU/GPU/NPU — `benchmarks/ov-smoke-notes.md`),
 M04 (`CommandSource` abstraction, text + voice stub, 11 tests), M05 (rule grounder,
-43 tests, `docs/command-grammar.md`).
+43 tests, `docs/command-grammar.md`). **Updated Sept 15, 2026:** M15 (Speechmatics
+voice input) — unscheduled/droppable as of Sept 12 — was finished afterward against a
+live key: `VoiceCommandSource` now performs real Speechmatics batch transcription (the
+M04 stub's placeholder text is gone) and `run_demo.py --voice PATH` runs a
+transcribe-ground-execute path end to end, verified PASS on bm-ptl. Three disclosed
+deviations from the original plan (execution location, credential variable name,
+Speechmatics operating-point tier) — see `DECISIONS.md`/`ARCHITECTURE.md` ADR-058 and
+the Speechmatics bonus row below. `tests/test_command_source.py` is now 19 tests (was
+11), all network-mocked.
 
 **M06 (scripted manipulation skills) is COMPLETE for four of the eight skill/arm/
 object combinations exercised to date, verified by direct measurement on bm-ptl,
@@ -81,8 +89,9 @@ still not reachable end-to-end.
   removed — it appears nowhere in PLAN.md, ARCHITECTURE.md or the code and was never a
   grounded choice. Judge-facing copy must not claim tools we do not use, per ADR-015.
   **Re-verified Sept 12: still correct** — no code added since references LeRobot,
-  SmolVLA, or trains any policy. Note `Speechmatics` itself is still a tag for a planned
-  integration, not a shipped one — see the Speechmatics bonus section below.)
+  SmolVLA, or trains any policy. **Updated Sept 15, 2026:** `Speechmatics` is now a
+  shipped-and-verified tag, not merely a planned one — see the Speechmatics bonus
+  section below and `DECISIONS.md`/`ARCHITECTURE.md` ADR-058.)
 - [ ] Category tags: Robotics, Physical AI, Edge AI
 
 ## Cover Image & Presentation
@@ -135,10 +144,20 @@ above already documents.
 
 ### Speechmatics bonus
 
+**Updated Sept 15, 2026.** M15 was finished (previously unscheduled/droppable, cut-ladder
+rung 1). Three deviations from the original plan wording were required and are disclosed,
+not silent — see `DECISIONS.md`/`ARCHITECTURE.md` ADR-058: (1) exercised end to end on
+bm-ptl rather than laptop-only, because MuJoCo is bm-ptl-only (ADR-020); (2) the real
+`.env` credential variable is `ai_infra`, not ADR-019's originally written
+`SPEECHMATICS_API_KEY`; (3) Speechmatics `operating_point="enhanced"`, not "standard" —
+measured necessary because "standard" misrecognized the verified test phrase's trailing
+single-letter arm ID ("...arm be" instead of "...arm B").
+
 | Criterion | Status | Evidence |
 |---|---|---|
-| Speech input wired to VLA text pipeline | Not done | M04 ships a `CommandSource` ABC with a voice stub only (11 tests cover the abstraction and the text source); no real Speechmatics integration exists. |
-| Working demo clip with voice command | Not done | TODO — does not exist. |
+| Speech input wired to VLA text pipeline | **Done** | `src/bimanual/command/voice_source.py` — `VoiceCommandSource` performs real Speechmatics batch transcription (submit/poll/fetch) via `urllib` only (no SDK, no new venv); `run_demo.py --voice PATH` transcribes, grounds via the existing `RuleGrounder`, and executes via the existing `ScriptedSkillExecutor`, reporting in the same format the default 4-skill run uses. `tests/test_command_source.py`, 19/19 passed (network-mocked), covers success and six distinct failure modes (missing key, auth rejection, network unreachable, job timeout, empty transcript, malformed WAV). `DECISIONS.md`/`ARCHITECTURE.md` ADR-058. |
+| Working demo clip with voice command | Not done | No video recorded for this path yet — TODO, distinct from the text-command evidence (`docs/videos/m06-handoff-clip.mp4`) already cited elsewhere in this document. The command-line run itself is verified end to end (below) and is reproducible for a future recording. |
+| End-to-end run, measured (bm-ptl, `ov_env`, real Speechmatics API, `data/voice/give_fork_to_arm_b.wav` — synthesized speech, not a placeholder file) | **Done** | Transcript `'Give the fork to arm B'` (confidence 0.983) → grounded to `handoff(arm=B, target=fork, params={'from_arm': 'A'})` → **PASS** (`frames=6610`, `fork z=0.5498`, `lateral_separation=0.1946 m` — identical to the same handoff step in the default 4-skill run) → exit 0, ~20.6 s. The 32-character API key was confirmed, by an in-process substring check against the full captured output, to never appear in it. Regression gate (`run_demo.py`, no args) unaffected: 4/4 PASS, exit 0, ~24.8 s, byte-identical before/after this change. |
 
 ## Assets to Produce
 - [ ] `docs/video-script.md` — narrated walkthrough script. TODO. Should not be written

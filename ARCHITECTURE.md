@@ -128,11 +128,18 @@ Two flows exist that are **not** the demo path and must be labelled as such in t
 |---|---|---|---|
 | MuJoCo sim, eval harness | **no** — blocked, ADR-020 | — | **all of it**: dev, data gen, eval, final demo (brief p3) |
 | CommandSource: text | yes | — | yes |
-| CommandSource: voice | **only here** (`CONSTRAINTS.md:40`) | — | never |
+| CommandSource: voice | **only here** (`CONSTRAINTS.md:40`) | — | never* |
 | Grounder | yes | — | yes |
 | ~~ACT~~ / PoseNet training | no | **yes** (`CONSTRAINTS.md:57`) | no |
 | OpenVINO export to IR | yes | — | verify compile |
 | OpenVINO inference + benchmark | optional | — | **yes, the scored artifact** |
+
+*`run_demo.py --voice` (M15/ADR-058) is, by a deliberate and disclosed
+user-authorised exception, actually exercised end to end on bm-ptl rather
+than laptop-only — see ADR-058 Deviation 1 for the full reasoning. This row
+otherwise still states the original design intent correctly:
+`VoiceCommandSource` itself has no platform check and would work
+identically on the laptop.
 
 **ACT training is cut as of Sept 12 (ADR-023);** Kaggle's role is now PoseNet training
 only. `LearnedSkillExecutor` in the section 1 diagram is specified but not built — it
@@ -5641,6 +5648,112 @@ local minima (ADR-057).").
 
 ---
 
+### ADR-058 — Speechmatics voice input wired end to end (M15): `VoiceCommandSource` finished, `run_demo.py --voice` added — three disclosed, user-authorised deviations from the written plan, none silent
+
+**Ratified:** Sept 15, 2026 · **Closes:** M15 (`PLAN.md`, previously
+unscheduled/droppable) · **Follows:** ADR-002 (the `CommandSource` seam this
+fills in without modifying), ADR-019 (credential handling this narrows one
+detail of, Deviation 2 below).
+
+**Context.** M15 was never built during its originally planned window — it
+was the first rung of the cut ladder and was unscheduled as of Sept 12
+(`PLAN.md`). The user later directed it be finished, against a now-live
+Speechmatics key, on `master` with a hard time cap. `ARCHITECTURE.md`
+section 1's `CommandSource`/`CommandEvent` boundary (ADR-002) needed no
+changes at all to accommodate a real implementation — confirming the M04
+design choice to build that seam before a credential existed.
+
+**Options considered for the non-blocking `poll()` tension.**
+`CommandSource.poll()` (component-contract table, section 1) must not
+block; a Speechmatics batch job takes several seconds end to end
+(submit/poll-status/fetch-transcript). (a) Transcribe eagerly inside
+`__init__`, have `poll()` return the already-ready result. (b) Kick off the
+job in `__init__` and have `poll()` return `None` until a background
+mechanism marks it done.
+
+**Decision.** (a). It mirrors `TextCommandSource`'s own existing pattern
+(reads all of its input eagerly at construction, `poll()` only pops a
+queue) and this project's `CommandSource` ABC docstring already anticipated
+it ("waiting must happen elsewhere ... e.g. eagerly at construction time").
+(b) would need a background thread or a caller loop that itself waits on
+repeated `poll()` calls — this demo's control flow never polls a
+`CommandSource` more than once per run, so (b) would just relabel the same
+wait rather than remove it. Measured: construction ~3-3.5 s; `poll()`
+<0.0001 s once construction has returned.
+
+**Deviation 1 — execution location.** Section 3's contract table states
+"CommandSource: voice | only here (laptop) | never [bm-ptl]"
+(`CONSTRAINTS.md:40`: "laptop-side"). The user directed this integration be
+exercised end to end **on bm-ptl** instead: MuJoCo only runs on bm-ptl
+(ADR-020), and shuttling a transcript between machines for every run was
+judged not worth the friction for a bonus feature. Recorded here as a
+deliberate, user-authorised deviation from this document's own stated
+design, not a silent contradiction of it. `VoiceCommandSource` itself
+carries no platform check — it is pure stdlib plus a network call (see
+Deviation 3) — so the deviation is in where `run_demo.py --voice` is
+actually invoked, not in the module's own code.
+
+**Deviation 2 — credential variable name.** ADR-019 specified
+`SPEECHMATICS_API_KEY`. This repository's actual `.env` (present before
+this integration began, confirmed gitignored and untracked on the laptop
+and bm-ptl both) names the variable **`ai_infra`**, and `voice_source.py`
+reads that name. ADR-019's mechanism — gitignored `.env`, read from a
+file/environment rather than a literal, loud failure if absent
+(`MissingApiKeyError`) — is otherwise unchanged; only the literal name
+differs from what ADR-019 wrote down.
+
+**Deviation 3 — `operating_point="enhanced"`, not `"standard"`.**
+`CONSTRAINTS.md:40` says "Standard model". Measured
+(`docs/hardware/voice-transcription-probe.md`): Speechmatics'
+`operating_point="standard"` transcribed this integration's verified demo
+phrase, "Give the fork to arm B", with the trailing single-letter arm ID
+rendered as the word "be" ("...arm be") on every audio variant tried,
+which `RuleGrounder`'s `to\s+arm\s+[ab]$` pattern (`rule_grounder.py`)
+cannot match; `"enhanced"` transcribed it correctly on the first try. Both
+operating points are Speechmatics' own generic hosted service, not a
+custom-trained model, so `CONSTRAINTS.md:45`'s "no custom novel
+architectures" line is untouched; the only real cost is Speechmatics' own
+higher price for "enhanced". Punctuation is separately disabled
+(`punctuation_overrides: {"permitted_marks": []}`) because the default
+punctuation model split the same sentence into two clauses, which the
+grammar's single-clause-per-pattern matching would also reject.
+
+**Test phrase: "Give the fork to arm B".** Not the brief's own literal
+example command, which `docs/command-grammar.md`/`rule_grounder.py`'s
+frozen grammar does not accept — the same finding `scripts/run_grounded_demo.py`
+(M10 Phase 5) already made; this is that script's own established
+grammar-correct, composition-correct substitute, reused rather than
+re-derived. It grounds to one `SkillCall`:
+`handoff(arm="B", target_object="fork", params={"from_arm": "A"})` — the
+identical call `run_demo.py`'s own default 4-skill sequence already runs.
+
+**Environment.** `voice_source.py` uses only the standard library
+(`urllib.request`, `json`, `wave`, `uuid`) — no `speechmatics-python` SDK,
+no `requests`, no new virtual environment. `run_demo.py --voice` runs in
+the same `ov_env` the default path already uses. Re-verified on bm-ptl
+after this change: `ov_env` — `mujoco==3.2.7`, `openvino==2026.3.1`,
+`numpy==2.4.6` (unchanged); `train_env` — `torch==2.14.0+xpu`,
+`openvino==2026.3.1` (unchanged, untouched entirely).
+
+**Consequences.** The `CommandSource` seam (ADR-002) is proven correct
+under a real implementation, not just the M04 stub -- a caller
+(`run_demo.py`) genuinely does not branch on which `CommandSource`
+implementation it holds. Three deviations from this document's/`CONSTRAINTS.md`'s
+literal wording are now load-bearing and must travel with any future
+edit to those sections: voice is exercised on bm-ptl (not laptop-only),
+the credential variable is `ai_infra` (not `SPEECHMATICS_API_KEY`), and
+transcription uses Speechmatics' "enhanced" tier (not "standard"). An
+incidental pre-existing bug in `run_demo.py`'s `print_summary` (a
+hardcoded `/4` instead of `/len(results)`, invisible until a
+non-4-skill plan existed) was fixed as part of this work; the default
+4-skill path is byte-identical before and after (`len(results) == 4`
+there always). Regression gate and the full `--voice` run, both on
+bm-ptl: `DECISIONS.md`'s ADR-058 entry (measured numbers, exit codes,
+timings, and the in-process check confirming the API key never appears
+in captured output).
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
@@ -5666,7 +5779,10 @@ These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.
   asset's shipped DoF is authoritative and Builder reports it in M01/M02.
 - **Speechmatics credentials** (RISK-04) — handling closed by ADR-019 (`.env`, gitignored,
   read as `SPEECHMATICS_API_KEY`). Whether a key is provisioned in time remains a
-  scheduling matter under the Day-4 drop rule, not an architectural one.
+  scheduling matter under the Day-4 drop rule, not an architectural one. **Update, Sept
+  15 (ADR-058 Deviation 2):** a key was provisioned and M15 was built against it; the
+  repository's actual `.env` names the variable `ai_infra`, not `SPEECHMATICS_API_KEY` --
+  ADR-019's mechanism (gitignored file, loud failure if absent) is otherwise unchanged.
 - **Interpretation of the 10-seed success bar** (RISK-06) — closed by ADR-018. True success
   rate as measured; failure modes narrated in the video.
 - **Acceptability of `pour` without fluid** (RISK-08) — closed by ADR-017, with disclosure

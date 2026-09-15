@@ -77,6 +77,53 @@ specific published systems.
 Current per-skill status (which combinations work and which do not, with measured
 failure reasons) is tracked in `SUBMISSION.md`, updated as skills are verified.
 
+## Voice Input (bonus, ADR-058)
+
+Speechmatics batch transcription wired as a front end to the existing text pipeline,
+via `VoiceCommandSource` (`src/bimanual/command/voice_source.py`), the second concrete
+implementation of the `CommandSource` abstraction M04 shipped (`ARCHITECTURE.md`
+ADR-002; the other is `TextCommandSource`). Nothing downstream of that boundary — the
+`RuleGrounder`, the scripted skills, `run_demo.py` — changes at all: a voice command
+becomes a `CommandEvent{text, confidence, ...}` and is grounded and executed exactly
+like typed text.
+
+**Setup.** Requires a [Speechmatics](https://www.speechmatics.com/) account and API
+key.
+1. Create a file named `.env` at the repo root (already gitignored — `.gitignore`'s
+   Secrets section — never commit it).
+2. Add one line: `ai_infra=<your Speechmatics API key>`. (This is the actual variable
+   name this repo's credential uses; it does **not** match an earlier internal plan
+   that named it `SPEECHMATICS_API_KEY` — see `DECISIONS.md` ADR-058 Deviation 2. Do
+   not put the key anywhere else — not in a command-line argument, not in a script, not
+   in a committed file.)
+3. No extra Python package is required — `voice_source.py` talks to Speechmatics'
+   batch REST API with the standard library only (`urllib.request`), so it runs in the
+   same environment `run_demo.py` already uses.
+
+**Usage.**
+```bash
+python run_demo.py --voice data/voice/give_fork_to_arm_b.wav
+```
+This transcribes the WAV file, prints the transcript, grounds it with the same
+`RuleGrounder` the text path uses, executes every grounded skill with
+`ScriptedSkillExecutor`, and reports pass/fail in the same format the default 4-skill
+run uses. `data/voice/` is gitignored (arbitrary-size local audio, no reproducibility
+value beyond the transcript already printed) — bring your own WAV file, or synthesize
+one (e.g. Windows' built-in `System.Speech.Synthesis`, no microphone required). Use a
+phrase `docs/command-grammar.md`'s grammar actually accepts — **"Give the fork to arm
+B"** is the phrase this integration is verified against end to end (the challenge
+brief's own literal example command does not parse under this grammar; see
+`scripts/run_grounded_demo.py`'s docstring and `DECISIONS.md` ADR-058 for why).
+
+**What it does not do.** No live microphone capture (file-based only); no audio ever
+crosses the `CommandSource` boundary downstream (ADR-002 — the grounder and every
+skill only ever see text); and, disclosed plainly rather than left implicit, this
+integration is exercised end to end on bm-ptl rather than the laptop, a deliberate
+deviation from `ARCHITECTURE.md`'s original laptop-only design, made because MuJoCo
+only runs on bm-ptl (ADR-020) — see `DECISIONS.md`/`ARCHITECTURE.md` ADR-058 for the
+full reasoning and every other disclosed deviation (credential variable name,
+Speechmatics operating-point tier) this feature required.
+
 ## Documentation
 
 - Learning journey in `docs/learn/` (notes 01–08), written for a software engineer with
