@@ -5870,6 +5870,153 @@ gates against those files is unaffected by this stage.
 
 ---
 
+### ADR-071 — v2 Stage 2: cubic-spline joint-space motion primitive (`motion.py`), plus its mandatory tracking/velocity/acceleration/idle-arm-drift validation — a real, investigated gate miss on idle-arm drift, reported rather than worked around
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from
+`master` at `238cfed`) · **New:** `src/bimanual/control/motion.py`,
+`scripts/v2_validate_motion.py`, `docs/hardware/v2-tracking.md`,
+`docs/images/v2-tracking-shoulder-lift.png` · **Does not modify:** `ik.py`,
+`skills_scripted.py`, `grasp.py`, `env.py`, `executor.py`,
+`scenes/so101/`, `ik_geometric.py` (ADR-070) · **Follows:** ADR-037 (the
+idle-arm freeze pattern this module re-implements, self-contained, rather
+than importing `skills_scripted.py`'s private helpers).
+
+**Context.** Every skill in `skills_scripted.py` drives an arm with a
+closed IK loop, one Cartesian subgoal at a time — there is no primitive
+for "move these 5 joints from A to B smoothly, over a chosen duration,"
+which is what a later v2 stage needs once it has a joint-space target
+(e.g. from `ik_geometric.solve_topdown_ik`) and wants a controlled,
+bounded-velocity/acceleration transit rather than whatever a one-shot
+`ctrl` write produces. `move_to_config(env, arm, q_target, duration_s,
+hold_other_arm=True)` fits a per-joint cubic with zero start/end velocity
+(the task-supplied, analytically-verified closed form: `a0=q_start,
+a1=0, a2=3*dq/T**2, a3=-2*dq/T**3`) between the arm's CURRENT qpos and
+`q_target`, and writes the interpolated `pos(t)` (t clamped to `[0,T]`)
+to `data.ctrl` every physics step. `set_gripper(env, arm, open,
+duration_s=0.6)` applies the identical profile to the gripper joint
+alone, always freezing everything else.
+
+**The idle-arm hold is ADR-037's pattern, re-implemented, not imported.**
+Per this stage's own scope (do not modify `skills_scripted.py`),
+`motion.py` re-implements the same verified idea locally: capture ONE
+ctrl snapshot from live qpos at the instant a hold begins
+(`_full_ctrl_from_current_qpos`), then rewrite that SAME array, unchanged,
+on every subsequent step of the hold — never re-derived from live qpos
+mid-hold, which is the exact bug ADR-037 fixed.
+
+**Validation (mandatory, methodology and full numbers in
+`docs/hardware/v2-tracking.md`).** One shared test move throughout: arm A,
+2.0 s / 1000 steps, from its post-`reset()` "home" configuration
+(`[0, -1.2, -1.6, 0, 0]`) to the midpoint of each of its 5 joints' own
+`jnt_range` (`|dq|` per joint: `[~0, 1.2, 1.6, ~0, 0.049]` rad), run on
+bm-ptl (`mujoco==3.2.7`) and, per ADR-047, the numbers below are that
+bm-ptl run — reproduced byte-for-byte on the laptop first (this session's
+premise, per the task brief, that MuJoCo now imports and steps there too;
+verified directly, not assumed), then re-run on bm-ptl and both outputs
+diffed identical before anything here was written down.
+
+**(a) TRACKING — spline vs. one-shot direct command (`ctrl` written once
+and held, the shape of a single non-interpolated position command):**
+
+| | peak \|actual − commanded\| (rad) | final \|actual − target\| (rad) |
+|---|---:|---:|
+| Spline (`move_to_config`) | **0.001754** | 0.000777 |
+| Direct (one-shot `ctrl` write) | **1.599738** | 0.000709 |
+
+Both methods converge to essentially the same *final* position error
+(the PD actuator's steady-state droop against gravity, ~0.0007-0.0008 rad,
+independent of how the setpoint got there) — the entire difference is
+*during* the move: the direct command's peak error (1.60 rad) is the
+distance the joint has not yet travelled the instant `ctrl` jumps to the
+far target and the arm is still near its start; the spline command's peak
+error (0.0018 rad, ~900x smaller) is only ever the small instantaneous
+lag between a *continuously advancing* reference and the real, physically
+lagging joint. Settling: the direct command's `shoulder_lift` overshoots
+past the target (visible in `v2-tracking.md`'s ASCII/PNG plots — a classic
+underdamped step response) before settling around step ~500-600; the
+spline's `shoulder_lift` never overshoots at all — it simply tracks the
+monotonic reference to within ~0.0018 rad throughout. (Note: ECE4560 Lab 9
+is not cited for any number here — the task brief warned it shows this
+comparison only as a qualitative graph; every number above is this
+session's own measurement.)
+
+**(b) PEAK VELOCITY/ACCELERATION of the spline's COMMANDED trajectory**,
+measured by finite-differencing the logged `ctrl` reference (central
+differences at `dt=0.002s` — a measurement of the logged artifact, not a
+second evaluation of the analytic formula), against the task-supplied
+closed forms:
+
+| joint | measured peak \|vel\| | closed \|vel\| = 1.5·dq/T | measured peak \|accel\| | closed \|accel\| = 6·dq/T² |
+|---|---:|---:|---:|---:|
+| shoulder_pan | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| shoulder_lift | 0.899999 | 0.900000 | 1.796400 | 1.800000 |
+| elbow_flex | 1.199998 | 1.200000 | 2.395200 | 2.400000 |
+| wrist_flex | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| wrist_roll | 0.036510 | 0.036510 | 0.072873 | 0.073019 |
+| **overall (max)** | **1.199998** | **1.200000** | **2.395200** | **2.400000** |
+
+Max relative error vs. the closed form: velocity 1.33e-6, acceleration
+2.00e-3 — both comfortably inside a 2% discretisation-error budget
+(**PASS**). The coefficient evaluation is confirmed correct; no
+investigation needed here.
+
+**(c) IDLE-ARM DRIFT of arm B (frozen via `hold_other_arm=True`) over the
+same 2.0 s / 1000-step move — a genuine, investigated gate miss, reported
+honestly rather than loosened.** The task's gate: < 0.001 rad, citing
+ADR-037's own 0.000774 rad/1655-frame measurement as the precedent this
+should reproduce. Measured here: **TRUE continuous max over all 1000
+steps = 0.001110 rad (step 12, t=0.024 s) — FAILS the < 0.001 rad gate.**
+The SAME run's final/steady-state value = **0.000774 rad — matches
+ADR-037's own number to 3 significant figures.**
+
+The two numbers are not in tension once traced. A per-step drift trace
+(`docs/hardware/v2-tracking.md`) shows a brief, bounded, self-correcting
+transient: drift rises from 0 to a peak of ~0.00111 rad by step ~10-15,
+then decays and settles at 0.000774 rad by ~step 100-200 (0.2-0.4 s) —
+this is NOT the ADR-037 bug (which produces *unbounded, monotonically
+growing* drift with no settling at all; this settles and stays flat).
+Three ablations isolate the cause, all measured directly (not asserted):
+(1) the SAME peak (0.0011098448632844704 rad, bit-identical) occurs
+regardless of arm A's target displacement, from full-scale down to 10% of
+it; (2) the SAME peak occurs with arm A doing **nothing at all** — both
+arms frozen from `reset()`, nothing driven, 300 steps; (3) re-freezing at
+an *already-settled* equilibrium (300 steps of correct, persistent
+freezing first, THEN take a fresh snapshot and continue) reproduces the
+identical ~0.0011 rad peak again, immediately. Conclusion: this is the
+bounded droop-and-settle step response any plain PD position actuator
+exhibits whenever its setpoint is (re-)set to exactly the CURRENT
+position of a joint that requires a nonzero position error to generate
+the force balancing gravity — the instant a snapshot is taken, that
+error is zero, so the joint sags a little further and rings briefly
+before settling back to the same steady offset. `move_to_config`'s freeze
+mechanism is verified correct (steady-state value matches ADR-037's
+number almost exactly); the gate itself, sourced from a measurement
+(ADR-037) that sampled only at phase BOUNDARIES rather than continuously,
+did not have the opportunity to see this transient even though the
+underlying mechanism there is the same one. **Flagged explicitly per this
+task's own instruction not to soften a failure:** a truly continuous
+"max over every step" idle-arm-drift bar under 0.001 rad is not
+achievable for THIS pose/gain combination with a plain snapshot-once PD
+hold, regardless of implementation correctness — reaching it would need
+either a startup grace period excluded from the bar, a softer/slew-limited
+transition onto the frozen setpoint, or a numerically larger gate; none of
+those changes were made here, since this task's scope was to measure and
+report, not to redesign the hold.
+
+**Consequences.** `move_to_config`/`set_gripper` are ready for a later v2
+stage to sequence joint-space moves (e.g. from `ik_geometric`'s solved
+angles) with a chosen, bounded-velocity/acceleration profile instead of a
+one-shot `ctrl` jump. Any future stage that also needs a genuinely
+sub-0.001-rad continuous idle-arm bound should budget for the startup
+transient documented here — e.g. by excluding the first ~20 steps
+(~40 ms) after a freeze from that bar, matching ADR-037's own
+phase-boundary sampling convention, rather than assuming the plain
+snapshot-once freeze alone gets there. `ik.py`, `skills_scripted.py`,
+`grasp.py`, `env.py`, `executor.py`, `scenes/so101/`, and `ik_geometric.py`
+are all untouched.
+
+---
+
 ## 5. Open items this document deliberately does not decide
 
 These are flagged, not guessed. Full list with evidence in `PLAN.md` section 7.

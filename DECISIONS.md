@@ -11,6 +11,54 @@ being ratified by the user rather than proposed.
 
 ---
 
+## ADR-071 — v2 Stage 2: cubic-spline joint-space motion primitive (`motion.py`), plus its mandatory tracking/velocity/acceleration/idle-arm-drift validation — a real, investigated gate miss on idle-arm drift, reported rather than worked around
+
+**Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from
+`master` at `238cfed`) · **New:** `src/bimanual/control/motion.py`,
+`scripts/v2_validate_motion.py`, `docs/hardware/v2-tracking.md`,
+`docs/images/v2-tracking-shoulder-lift.png` · **Does not modify:** `ik.py`,
+`skills_scripted.py`, `grasp.py`, `env.py`, `executor.py`,
+`scenes/so101/`, `ik_geometric.py` (ADR-070) · **Follows:** ADR-037 (the
+idle-arm freeze pattern, re-implemented self-contained here, not
+imported).
+
+Full context, the freeze-transient investigation (three ablations that
+isolate its cause), and the complete validation writeup are in
+`ARCHITECTURE.md`'s ADR-071 entry and `docs/hardware/v2-tracking.md` — not
+duplicated here per this file's own mirroring convention. Headline
+numbers, all measured on bm-ptl (`mujoco==3.2.7`), one shared 2.0 s /
+1000-step test move (arm A, home → midpoint of each joint's own
+`jnt_range`):
+
+- **(a) Tracking:** peak `|actual-commanded|` — spline **0.001754 rad**
+  vs. one-shot direct command **1.599738 rad** (~900x larger); both
+  converge to the same ~0.0008 rad final PD droop. Reported, not cited
+  from ECE4560 Lab 9 (that source has no number for this, only a graph,
+  per the task's own warning).
+- **(b) Peak velocity/acceleration** of the spline's commanded
+  trajectory, measured by finite-differencing the logged reference:
+  overall max `|vel|`=0.899999-1.199998 rad/s, `|accel|`=1.7964-2.3952
+  rad/s² per the dominant joints, vs. closed-form `1.5·dq/T` /
+  `6·dq/T²` — max relative error 1.33e-6 (vel) / 2.00e-3 (accel), both
+  **PASS** a 2% discretisation-error budget.
+- **(c) Idle-arm drift**, arm B frozen via `hold_other_arm=True`: TRUE
+  continuous max over all 1000 steps = **0.001110 rad — FAILS** the
+  task's < 0.001 rad gate. The SAME run's final/steady-state value =
+  **0.000774 rad**, matching ADR-037's own reported number to 3
+  significant figures. Three ablations (varying arm A's target scale;
+  freezing with arm A doing nothing at all; re-freezing after the system
+  has already settled) all reproduce the identical ~0.0011 rad peak,
+  proving it is a bounded droop-and-settle transient intrinsic to
+  snapshotting a plain PD position actuator's setpoint at its current
+  value against gravity — not the ADR-037 monotonic-drift bug (which
+  never settles), and not caused by this module's own freeze mechanism
+  being wrong (its steady-state number matches ADR-037's almost exactly).
+  Reported as a genuine gate FAIL per the task's explicit instruction not
+  to soften a failure, with the mechanism traced rather than patched
+  around.
+
+---
+
 ## ADR-070 — v2 Stage 1: geometric closed-form top-down IK for SO-101 (`ik_geometric.py`), separate from `ik.py`, plus its mandatory validation
 
 **Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from
