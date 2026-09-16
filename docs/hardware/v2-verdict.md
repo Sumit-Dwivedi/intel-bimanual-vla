@@ -5,6 +5,16 @@ someone who has not followed the branch.
 
 `master` is frozen at `238cfed` throughout and is not modified by any of this.
 
+> **Where these files live.** This document is on `master`, together with the
+> relay video (`docs/videos/v2-relay-demo.mp4`), its eight inspection frames
+> (`docs/images/v2-frames/`) and the scoring instrument
+> (`scripts/v2_criteria_monitor.py`) — so every comparison below can be
+> re-measured. **The v2 source (`ik_geometric.py`, `motion.py`,
+> `skills_v2.py`), `scripts/v2_stage5_demo.py`, `docs/hardware/submission-path.md`
+> and ADR-070 through ADR-074 are on the `redesign-v2` branch, not on
+> `master`** — the branch is pushed to origin and preserved as the evidence,
+> the same convention this repo uses for the earlier `redesign` branch.
+
 ## 1. What v2 replaced
 
 Master's motion stack is **position-only damped-least-squares IK driving direct
