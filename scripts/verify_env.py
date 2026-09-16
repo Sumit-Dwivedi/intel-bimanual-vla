@@ -159,7 +159,14 @@ def check_package(name: str, pinned_version: str) -> PackageCheck:
 
     # Step 2: import, purely for reporting host-importability. Failures here
     # are classified, not silently absorbed.
-    import_name = IMPORT_NAME_OVERRIDES.get(name.lower(), name)
+    # Default dist-name -> module-name rule is the PyPI convention: hyphens
+    # become underscores (openvino-telemetry -> openvino_telemetry). Without
+    # this the import is attempted as a literal hyphenated name, which can
+    # never succeed, and a correctly installed package is reported as an
+    # import failure -- which is exactly what happened to openvino-telemetry
+    # on bm-ptl during a from-scratch judge run. IMPORT_NAME_OVERRIDES stays
+    # for the cases the convention does not cover (pyyaml -> yaml, etc.).
+    import_name = IMPORT_NAME_OVERRIDES.get(name.lower(), name.replace("-", "_"))
     try:
         importlib.import_module(import_name)
         import_status = "IMPORTABLE"
