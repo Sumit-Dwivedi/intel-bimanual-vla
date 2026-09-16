@@ -212,7 +212,7 @@ HOME_ARM_QPOS = np.array([0.0, -1.2, -1.6, 0.0, 0.0], dtype=np.float64)
 #: between the pads (span 0.357..0.420, fork 0.356); at the pad MIDPOINT
 #: offset it is centred. Viable range 0.040-0.060.
 #:   pad midpoint = (-0.08298 + -0.02015) / 2 = -0.05156
-GRIPPER_STATIC_PAD_CLEARANCE_M = 0.076
+GRIPPER_STATIC_PAD_CLEARANCE_M = 0.082
 
 #: PICK/PLACE hover clearance above the (pad-compensated) grasp/place
 #: point, metres. **A disclosed correction to the brief's own "0.08 m

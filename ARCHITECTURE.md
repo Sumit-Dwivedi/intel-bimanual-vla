@@ -6017,143 +6017,7 @@ are all untouched.
 
 ---
 
-### ADR-073 — v2 Stage 4: phase-based skills with cubic splines and scene-integrity criteria; 2 of 3 skills pass all five, and the remaining failure is measured rather than tuned away
-
-**Branch:** `redesign-v2` (master frozen at `238cfed`). **Supersedes nothing on
-master.** Files: `src/bimanual/control/skills_v2.py` (new),
-`src/bimanual/control/executor.py` (routing flag only),
-`docs/hardware/v2-stage4-skills.md`, `docs/hardware/v2-master-baseline.md`.
-
-**Outcome: 2 of 3 skills pass all five criteria** (`pick` and `place`). Scored by an independent
-monitor (`scripts/v2_criteria_monitor.py`) that also scored master, so no stage
-graded its own work.
-
-| skill | (a) outcome | (b) props <=5 mm | (c) no arm-prop | (d) no cross-arm | (e) peak vel < 2.6 | verdict |
-|---|---|---|---|---|---|---|
-| `pick(A, fork)` | OK | OK | OK | OK | OK 1.832 rad/s | **PASS** |
-| `place(A, fork, .)` | OK | OK | OK | OK | OK 0.143 rad/s | **PASS** |
-| `handoff(A->B, fork)` | BAD phase 3 | BAD mug 25.1 mm | BAD mug -3.7 mm | **OK** | OK 1.832 rad/s | FAIL |
-
-**The master baseline, same instrument.** All three of master's skills FAIL,
-and all three PASS (a): `place` displaces the mug **63.2 mm** and the spoon
-29.1 mm; `handoff` spends **3179 of 6610 steps (48%) in cross-arm contact**,
-1.1 cm deep at worst, and still reports success; peak joint velocity is
-**6.937 rad/s** throughout. That is the quantified mechanism behind the knocked
-mug and fallen bottle visible in master's own demo video, and it is the case
-for this redesign. v2's peak velocity is 1.832 rad/s — **3.8x lower**.
-
-**`place`'s plate contact was a target choice, not a skill defect.** Testing
-placed the fork back at its own start position `(-0.05, 0.05)`. The plate's
-dish geom has radius **0.06** centred at x=-0.15, so its rim reaches x=-0.09 —
-only 4 cm from that target — and the moving finger pad catches the rim when it
-OPENS in phase 3 (first contact at step 1615 of 2300, worst **-0.00157 m**,
-plate displaced 16.7 mm). Measured at six targets: `(-0.05, 0.05)` is the only
-one that collides; `(0.00, 0.05)`, `(0.02, 0.00)`, `(0.00, -0.05)`,
-`(0.05, 0.05)` and `(-0.02, -0.06)` are all **completely clean** — plate
-displacement 0.0000 m, zero penetration. With a clear target `place` passes all
-five criteria at peak joint velocity **0.143 rad/s**, placing the fork within
-~8 mm of target and resting at z=0.3580 on a 0.35 surface.
-
-Recorded because the failure was real and the fix was not in the skill: a
-place target must keep the jaw-opening swept volume clear of neighbouring
-props. Whoever calls `run_place` owns that, and Stage 5's video target is
-chosen accordingly.
-
-
-**Phase structure.** Lab 8 phasing, every transition a cubic spline
-(ADR-071), IK solved once per phase and never inside the control loop, idle
-arm frozen at a snapshot every phase (ADR-037 pattern).
-
-**The ADR-025 pinch point is not this gripper's grasp centre.** Measured in
-genuine top-down poses, constant across the workspace to 5 dp: the static
-finger pad sits **-0.08298 m** below the pinch point, the moving pad
-**-0.02015 m**. Master never hit this because its position-only IK leaves
-orientation uncontrolled — its poses are not top-down, and its pads sit only
-~0.013 m below the pinch. Two constraints then nearly conflict: the static pad
-must clear the table (pinch >= 0.43298) while the object must lie BETWEEN the
-pads (pinch <= 0.43898). The feasible clearance window is **4 mm wide**:
-0.078 / 0.080 / 0.082. Adopted 0.080.
-
-This matters because the stage's first attempt used 0.084 — 2 mm past the
-window — which put the fork outside the jaw span, and then widened
-`attempt_grasp`'s distance gate from 0.05 to **0.12 m** so the weld would
-attach anyway, 8.6 cm from the pinch. That produced a `pick` that satisfied
-criterion (a) by dragging a fork welded below the gripper. **It was reported as
-a PASS and that result is retracted**; the gate is now 0.09 against an actual
-0.0854, so it is a real check again.
-
-**Yaw is a first-class variable, not a fixed `heading + 90 deg`.** Reachable
-pinch ceiling at the fork's xy, by yaw: 90 deg -> 0.440; 0/180 -> 0.466;
-225 -> 0.476; **270 -> 0.478**. 270 deg is 90+180: for a two-jaw gripper the
-SAME grip (pad offsets identical), but a far less extended arm. At 90 deg only
-4 mm of lift headroom remained and `pick` could not raise the fork past its
-0.370 bar; at the corrected clearance plus a 0.03 m hover (Lab 8's own number)
-it lifts to 0.3768. **The same variable fixed the handoff's transit
-collision**: at `HANDOFF_YAW = pi/2` arm B's approach collides with
-`armA_lower_arm` for 129 steps (worst -0.0047 m); at `3*pi/2` cross-arm contact
-is **zero** and phase 2 converges. Criterion (d) passes as a result.
-
-**Why the handoff still fails, and what was refused.** With the transit solved,
-phase 3 fails: arm B's weld never attaches. The offset-grasp geometry puts the
-two pinch points 6 cm apart laterally while each jaw span is ~2 cm, so the
-fork's body origin sits **0.1079 m** from arm B's pinch and 0.0762 m from its
-nearest pad. Widening the gate to 0.115 does make the handoff report success —
-and it was tested, then **reverted**, because a per-step contact check proved
-**arm B's finger pads never touch any fork geom at any point**. That is a weld
-across a 10.8 cm gap with no contact: a teleport dressed as a transfer. It is
-not shipped.
-
-The real fix, recorded for whoever continues: arm B's target must be derived
-from the **fork's actual pose** — a point on the fork's own surface offset
-along its axis, plus the pad clearance — not from an abstract world-frame
-`P_to`. `attempt_grasp`'s distance gate also measures to the object's body
-ORIGIN, which is a poor proxy for "between my jaws" on a 0.14 m object; a
-surface-distance gate would be the honest instrument.
-
-**Two rejected candidates, measured.** Widening the grip separation to dx=0.07
-clears the transit but the fork is only **0.14 m long with a 0.09 m handle**, so
-grips 14 cm apart would not be on it. Lateral staging cleans the final legs but
-then `home->stage` collides, and pushing the stage out merely moves the
-collision into `stage->hover`. Both refused on measurement.
-
-**A finding the brief did not anticipate:** `_split_move` (n=4). A single
-joint-space cubic from the folded home pose to a reach-down pose drives the
-gripper through the **table** mid-transit even when both endpoints are
-collision-free — joint-space interpolation has no notion of the Cartesian path
-it traces. Confirmed as real contact-force blocking, not slow PD tracking, by
-`data.qfrc_actuator` pinned at its `forcerange` bound while
-`data.qfrc_constraint` exactly opposed it. This is the same swept-path class as
-v1's ADR-062 gate gap, recurring at the trajectory level, and it is why `pick`
-passes.
-
-**Carried-forward corrections recorded here.**
-1. **Drift gate re-specified.** ADR-071's `< 0.001 rad` idle-arm gate fails at
-   0.001110 rad, but the gate was wrong, not the code: the maximum is at
-   **step 12 of 1000** and settles to **exactly 0.000774** (ADR-037's own
-   steady-state figure) by step ~200, holding for the remaining 800. Gate the
-   **settled** value; disclose the bounded start-up transient. No
-   snapshot-once PD hold can do better — a gravity-loaded joint snapshotted at
-   zero position error must sag before the PD term restores it.
-2. **Tracking metric corrected.** The "spline 0.001754 rad vs direct 1.599738
-   rad, ~900x" figure must not be quoted: for a one-shot command the peak error
-   IS the size of the move by construction. The defensible numbers are peak
-   ACTUAL velocity and acceleration — **0.451 vs 5.350 rad/s** and
-   **9.9 vs 211.4 rad/s^2**, same 0.00014 rad final error.
-3. **`water_bottle` regression stands (ADR-072).** Unreachable by both arms at
-   every height under top-down IK — a horizontal reach limit (0.271 m needed
-   against ~0.249 m available), not a height one. Master reached it 9/20 under
-   position-only IK. v2 cannot reach it at all. Disclosed, not dropped.
-
-**Executor.** `ScriptedSkillExecutor(inference=None, use_v2=False)`; the flag
-routes `_dispatch` to `skills_v2`. Default `False` preserves master's behaviour
-byte-for-byte, including the oracle-mode `cameras=None` assertion.
-`pytest tests/test_skills.py` unchanged at **4 passed / 4 failed**.
-
-**Caps.** Part A's 45 min and Part B's 90 min were both overrun, disclosed
-rather than hidden: in each case the stated defect was a symptom several levels
-below where the brief located it.
-
-## ADR-072 — v2 Stage 3: home pose and scene geometry validated under top-down IK — home pose KEPT unmodified, water_bottle scoped out (disclosed regression), handoff grasp points defined with measured margins
+### ADR-072 — v2 Stage 3: home pose and scene geometry validated under top-down IK — home pose KEPT unmodified, water_bottle scoped out (disclosed regression), handoff grasp points defined with measured margins
 
 **Ratified:** Sept 15, 2026 · **Branch:** `redesign-v2` (diverges from
 `master` at `238cfed`) · **New:** `scripts/v2_validate_scene.py`,
@@ -6303,6 +6167,250 @@ cannot reach it as placed, or reopen Part C's decision with a proper
 regression sweep this stage's budget did not include.
 
 ---
+
+### ADR-073 — v2 Stage 4: phase-based skills with cubic splines and scene-integrity criteria; 2 of 3 skills pass all five, and the remaining failure is measured rather than tuned away
+
+**Branch:** `redesign-v2` (master frozen at `238cfed`). **Supersedes nothing on
+master.** Files: `src/bimanual/control/skills_v2.py` (new),
+`src/bimanual/control/executor.py` (routing flag only),
+`docs/hardware/v2-stage4-skills.md`, `docs/hardware/v2-master-baseline.md`.
+
+**Outcome: 2 of 3 skills pass all five criteria** (`pick` and `place`). Scored by an independent
+monitor (`scripts/v2_criteria_monitor.py`) that also scored master, so no stage
+graded its own work.
+
+| skill | (a) outcome | (b) props <=5 mm | (c) no arm-prop | (d) no cross-arm | (e) peak vel < 2.6 | verdict |
+|---|---|---|---|---|---|---|
+| `pick(A, fork)` | OK | OK | OK | OK | OK 1.832 rad/s | **PASS** |
+| `place(A, fork, .)` | OK | OK | OK | OK | OK 0.143 rad/s | **PASS** |
+| `handoff(A->B, fork)` | BAD phase 3 | BAD mug 25.1 mm | BAD mug -3.7 mm | **OK** | OK 1.832 rad/s | FAIL |
+
+**The master baseline, same instrument.** All three of master's skills FAIL,
+and all three PASS (a): `place` displaces the mug **63.2 mm** and the spoon
+29.1 mm; `handoff` spends **3179 of 6610 steps (48%) in cross-arm contact**,
+1.1 cm deep at worst, and still reports success; peak joint velocity is
+**6.937 rad/s** throughout. That is the quantified mechanism behind the knocked
+mug and fallen bottle visible in master's own demo video, and it is the case
+for this redesign. v2's peak velocity is 1.832 rad/s — **3.8x lower**.
+
+**`place`'s plate contact was a target choice, not a skill defect.** Testing
+placed the fork back at its own start position `(-0.05, 0.05)`. The plate's
+dish geom has radius **0.06** centred at x=-0.15, so its rim reaches x=-0.09 —
+only 4 cm from that target — and the moving finger pad catches the rim when it
+OPENS in phase 3 (first contact at step 1615 of 2300, worst **-0.00157 m**,
+plate displaced 16.7 mm). Measured at six targets: `(-0.05, 0.05)` is the only
+one that collides; `(0.00, 0.05)`, `(0.02, 0.00)`, `(0.00, -0.05)`,
+`(0.05, 0.05)` and `(-0.02, -0.06)` are all **completely clean** — plate
+displacement 0.0000 m, zero penetration. With a clear target `place` passes all
+five criteria at peak joint velocity **0.143 rad/s**, placing the fork within
+~8 mm of target and resting at z=0.3580 on a 0.35 surface.
+
+Recorded because the failure was real and the fix was not in the skill: a
+place target must keep the jaw-opening swept volume clear of neighbouring
+props. Whoever calls `run_place` owns that, and Stage 5's video target is
+chosen accordingly.
+
+
+**Phase structure.** Lab 8 phasing, every transition a cubic spline
+(ADR-071), IK solved once per phase and never inside the control loop, idle
+arm frozen at a snapshot every phase (ADR-037 pattern).
+
+**The ADR-025 pinch point is not this gripper's grasp centre.** Measured in
+genuine top-down poses, constant across the workspace to 5 dp: the static
+finger pad sits **-0.08298 m** below the pinch point, the moving pad
+**-0.02015 m**. Master never hit this because its position-only IK leaves
+orientation uncontrolled — its poses are not top-down, and its pads sit only
+~0.013 m below the pinch. Two constraints then nearly conflict: the static pad
+must clear the table (pinch >= 0.43298) while the object must lie BETWEEN the
+pads (pinch <= 0.43898). The feasible clearance window is **4 mm wide**:
+0.078 / 0.080 / 0.082. Adopted 0.080.
+
+This matters because the stage's first attempt used 0.084 — 2 mm past the
+window — which put the fork outside the jaw span, and then widened
+`attempt_grasp`'s distance gate from 0.05 to **0.12 m** so the weld would
+attach anyway, 8.6 cm from the pinch. That produced a `pick` that satisfied
+criterion (a) by dragging a fork welded below the gripper. **It was reported as
+a PASS and that result is retracted**; the gate is now 0.09 against an actual
+0.0854, so it is a real check again.
+
+**Yaw is a first-class variable, not a fixed `heading + 90 deg`.** Reachable
+pinch ceiling at the fork's xy, by yaw: 90 deg -> 0.440; 0/180 -> 0.466;
+225 -> 0.476; **270 -> 0.478**. 270 deg is 90+180: for a two-jaw gripper the
+SAME grip (pad offsets identical), but a far less extended arm. At 90 deg only
+4 mm of lift headroom remained and `pick` could not raise the fork past its
+0.370 bar; at the corrected clearance plus a 0.03 m hover (Lab 8's own number)
+it lifts to 0.3768. **The same variable fixed the handoff's transit
+collision**: at `HANDOFF_YAW = pi/2` arm B's approach collides with
+`armA_lower_arm` for 129 steps (worst -0.0047 m); at `3*pi/2` cross-arm contact
+is **zero** and phase 2 converges. Criterion (d) passes as a result.
+
+**Why the handoff still fails, and what was refused.** With the transit solved,
+phase 3 fails: arm B's weld never attaches. The offset-grasp geometry puts the
+two pinch points 6 cm apart laterally while each jaw span is ~2 cm, so the
+fork's body origin sits **0.1079 m** from arm B's pinch and 0.0762 m from its
+nearest pad. Widening the gate to 0.115 does make the handoff report success —
+and it was tested, then **reverted**, because a per-step contact check proved
+**arm B's finger pads never touch any fork geom at any point**. That is a weld
+across a 10.8 cm gap with no contact: a teleport dressed as a transfer. It is
+not shipped.
+
+The real fix, recorded for whoever continues: arm B's target must be derived
+from the **fork's actual pose** — a point on the fork's own surface offset
+along its axis, plus the pad clearance — not from an abstract world-frame
+`P_to`. `attempt_grasp`'s distance gate also measures to the object's body
+ORIGIN, which is a poor proxy for "between my jaws" on a 0.14 m object; a
+surface-distance gate would be the honest instrument.
+
+**Two rejected candidates, measured.** Widening the grip separation to dx=0.07
+clears the transit but the fork is only **0.14 m long with a 0.09 m handle**, so
+grips 14 cm apart would not be on it. Lateral staging cleans the final legs but
+then `home->stage` collides, and pushing the stage out merely moves the
+collision into `stage->hover`. Both refused on measurement.
+
+**A finding the brief did not anticipate:** `_split_move` (n=4). A single
+joint-space cubic from the folded home pose to a reach-down pose drives the
+gripper through the **table** mid-transit even when both endpoints are
+collision-free — joint-space interpolation has no notion of the Cartesian path
+it traces. Confirmed as real contact-force blocking, not slow PD tracking, by
+`data.qfrc_actuator` pinned at its `forcerange` bound while
+`data.qfrc_constraint` exactly opposed it. This is the same swept-path class as
+v1's ADR-062 gate gap, recurring at the trajectory level, and it is why `pick`
+passes.
+
+**Carried-forward corrections recorded here.**
+1. **Drift gate re-specified.** ADR-071's `< 0.001 rad` idle-arm gate fails at
+   0.001110 rad, but the gate was wrong, not the code: the maximum is at
+   **step 12 of 1000** and settles to **exactly 0.000774** (ADR-037's own
+   steady-state figure) by step ~200, holding for the remaining 800. Gate the
+   **settled** value; disclose the bounded start-up transient. No
+   snapshot-once PD hold can do better — a gravity-loaded joint snapshotted at
+   zero position error must sag before the PD term restores it.
+2. **Tracking metric corrected.** The "spline 0.001754 rad vs direct 1.599738
+   rad, ~900x" figure must not be quoted: for a one-shot command the peak error
+   IS the size of the move by construction. The defensible numbers are peak
+   ACTUAL velocity and acceleration — **0.451 vs 5.350 rad/s** and
+   **9.9 vs 211.4 rad/s^2**, same 0.00014 rad final error.
+3. **`water_bottle` regression stands (ADR-072).** Unreachable by both arms at
+   every height under top-down IK — a horizontal reach limit (0.271 m needed
+   against ~0.249 m available), not a height one. Master reached it 9/20 under
+   position-only IK. v2 cannot reach it at all. Disclosed, not dropped.
+
+**Executor.** `ScriptedSkillExecutor(inference=None, use_v2=False)`; the flag
+routes `_dispatch` to `skills_v2`. Default `False` preserves master's behaviour
+byte-for-byte, including the oracle-mode `cameras=None` assertion.
+`pytest tests/test_skills.py` unchanged at **4 passed / 4 failed**.
+
+**Caps.** Part A's 45 min and Part B's 90 min were both overrun, disclosed
+rather than hidden: in each case the stated defect was a symptom several levels
+below where the brief located it.
+
+### ADR-074 — v2 verdict: the motion-stack rebuild passes 2 of 3 skills and a 6-of-6 bimanual relay on scene-integrity criteria that master fails 0-for-3; `master` is kept as the functional baseline and v2 presented as the measured rebuild
+
+**Branch:** `redesign-v2`, closing ADR. **`master` frozen at `238cfed`
+throughout and not modified.** Full report: `docs/hardware/v2-verdict.md`.
+Closes ADR-070 (geometric top-down IK), ADR-071 (cubic-spline motion),
+ADR-072 (scene validation), ADR-073 (phase-based skills).
+
+**What was replaced.** Master's stack is position-only DLS IK driving direct
+position commands: orientation uncontrolled, no swept-path check, and
+"success" measured on the target object alone. All three consequences are
+visible in master's own `docs/videos/full-sequence-demo.mp4`, where the mug is
+knocked over and the water bottle knocked off the table while every skill
+reports success.
+
+**What was built.** `ik_geometric.py` (ADR-070), `motion.py` (ADR-071),
+`skills_v2.py` (ADR-073) — all additive. `ik.py`, `skills_scripted.py`,
+`grasp.py`, `env.py` and `scenes/so101/` are untouched; `executor.py` gained
+only an opt-in `use_v2` flag defaulting to `False`, and
+`pytest tests/test_skills.py` is unchanged at 4 passed / 4 failed.
+
+**Master vs v2, measured on ONE instrument.** `scripts/v2_criteria_monitor.py`
+is a read-only observer, and `skills_scripted.py` is unmodified on this
+branch, so master's own skills were run through it directly. **Both columns
+are measured** — contrary to this stage's brief, which assumed master's
+(b)-(e) could not be scored retroactively.
+
+| skill | stack | (a) | (b) props | (c) arm-prop | (d) cross-arm | (e) peak vel |
+|---|---|---|---|---|---|---|
+| `pick(A, fork)` | master | OK | OK | OK | OK | **6.937 FAIL** |
+| | v2 | OK | OK | OK | OK | 1.832 OK |
+| `place(A, fork, .)` | master | OK | **mug 63.2 mm FAIL** | **-4.5 mm FAIL** | OK | **6.937 FAIL** |
+| | v2 | OK | OK | OK | OK | 0.143 OK |
+| `handoff(A->B, fork)` | master | OK | **mug 48.4 mm FAIL** | **-4.1 mm FAIL** | **3179 steps, -10.9 mm FAIL** | **6.937 FAIL** |
+| | v2 | **FAIL ph3** | 25.1 mm | -3.7 mm | **OK (0)** | 1.832 OK |
+
+**Master 0 of 3. v2 2 of 3.** Master's handoff spends **3179 of its 6610 steps
+(48%) in cross-arm contact**, 1.1 cm deep at worst, and reports success. Its
+peak joint velocity of 6.937 rad/s exceeds even the 5.350 rad/s an isolated
+one-shot direct command produces — the quantified mechanism behind the wrecked
+table. v2's handoff still fails, but its cross-arm contact went from 3179 steps
+to **zero**.
+
+**The bimanual relay.** `scripts/v2_stage5_demo.py`, seed 0: six stages,
+**6 of 6 pass all five criteria**, 24.2 s simulated, recorded in
+`docs/videos/v2-relay-demo.mp4` (23.73 s, 1.020x real time). The fork moves
+from arm A to arm B **via the table**, not hand to hand.
+
+Three sequencing rules were found by measurement and are **preconditions on
+skill composition, not fixes to skills**: the idle arm must be home before the
+other approaches shared space (skipping it cost 240 cross-arm contact-steps);
+returns must route via a raised waypoint (a direct sweep dragged the mug
+**28.2 cm**); and a place target must keep the **jaw-opening swept volume**
+clear of neighbouring props. That last rule generalises this branch's most
+common failure: **endpoints being clear says nothing about the volume swept
+getting there, or letting go.**
+
+**What v2 does not do.** The direct handoff. Its transit collision WAS solved
+(`HANDOFF_YAW = 3*pi/2` took cross-arm contact 129 steps -> 0), but phase 3
+fails: the 6 cm lateral grip offset the fork's 0.14 m length permits leaves the
+fork's body origin **0.1079 m** from arm B's pinch against a ~2 cm jaw span.
+Widening the weld gate to 0.115 m makes it *report* success; that was tested
+and **refused** after a per-step contact check proved **arm B's pads never
+touch any fork geom** — a weld across a 10.8 cm gap, not a transfer. Named fix,
+not attempted: target from the object's actual pose and gate on surface
+distance rather than body-origin distance. Also lost: the **water bottle**,
+unreachable under top-down IK (0.271 m needed against ~0.249 m available) where
+master reached it 9/20 — the direct cost of spending the arm's redundancy on
+orientation control.
+
+**Instrument-quality findings.** The ADR-025 pinch point is **not** this
+gripper's grasp centre: in top-down poses the static pad sits -0.08298 m below
+it and the moving pad -0.02015 m, leaving a **4 mm** feasible clearance window
+between "static pad clears the table" and "object lies between the pads".
+Stage 4's first implementation sat 2 mm outside that window and widened the
+weld gate 0.05 -> 0.12 m to attach anyway, 8.6 cm from the pinch; its `pick`
+satisfied criterion (a) by dragging a fork welded below the gripper and **was
+reported as passing all five. That result was retracted.**
+
+Also recorded: the ADR-071 drift gate is **mis-specified** — 0.001110 rad is a
+step-12 transient settling to exactly 0.000774 (ADR-037's own steady state), so
+gate the settled value and disclose the transient; and ADR-071's "~900x
+tracking" figure must not be quoted, because a one-shot command's peak error is
+the size of the move by construction (the defensible numbers are peak ACTUAL
+velocity 0.451 vs 5.350 rad/s and acceleration 9.9 vs 211.4 rad/s^2).
+
+**Errors of my own, recorded rather than quietly fixed.** A 21-sample sweep
+declared the handoff transit clean; it stepped `s` by 0.05 and straddled a
+collision at s~0.87 that a 101-sample sweep measured at **-0.0269 m**. A relay
+harness printed "6/6" while counting only criterion (a) (truly 5/6). And I
+briefly called the 0.083 m pad offset a phantom after measuring master's
+non-top-down pose — the original measurement was right.
+
+**Verdict.** Neither stack dominates. Master does two things v2 cannot: a
+direct hand-to-hand transfer, and water-bottle reach. v2 does its work without
+disturbing the scene and knows, with numbers, what it is doing.
+**`master` is kept as the submission's functional baseline and v2 is presented
+as the measured rebuild** — v2 does not replace those four skills. Its
+contribution is a documented case of finding hidden failure modes by building a
+better instrument, then refusing the two shortcuts (a widened grasp gate, a
+widened weld gate) that would have converted failures into passing numbers.
+Disposition recorded in `docs/hardware/submission-path.md`.
+
+**A continuation would need** the named handoff fix; reach recovery via a
+longer link or repositioned base (scene/hardware, deliberately outside v2's
+motion-stack scope); and a swept-volume planner, since every hard failure here
+reduces to joint-space interpolation having no notion of the Cartesian path it
+traces — `_split_move`'s four linear sub-legs is a mitigation, not a solution.
 
 ## 5. Open items this document deliberately does not decide
 
