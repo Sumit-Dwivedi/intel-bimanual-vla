@@ -16,7 +16,18 @@ Licensed under the MIT License — see `LICENSE`.
 `run_demo.sh` is the project's entry point for reproducing the demo. Before
 running it, check your environment against `scripts/requirements-dev.txt`
 (laptop) or `scripts/requirements-bmptl.txt` (Intel target), and run
-`scripts/verify_env.py` to confirm the install. This is a simulation-only
+`scripts/verify_env.py` to confirm the install — **passing the same
+requirements file you installed**:
+
+```bash
+python scripts/verify_env.py                                          # laptop (default)
+python scripts/verify_env.py --requirements scripts/requirements-bmptl.txt   # Intel target
+```
+
+The default is the laptop list, so running it bare on the Intel target reports
+`torch`/`PyYAML`/`kaggle` as missing and prints FAIL — those are deliberately
+absent from that host's `ov_env` (they live in `train_env`), and the demo runs
+fine without them. This is a simulation-only
 project — no physical robot is involved anywhere in the pipeline. See the
 Status section below for exactly which skill/arm/object combinations
 currently work end-to-end, and `SUBMISSION.md` for the full, unembellished
