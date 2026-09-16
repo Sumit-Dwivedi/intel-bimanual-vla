@@ -56,6 +56,16 @@ already-diagnosed, documented reasons (below), not silently.
   (`reason: phase 1 (from_arm pick) failed (waypoint 1 (approach) failed
   [convergence (IK residual=0.0954 m >= 0.01 m)])`), matching ADR-037's own
   recorded measurement.
+  **Qualification (added with the v2 section below):** this is a limit of *this
+  stack's position-only solver*, not of arm B as such — the v2 rewrite's
+  top-down IK does achieve `pick(B, fork)` (relay stage 4, all five
+  scene-integrity criteria). v2 still has no working direct handoff, so
+  `handoff(B→A, fork)` remains unachieved on either stack.
+
+- **(v2 branch, not this stack)** Direct hand-to-hand handoff attempted in the
+  v2 rewrite; diagnosed to arm B's grasp not physically attaching at the offset
+  the fork's length permits. Fix identified in ADR-073. Six-stage relay via
+  table shown instead.
 
 `pytest tests/test_skills.py`: 4 passed / 4 failed (same four tests failing
 throughout ADR-034 through ADR-038, no regression).
@@ -75,6 +85,66 @@ end-to-end and are available for the 10-seed robustness recording and demo video
 content — see the Working list above. The four listed as not working are the ones
 still at risk; a full brief-example command (which ends in `pour`, out of scope) is
 still not reachable end-to-end.
+
+## Motion-stack rewrite (`redesign-v2`) — a measured rebuild, not a replacement
+
+A full rewrite of the motion stack lives on the **`redesign-v2`** branch:
+geometric top-down IK (`ik_geometric.py`, ADR-070), cubic-spline joint-space
+trajectories (`motion.py`, ADR-071) and phase-based skills (`skills_v2.py`,
+ADR-073). It is **opt-in** behind `ScriptedSkillExecutor(use_v2=True)`, it
+**does not replace** the four skills above, and it changes nothing about this
+submission's demo path — `use_v2` defaults to `False`, and the regression gate
+is unchanged (`run_demo.py` 4/4 PASS; `pytest tests/` 66 passed / 4 failed;
+`scripts/verify_adr038_skills.py` 0.3989 / 0.3588 / 0.6192 / 0.1946,
+`frames_used=6610`, all on bm-ptl).
+
+It exists because the skills above were only ever scored on **whether the
+target object moved**. Re-scored against five criteria — target moved as
+intended; no non-target prop displaced beyond **5 mm**; no arm-to-prop contact
+deeper than **1 mm**; no arm-to-arm contact; peak joint velocity under a
+**2.6 rad/s** gate — **this stack passes 0 of 3**: `place` displaces the mug
+**63.2 mm**, and `handoff(A→B, fork)` spends **3179 of its 6610 steps (48%)**
+with the two arms in contact, 1.1 cm deep at worst, at **6.937 rad/s** peak
+joint velocity. That is the measured mechanism behind the two props disturbed
+in `docs/videos/full-sequence-demo.mp4`, disclosed above. Both stacks were
+scored on one read-only instrument (`scripts/v2_criteria_monitor.py`), so the
+comparison is like-for-like.
+
+Under those same criteria v2 passes **2 of 3 individual skills** (`pick`,
+`place`) and a **six-stage bimanual relay in which every stage passes all five
+scene-integrity criteria** — worst peak joint velocity **2.362 rad/s** against
+the 2.6 gate, and no non-target prop displaced at any stage. Recorded in
+`docs/videos/v2-relay-demo.mp4` (23.7 s, one continuous fixed-camera take at
+1.02x real speed). Two qualifications belong with that result: `pick`'s pass
+required **correcting the grasp geometry first** — the ADR-025 pinch point is
+not this gripper's grasp centre in top-down poses, leaving only a **4 mm**
+feasible clearance window — and an earlier v2 claim that `pick` passed all five
+was **retracted** when that proved wrong (ADR-073). Relatedly, v2's top-down IK
+does achieve `pick(B, fork)` (relay stage 4), which this stack has never
+managed; the arm-B reach limit recorded above is specific to the position-only
+solver.
+
+**What v2 does not do.** It has **no working direct hand-to-hand handoff** —
+diagnosed, unsolved, with a named fix in ADR-073. The relay moves the fork
+between arms **via the table**, and is not a substitute for a direct transfer.
+v2 also **cannot reach the water bottle at all** (0.271 m of horizontal reach
+required against ~0.249 m available), where this stack reaches it 9/20 — the
+direct cost of spending the arm's redundancy on orientation control. v2 has
+seed-0 coverage plus the relay, against this stack's 20-seed record (ADR-053).
+
+Full comparison, every caveat, and both stacks' per-criterion numbers:
+**ADR-074** and `docs/hardware/v2-verdict.md`.
+
+**Where the v2 records live.** `docs/hardware/v2-verdict.md` is on `master` and
+is self-contained. **ADR-070 through ADR-074 live in `DECISIONS.md` and
+`ARCHITECTURE.md` on the `redesign-v2` branch, not on `master`** — the branch
+is pushed to origin and preserved deliberately as the evidence, the same
+convention this document already uses for the earlier `redesign` branch. The
+v2 source (`ik_geometric.py`, `motion.py`, `skills_v2.py`) is likewise on that
+branch only; `master` carries the v2 documentation, the relay video, its eight
+inspection frames, and the scoring instrument
+(`scripts/v2_criteria_monitor.py`), so every claim above can be re-measured.
+
 
 ## Basic Information
 - [ ] Project title: [DRAFT: Bimanual VLA on Intel Core Ultra — a voice-driven table-setting demo]
@@ -122,12 +192,12 @@ rubric; only the presentation is new.
 
 | Criterion (pts) | Status | Evidence | What it shows / where it stops |
 |---|---|---|---|
-| End-to-end task completion & bimanual (30) | **MET, narrowly** | ADR-037 (sequential one-arm-at-a-time choreography fix), ADR-038 (render legibility); `docs/images/m06-handoff-complete.png`; `docs/videos/full-sequence-demo.mp4`; `docs/videos/m06-handoff-clip.mp4`; `scripts/render_full_sequence.py`; `run_demo.py` (reported 4/4 PASS, exit 0, bm-ptl) | `handoff(A→B, fork)` completes end-to-end with genuine two-arm coordination (`weld.is_holding('B')=='fork'`, `weld.is_holding('A') is None`, `from_arm_clear=True`), following the sequential choreography in Wan, Ramos, Yang, Garrett 2025 (NVIDIA), "Learning to Plan & Schedule with Reinforcement-Learned Bimanual Robot Skills", https://arxiv.org/html/2510.25634v1, and consistent with "Trajectory planning system for bimanual robots" (2025), https://www.sciencedirect.com/science/article/pii/S0921889025002155 (title/URL only; no verified author). Three further single-arm skills also complete end-to-end: `pick(A, fork)`, `place(A, fork, table)`, `pick(A, water_bottle)`. Grasping is an explicit MuJoCo weld-constraint abstraction, not friction contact (ADR-029, disclosed per ADR-015). Four other skill/arm/object combinations do not work (see Working/Not working lists above), and `pour` is out of scope (ADR-023), so the brief's own literal example command does not run end-to-end. **On composition:** pick, handoff and place DO run as one continuous episode — but only when the sequence is expressed as TWO calls, not three. `run_handoff`'s own Phase 1 is a nested `run_pick`, so `run_handoff(env, 'B', 'A', 'fork')` followed by `run_place(env, 'B', 'fork', 'table')` covers all three phases in a single 8410-step episode (handoff 6610 steps success=True; place 1800 steps success=True; fork ends at z=0.3537 on a table surface at z=0.35, weld released). That is what `docs/videos/full-sequence-demo.mp4` records, in one continuous fixed-camera take. The literal THREE-call form still fails, and was re-verified as failing: `scripts/chained_demo.py` runs `pick(A, fork)`, then `handoff(A->B, fork)`, then `place(B, fork, table)`: step 1 passes; step 2 clears the already-held guard added in ADR-054 but fails at Phase 3 (`to_arm` approach, IK residual 0.0875 m, then a cross-arm collision when staging to y=-0.06); step 3 is never reached. The difference is the leading explicit `run_pick`, which is redundant with the handoff's own Phase 1 (whose guard then skips it) and leaves arm A entering Phase 2 in a different configuration than the nested pick would have. The mechanism has not been isolated further; what is measured is that the two-call form succeeds and the three-call form does not. Reported this way because "four skills complete end-to-end" should not be read as "any call sequence composes": the composition that works is the two-call one, and the three-call failure point is measured and named rather than glossed. **On the clips:** `docs/videos/full-sequence-demo.mp4` is now the primary video evidence — 40.0 s, 1280x720, 30 fps, one continuous fixed-camera take showing the pick, the transfer and the place. Note that two non-target props are disturbed during it: the mug is knocked onto its side and the water bottle falls off the table. The scripted skills have no collision avoidance for props they are not acting on; this is disclosed rather than reframed away, and it does not affect the fork result. The older `docs/videos/m06-handoff-clip.mp4` is retained but superseded: its first roughly two-thirds do not read as a handoff, because the camera is pinned to the final gripper pose, so only the last ~0.5 s is legible. |
+| End-to-end task completion & bimanual (30) | **MET, narrowly** | ADR-037 (sequential one-arm-at-a-time choreography fix), ADR-038 (render legibility); `docs/images/m06-handoff-complete.png`; `docs/videos/full-sequence-demo.mp4`; `docs/videos/m06-handoff-clip.mp4`; `scripts/render_full_sequence.py`; `run_demo.py` (reported 4/4 PASS, exit 0, bm-ptl); plus, on the `redesign-v2` branch, a six-stage bimanual relay passing all five scene-integrity criteria at every stage (`docs/videos/v2-relay-demo.mp4`, `docs/hardware/v2-verdict.md`, ADR-074) — via the table, **not** a direct handoff | `handoff(A→B, fork)` completes end-to-end with genuine two-arm coordination (`weld.is_holding('B')=='fork'`, `weld.is_holding('A') is None`, `from_arm_clear=True`), following the sequential choreography in Wan, Ramos, Yang, Garrett 2025 (NVIDIA), "Learning to Plan & Schedule with Reinforcement-Learned Bimanual Robot Skills", https://arxiv.org/html/2510.25634v1, and consistent with "Trajectory planning system for bimanual robots" (2025), https://www.sciencedirect.com/science/article/pii/S0921889025002155 (title/URL only; no verified author). Three further single-arm skills also complete end-to-end: `pick(A, fork)`, `place(A, fork, table)`, `pick(A, water_bottle)`. Grasping is an explicit MuJoCo weld-constraint abstraction, not friction contact (ADR-029, disclosed per ADR-015). Four other skill/arm/object combinations do not work (see Working/Not working lists above), and `pour` is out of scope (ADR-023), so the brief's own literal example command does not run end-to-end. **On composition:** pick, handoff and place DO run as one continuous episode — but only when the sequence is expressed as TWO calls, not three. `run_handoff`'s own Phase 1 is a nested `run_pick`, so `run_handoff(env, 'B', 'A', 'fork')` followed by `run_place(env, 'B', 'fork', 'table')` covers all three phases in a single 8410-step episode (handoff 6610 steps success=True; place 1800 steps success=True; fork ends at z=0.3537 on a table surface at z=0.35, weld released). That is what `docs/videos/full-sequence-demo.mp4` records, in one continuous fixed-camera take. The literal THREE-call form still fails, and was re-verified as failing: `scripts/chained_demo.py` runs `pick(A, fork)`, then `handoff(A->B, fork)`, then `place(B, fork, table)`: step 1 passes; step 2 clears the already-held guard added in ADR-054 but fails at Phase 3 (`to_arm` approach, IK residual 0.0875 m, then a cross-arm collision when staging to y=-0.06); step 3 is never reached. The difference is the leading explicit `run_pick`, which is redundant with the handoff's own Phase 1 (whose guard then skips it) and leaves arm A entering Phase 2 in a different configuration than the nested pick would have. The mechanism has not been isolated further; what is measured is that the two-call form succeeds and the three-call form does not. Reported this way because "four skills complete end-to-end" should not be read as "any call sequence composes": the composition that works is the two-call one, and the three-call failure point is measured and named rather than glossed. **On the clips:** `docs/videos/full-sequence-demo.mp4` is now the primary video evidence — 40.0 s, 1280x720, 30 fps, one continuous fixed-camera take showing the pick, the transfer and the place. Note that two non-target props are disturbed during it: the mug is knocked onto its side and the water bottle falls off the table. The scripted skills have no collision avoidance for props they are not acting on; this is disclosed rather than reframed away, and it does not affect the fork result. The older `docs/videos/m06-handoff-clip.mp4` is retained but superseded: its first roughly two-thirds do not read as a handoff, because the camera is pinned to the final gripper pose, so only the last ~0.5 s is legible. |
 | VLA / multi-modal reasoning (20) | Partial | M04 `CommandSource` ABC; M05 rule grounder; `tests/test_grounder.py` (43 tests); `docs/command-grammar.md` | Text command → grounded skill plan works and is the path the demo actually runs. This is a rule-based grounder, not a learned VLA model — ACT/policy training is cut (ADR-023). PoseNet perception is trained and benchmarked (M10) but is opt-in and **off by default** in the demo (oracle mode, ADR-046): the grounder is in the demo path, perception is not. Do not read this row as claiming perception-driven multi-modal reasoning. |
 | OpenVINO & Core Ultra optimization (20) | Partial | ADR-045 (PoseNet → OpenVINO IR, FP32/FP16, benchmarked CPU/iGPU/NPU) and ADR-050 (INT8 PoseNet quantization via NNCF, benchmarked CPU/iGPU/NPU); `benchmarks/ov-smoke-notes.md`; `docs/hardware/m10-phase4-benchmark.md` | The conversion pipeline is proven on all three devices twice over: a smoke test on a placeholder ResNet18-scale encoder (`ov-smoke-notes.md`, max abs deviation vs PyTorch 5.7e-05 to 1.1e-04) and the real PoseNet model in FP32/FP16 (ADR-045). INT8 was also converted and benchmarked (ADR-050) but its 36-37 mm deviation — an order of magnitude above PoseNet's own 2.6-3.2 mm ground-truth MAE — made it unfit to ship; see the Innovation row for why that is reported as a finding, not a gap. |
 | Robustness across 10 seeds (15) | Narrow, measured per skill | ADR-053, `docs/hardware/m08-extended-eval.md` (20 seeds); ADR-049, `docs/hardware/m08-eval.md` (original 10 seeds); ADR-051 and its section 9, `docs/hardware/m10-handoff-perturbation.md` | **Each skill carries its own rate — these are not interchangeable.** Track A (each skill's own target prop displaced within its own measured envelope, roughly ±10-20 mm), 20 seeds: `pick(A, fork)` **20/20**; `place(A, fork, table)` **20/20**; `pick(A, water_bottle)` **9/20 (45%)**; `handoff(A→B, fork)` **20/20 but degenerate** — its Track A envelope is a single point (`docs/hardware/m07-envelopes.md`), so every seed runs the byte-identical scenario and this measures determinism, not robustness. **Methodology:** the initial 10-seed evaluation (ADR-049) measured `pick(A, water_bottle)` at 6/10. Extending to 20 seeds (ADR-053) revised this to 9/20 (45%), with seeds 0-9 reproducing bit-for-bit — the original figure was small-sample optimism, not a behavioural change. We report the 20-seed figure. **`handoff` is not robust by any measurement taken:** it reproduces only at its single exact tuned configuration, and fails under prop displacement (Track B, 0/10, ADR-049), a 2.2 mm perception offset (ADR-046), and ±0.003 rad arm-angle noise (1/5, ADR-051 section 9). No robustness adjective should be attached to `handoff` anywhere in judge-facing copy, and its 20/20 must never appear without the degenerate qualifier. |
 | Reproducibility (10) | Met, for what ships | `scripts/verify_env.py`; `scripts/requirements-dev.txt` / `scripts/requirements-bmptl.txt`; `run_demo.py` (reported 4/4 PASS, exit 0, bm-ptl) | Pinned environments plus a single entry point reproduce the four working skills end-to-end. `pytest tests/test_skills.py` is **4 passed / 4 failed** — never describe the suite as passing; the four failures are the same already-diagnosed combinations, not a regression. |
-| Innovation (5) | Evidenced | ADR-029 (weld-constraint grasping abstraction), following the ADR-028 fix for MuJoCo issue #239's finger-pad mesh collapse; ADR-050 and `docs/hardware/m10-phase4-benchmark.md` (INT8 PoseNet quantization measured, then declined for shipping) | Two concrete instances, not one technique: an explicit, disclosed physics abstraction built only after diagnosing and fixing an upstream MuJoCo geometry bug, and a quantization pass that was measured against the model's own ground-truth error (36-37 mm vs. 2.6-3.2 mm MAE) and rejected on that evidence rather than shipped for its speedup alone. A measurement changing a decision is the rarer signal here. |
+| Innovation (5) | Evidenced | ADR-029 (weld-constraint grasping abstraction), following the ADR-028 fix for MuJoCo issue #239's finger-pad mesh collapse; ADR-050 and `docs/hardware/m10-phase4-benchmark.md` (INT8 PoseNet quantization measured, then declined for shipping) | Two concrete instances, not one technique: an explicit, disclosed physics abstraction built only after diagnosing and fixing an upstream MuJoCo geometry bug, and a quantization pass that was measured against the model's own ground-truth error (36-37 mm vs. 2.6-3.2 mm MAE) and rejected on that evidence rather than shipped for its speedup alone. A measurement changing a decision is the rarer signal here. **Fourth finding (ADR-074, `redesign-v2`):** the motion stack was rebuilt and then BOTH stacks were measured on one read-only instrument — this stack 0 of 3 skills pass scene-integrity criteria, v2 2 of 3 plus a six-stage relay passing all five at every stage. It is the only one of these findings that produced a working alternative as well as a negative result. Two shortcuts that would have converted failures into passing numbers (widening the grasp gate 0.05 → 0.12 m; widening the weld gate to 0.115 m) were measured and refused — the second after a per-step contact check proved the receiving gripper's pads never touch the fork. |
 
 ### Platform-general
 

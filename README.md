@@ -53,6 +53,26 @@ z=0.35, with the weld released.
 `docs/videos/m06-handoff-clip.mp4` is retained but superseded as primary evidence:
 it is a 2.0 s close-up in which only the last ~0.5 s reads as a handoff.
 
+## Motion-stack rewrite (`redesign-v2` branch)
+
+A second, measured take on the motion stack — geometric top-down IK,
+cubic-spline trajectories, and skills scored on what happens to the **whole
+table**, not just the target object: no non-target prop displaced beyond 5 mm,
+no arm-to-prop or arm-to-arm contact, peak joint velocity under a 2.6 rad/s
+gate.
+
+`docs/videos/v2-relay-demo.mp4` — a six-stage bimanual relay, 23.7 s at 1.02x
+real speed, in which **every stage passes all five of those criteria** and
+nothing else on the table moves. The fork passes from one arm to the other
+**via the table**: v2 has **no working direct hand-to-hand handoff**, and the
+relay is not a substitute for one.
+
+It is opt-in (`use_v2=True`), does not replace the four skills below, and the
+default demo path is unchanged. Measured on the same instrument, the shipped
+stack passes **0 of 3** — and v2 gives up water-bottle reach entirely. The
+honest comparison, with every caveat, is in `docs/hardware/v2-verdict.md`
+(on `master`); ADR-070-074 and the v2 source live on the `redesign-v2` branch.
+
 ## Status
 
 **In active development through Sept 16, 2026.** The final README — with reproduction

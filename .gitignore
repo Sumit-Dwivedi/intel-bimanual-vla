@@ -60,3 +60,4 @@ Thumbs.db
 
 # Build artifacts (OpenVINO IR, reference tensors) -- regenerable, ~67MB
 artifacts/
+v2_demo_frames/

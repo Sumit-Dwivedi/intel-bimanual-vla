@@ -6,12 +6,12 @@ was verified present before commit.
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| End-to-end + bimanual (30) | 4 skills; `handoff(A→B)` verified, 4/4 PASS; pick+handoff+place in one 40 s take | `docs/videos/full-sequence-demo.mp4`, `run_demo.py`, `docs/images/m06-handoff-complete.png` |
+| End-to-end + bimanual (30) | 4 skills; `handoff(A→B)` verified, 4/4 PASS; pick+handoff+place in one 40 s take | `docs/videos/full-sequence-demo.mp4`, `run_demo.py`, `docs/images/m06-handoff-complete.png`, plus a v2 six-stage relay passing all five scene-integrity criteria (`docs/videos/v2-relay-demo.mp4`, ADR-074) — via the table, not a direct handoff |
 | VLA / multi-modal (20) | Text + voice grounding; perception demoed | 43 grounder tests, ADR-058 (voice), ADR-055 (perception) |
 | OpenVINO on Core Ultra (20) | 3 devices × 3 precisions + batch scaling | `docs/hardware/m10-phase4-benchmark.md` |
 | Robustness (15) | 20-seed eval, per-skill rates | `docs/hardware/m08-extended-eval.md` |
 | Reproducibility (10) | One entry point, pinned envs, 59 ADRs | `run_demo.py`, `scripts/requirements-*.txt`, `ARCHITECTURE.md` |
-| Innovation (5) | Three measured negative results | ADR-050, ADR-057, `redesign` branch verdict |
+| Innovation (5) | Four measured findings | ADR-050, ADR-057, `redesign` branch verdict |
 
 ## Notes for whoever presents this
 
@@ -27,6 +27,14 @@ was verified present before commit.
   its envelope is a single point, so that figure measures determinism, not
   robustness, and must never be quoted bare.
 - Full-sequence video: pick + handoff + place in **one continuous 40.0 s take**, as **two** calls (`run_handoff`, whose Phase 1 *is* the pick, then `run_place`). The three-call form still fails at handoff Phase 3 — do not claim "any order composes". Two non-target props (mug, water bottle) are knocked over on camera; say so before a judge asks.
+- v2 (`redesign-v2`) has **no working direct handoff** — say "relay via the
+  table". Its relay is **6 of 6 stages on all five scene-integrity criteria**,
+  never a bare "6/6". Do **not** quote any spline-vs-direct
+  tracking-error ratio; that comparison measures the command step, not the
+  controller — the defensible numbers are **11.9x
+  lower peak velocity and 21x lower peak acceleration at an identical 0.00014
+  rad final error**. Idle-arm drift is **0.000774 rad settled**, with a bounded
+  transient at step 12 disclosed. v2 **cannot reach the water bottle at all**.
 - `pytest tests/test_skills.py` is **4 passed / 4 failed** — never describe the
   suite as passing.
 
@@ -43,7 +51,19 @@ strongest part of the story because each one changed a decision:
    base separation) and was then **rejected on net evidence** (1/8 vs master's
    4/9), with a named reason it cannot be rescued at this scope.
 
-**Path note.** The redesign verdict is `docs/hardware/redesign-verdict.md` on
+4. **v2 motion-stack rewrite** (`redesign-v2`, ADR-074) — rebuilt the motion
+   stack, then measured **both** stacks on one read-only instrument: the
+   shipped stack passes **0 of 3** skills on scene-integrity criteria, v2
+   **2 of 3** plus a six-stage relay passing all five at every stage. The only
+   one of the four that produced a working alternative as well as a negative
+   result — and two shortcuts that would have turned failures into passing
+   numbers (grasp gate 0.05 → 0.12 m; weld gate → 0.115 m) were measured and
+   **refused**.
+
+**Path note.** The v2 verdict `docs/hardware/v2-verdict.md`, the relay video
+and `scripts/v2_criteria_monitor.py` ARE on `master`; **ADR-070-074 and the v2
+source are on the `redesign-v2` branch**. The redesign verdict is
+`docs/hardware/redesign-verdict.md` on
 the **`redesign` branch**, not on `master` — the branch is pushed to origin and
 preserved deliberately as the evidence. Everything else cited here is on
 `master`.
