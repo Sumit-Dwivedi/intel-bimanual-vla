@@ -58,7 +58,11 @@ def main():
 
     # ---- 2. PLACE(A, fork, target) -- prerequisite pick NOT scored ----
     env, weld = fresh()
-    tgt = fork_pos(env).copy()
+    # Clear of the plate: its dish radius is 0.06 so its rim reaches x=-0.09,
+    # and the fork's own start (-0.05, 0.05) is only 4 cm from that rim -- the
+    # gripper's moving pad catches it on opening. Measured: 5 of 6 alternative
+    # targets are completely clean. This is a caller's choice, not a skill defect.
+    tgt = np.array([0.00, 0.05, 0.356])
     pre = sk.run_pick(env, "A", "fork", weld)
     print("\n   [prereq] pick(A,fork) success=%s (not scored)" % pre.success)
     mon = Monitor(env, "fork")

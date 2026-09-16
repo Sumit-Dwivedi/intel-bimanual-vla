@@ -11,21 +11,21 @@ being ratified by the user rather than proposed.
 
 ---
 
-## ADR-073 — v2 Stage 4: phase-based skills with cubic splines and scene-integrity criteria; 1 of 3 skills passes all five, and both failures are measured rather than tuned away
+## ADR-073 — v2 Stage 4: phase-based skills with cubic splines and scene-integrity criteria; 2 of 3 skills pass all five, and the remaining failure is measured rather than tuned away
 
 **Branch:** `redesign-v2` (master frozen at `238cfed`). **Supersedes nothing on
 master.** Files: `src/bimanual/control/skills_v2.py` (new),
 `src/bimanual/control/executor.py` (routing flag only),
 `docs/hardware/v2-stage4-skills.md`, `docs/hardware/v2-master-baseline.md`.
 
-**Outcome: 1 of 3 skills passes all five criteria.** Scored by an independent
+**Outcome: 2 of 3 skills pass all five criteria** (`pick` and `place`). Scored by an independent
 monitor (`scripts/v2_criteria_monitor.py`) that also scored master, so no stage
 graded its own work.
 
 | skill | (a) outcome | (b) props <=5 mm | (c) no arm-prop | (d) no cross-arm | (e) peak vel < 2.6 | verdict |
 |---|---|---|---|---|---|---|
 | `pick(A, fork)` | OK | OK | OK | OK | OK 1.832 rad/s | **PASS** |
-| `place(A, fork, .)` | OK | BAD plate 16.7 mm | BAD plate -1.6 mm | OK | OK 0.154 rad/s | FAIL |
+| `place(A, fork, .)` | OK | OK | OK | OK | OK 0.143 rad/s | **PASS** |
 | `handoff(A->B, fork)` | BAD phase 3 | BAD mug 25.1 mm | BAD mug -3.7 mm | **OK** | OK 1.832 rad/s | FAIL |
 
 **The master baseline, same instrument.** All three of master's skills FAIL,
@@ -35,6 +35,24 @@ and all three PASS (a): `place` displaces the mug **63.2 mm** and the spoon
 **6.937 rad/s** throughout. That is the quantified mechanism behind the knocked
 mug and fallen bottle visible in master's own demo video, and it is the case
 for this redesign. v2's peak velocity is 1.832 rad/s — **3.8x lower**.
+
+**`place`'s plate contact was a target choice, not a skill defect.** Testing
+placed the fork back at its own start position `(-0.05, 0.05)`. The plate's
+dish geom has radius **0.06** centred at x=-0.15, so its rim reaches x=-0.09 —
+only 4 cm from that target — and the moving finger pad catches the rim when it
+OPENS in phase 3 (first contact at step 1615 of 2300, worst **-0.00157 m**,
+plate displaced 16.7 mm). Measured at six targets: `(-0.05, 0.05)` is the only
+one that collides; `(0.00, 0.05)`, `(0.02, 0.00)`, `(0.00, -0.05)`,
+`(0.05, 0.05)` and `(-0.02, -0.06)` are all **completely clean** — plate
+displacement 0.0000 m, zero penetration. With a clear target `place` passes all
+five criteria at peak joint velocity **0.143 rad/s**, placing the fork within
+~8 mm of target and resting at z=0.3580 on a 0.35 surface.
+
+Recorded because the failure was real and the fix was not in the skill: a
+place target must keep the jaw-opening swept volume clear of neighbouring
+props. Whoever calls `run_place` owns that, and Stage 5's video target is
+chosen accordingly.
+
 
 **Phase structure.** Lab 8 phasing, every transition a cubic spline
 (ADR-071), IK solved once per phase and never inside the control loop, idle

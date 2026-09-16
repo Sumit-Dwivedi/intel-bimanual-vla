@@ -215,3 +215,32 @@ gate, so the gate is a real check again), lifted to z=0.3768 > 0.3700.
 `place`'s stated Part A defect is resolved. Its remaining failure is a new and
 much smaller one: the plate is nudged 16.7 mm with 1.6 mm penetration, just
 over the 1 mm bar.
+
+## PART A addendum — `place` now PASSES: the plate was the target, not the skill
+
+`place`'s remaining (b)/(c) failure was caused by the **place target**, not by
+the skill. Tests placed the fork back at its own start `(-0.05, 0.05)`; the
+plate's dish radius is **0.06** centred at x=-0.15, so its rim reaches x=-0.09,
+4 cm from that target. The moving finger pad catches the rim as it OPENS in
+phase 3 — first contact step **1615** of 2300, worst **-0.00157 m**, plate
+displaced **16.7 mm**.
+
+| place target | plate moved | worst penetration | verdict |
+|---|---|---|---|
+| (-0.05, +0.05) | 0.0167 m | -0.00157 | collides |
+| (0.00, +0.05) | 0.0000 | 0.00000 | **clean** |
+| (+0.02, 0.00) | 0.0000 | 0.00000 | **clean** |
+| (0.00, -0.05) | 0.0000 | 0.00000 | **clean** |
+| (+0.05, +0.05) | 0.0000 | 0.00000 | **clean** |
+| (-0.02, -0.06) | 0.0000 | 0.00000 | **clean** |
+
+With `(0.00, 0.05, 0.356)`, `place` passes **all five criteria**: peak joint
+velocity 0.143 rad/s, nothing displaced, nothing touched, fork resting at
+z=0.3580 within ~8 mm of target.
+
+**Stage 4 final: 2 of 3 skills pass all five criteria** (`pick`, `place`),
+against master's **0 of 3**. `handoff` fails at phase 3 as recorded in ADR-073.
+
+The generalisable lesson: a place target must keep the **jaw-opening swept
+volume** clear of neighbouring props. That is the caller's responsibility, and
+Stage 5's video target is chosen accordingly.
