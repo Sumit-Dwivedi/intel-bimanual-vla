@@ -199,7 +199,20 @@ HOME_ARM_QPOS = np.array([0.0, -1.2, -1.6, 0.0, 0.0], dtype=np.float64)
 #: object's OWN z plus this clearance for the pinch point, instead of
 #: master's tiny `GRASP_POINT_OFFSET_M` z component, so the REAL pad (not
 #: the abstract pinch point) ends up at the object's actual height.
-GRIPPER_STATIC_PAD_CLEARANCE_M = 0.084
+#: **ORCHESTRATOR CORRECTION (Part A).** This was 0.084 -- the STATIC pad's
+#: own offset. That number is correct as a measurement (static pad sits
+#: -0.08298 m below the pinch point in every top-down pose, verified
+#: independently at six targets) but wrong as a clearance: the TWO pads sit
+#: at very different offsets (static -0.08298, moving -0.02015), and the
+#: object must end up BETWEEN them. Compensating by the static pad alone put
+#: the object AT that pad with the moving pad 6.3 cm above it -- outside the
+#: jaw span entirely -- which is why `attempt_grasp` only succeeded once its
+#: gate was widened to 0.12 m, welding the fork 8.6 cm from the pinch and
+#: dragging it along below the gripper. Measured: at 0.084 the fork is NOT
+#: between the pads (span 0.357..0.420, fork 0.356); at the pad MIDPOINT
+#: offset it is centred. Viable range 0.040-0.060.
+#:   pad midpoint = (-0.08298 + -0.02015) / 2 = -0.05156
+GRIPPER_STATIC_PAD_CLEARANCE_M = 0.076
 
 #: PICK/PLACE hover clearance above the (pad-compensated) grasp/place
 #: point, metres. **A disclosed correction to the brief's own "0.08 m
@@ -214,7 +227,7 @@ GRIPPER_STATIC_PAD_CLEARANCE_M = 0.084
 #: 0.02 m, measured reachable here for every phase this stage actually
 #: commands, is used instead -- the same number, and the same reasoning,
 #: `HANDOFF_HOVER_OFFSET_M` below already uses.
-HOVER_CLEARANCE_M = 0.02
+HOVER_CLEARANCE_M = 0.03
 
 #: PLACE's OWN hover clearance -- deliberately DIFFERENT from `HOVER_
 #: CLEARANCE_M` above, and a separate, later finding. PLACE's phase 1
@@ -247,7 +260,13 @@ PLACE_HOVER_CLEARANCE_M = 0.10
 #: independent loosening of the grasp abstraction's standard: the object
 #: was always going to be this far from the PINCH POINT once the pinch
 #: point itself had to move to keep the PAD clear of the table.
-WELD_GRASP_DISTANCE_THRESHOLD_M = 0.12
+#: **ORCHESTRATOR CORRECTION (Part A).** Was 0.12, which was sized to admit
+#: the 0.084 static-pad clearance above. With the pad-MIDPOINT clearance the
+#: object sits ~0.0516 m from the pinch point, so 0.06 m suffices with
+#: margin. 0.12 m was wide enough to admit a grasp with the object 8.6 cm
+#: from the pinch -- i.e. not between the jaws at all -- so narrowing this
+#: restores the gate's purpose as a real check rather than a formality.
+WELD_GRASP_DISTANCE_THRESHOLD_M = 0.09
 
 #: HANDOFF's own hover offset above `P_FROM`/`P_TO`, metres -- deliberately
 #: SMALLER than `HOVER_CLEARANCE_M` and a disclosed correction to a gap in

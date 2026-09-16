@@ -127,3 +127,86 @@ the handoff failure above, and it is why `pick` passes.
 2. Diagnose `place`'s 12.5 mm end-state error.
 3. Re-run everything on bm-ptl.
 4. Then, and only then, write ADR-073.
+
+## PART A — the 12.5 mm place offset: root cause was the grasp, not the release
+
+**Fixed.** `place`'s criterion (a) now passes. The cause was three stacked
+constants, all traceable to one geometric fact the brief did not know.
+
+### The geometric fact
+
+In a genuine top-down pose the gripper's two finger pads sit at **very
+different** offsets below the ADR-025 pinch point, and those offsets are
+constant across the workspace (verified at six targets, identical to 5 dp):
+
+    armA_static_finger_pad   -0.08298 m
+    armA_moving_finger_pad   -0.02015 m
+
+So the ADR-025 pinch point is **not** the grasp centre for this gripper. This
+is why master can target the pinch directly at the object and still grasp:
+master's position-only IK leaves orientation uncontrolled, so its pose is not
+top-down and its pads sit only ~0.013 m below the pinch. I initially concluded
+the Stage 4 builder had compensated for a phantom offset, measuring master's
+pose; that was wrong, and the builder's measurement was right.
+
+### The window
+
+Two constraints bound the grasp clearance, and they nearly conflict:
+
+  - the static pad must clear the table  ->  pinch >= 0.35 + 0.08298 = 0.43298
+  - the fork must lie BETWEEN the pads   ->  pinch <= 0.356 + 0.08298 = 0.43898
+
+Measured feasible clearances: **0.078, 0.080, 0.082** — a 4 mm window. Below
+0.078 the static pad penetrates the table (3-4 arm-table contacts). At 0.084
+the pad clears but the fork is **not** between the pads. At 0.086+ the target
+is unreachable.
+
+`GRIPPER_STATIC_PAD_CLEARANCE_M` was **0.084** — 2 mm past the top of the
+window. That is why `attempt_grasp` only succeeded once its gate had been
+widened to **0.12 m**: it was welding a fork 8.6 cm from the pinch and *not
+between the jaws*, then dragging it along below the gripper. The lift
+"succeeded" because criterion (a) only asks whether the fork rose.
+
+**So the earlier "pick PASSES all five criteria" result was not trustworthy,
+and is retracted.** It passed on a grasp that was not a grasp.
+
+### Yaw: the second finding
+
+With clearance corrected to 0.080 the grasp is sound but the lift fails —
+only 4 mm of headroom remained. The reachable pinch ceiling at the fork's xy
+turns out to depend strongly on **yaw**, which the brief treated as fixed at
+`heading + 90 deg`:
+
+| yaw | ceiling | headroom above the 0.436 grasp |
+|---|---|---|
+| 90 deg (current) | 0.440 | +0.004 |
+| 0 / 180 deg | 0.466 | +0.030 |
+| 225 deg | 0.476 | +0.040 |
+| **270 deg** | **0.478** | **+0.042** |
+
+270 deg is 90 deg + 180 deg: for a two-jaw gripper it is the **same grip**
+(`d_static`/`d_moving` identical), but the arm is far less extended. The fork
+sits at y=+0.05, 30 cm from arm A's base at y=-0.25, so it is near the edge of
+the top-down workspace and the arm's configuration matters more than the grip
+orientation does.
+
+### Applied
+
+    GRIPPER_STATIC_PAD_CLEARANCE_M   0.084 -> 0.080   (the measured window)
+    WELD_GRASP_DISTANCE_THRESHOLD_M  0.12  -> 0.09    (actual is 0.0854)
+    HOVER_CLEARANCE_M                0.02  -> 0.03    (= Lab 8's own value)
+
+Verified: fork **between the pads**, |fork - pinch| = 0.0854 m (under the 0.09
+gate, so the gate is a real check again), lifted to z=0.3768 > 0.3700.
+
+### Result after Part A
+
+| skill | (a) | (b) | (c) | (d) | (e) | verdict |
+|---|---|---|---|---|---|---|
+| `pick(A, fork)` | OK | OK | OK | OK | OK 1.832 | **PASS** (genuine grasp) |
+| `place(A, fork, ·)` | **OK** | BAD plate 16.7 mm | BAD plate -1.6 mm | OK | OK 0.154 | FAIL |
+| `handoff(A→B, fork)` | BAD | BAD mug 18.9 mm | OK | BAD 129 steps | OK 2.358 | FAIL |
+
+`place`'s stated Part A defect is resolved. Its remaining failure is a new and
+much smaller one: the plate is nudged 16.7 mm with 1.6 mm penetration, just
+over the 1 mm bar.
