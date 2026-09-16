@@ -95,6 +95,17 @@ does not transfer to a dual-arm scene.
 5. **Drift gate is mis-specified.** See below.
 6. **MuJoCo runs on the laptop.** Verified: 3.2.7 imports, builds the scene,
    and renders offscreen at 1280x720 in 1.7 s. ADR-020's premise is stale.
+
+> **CORRECTION (Stage 6).** The claim that ADR-020's premise is "stale" is
+> WRONG and is withdrawn. MuJoCo imported and ran hundreds of simulations on
+> the laptop during this series, then later failed on `master`'s own test
+> suite with `ImportError: DLL load failed while importing _specs: An
+> Application Control policy has blocked this file` — ADR-020's original
+> blocker, on the same machine, in the same session. Laptop MuJoCo is
+> **intermittent and not dependable**; bm-ptl remains the only reliable host,
+> and ADR-020 stands. Local iteration is a convenience that may vanish without
+> warning, never a substitute for bm-ptl.
+
    Iterate locally; bm-ptl stays authoritative for numbers (ADR-047).
    **Stage 5 no longer needs 461 MB / 9-minute frame transfers.**
 

@@ -23,8 +23,10 @@ REAL-TIME SPEED
 "every 6th step" would be 0.360x -- 2.8x slow motion.
 
 Renders locally: MuJoCo 3.2.7 imports, builds the scene and renders offscreen
-at 1280x720 on the laptop, so ADR-020's premise is stale and no frame transfer
-is needed. bm-ptl remains authoritative for reported numbers (ADR-047).
+at 1280x720 on the laptop WHEN Windows Application Control permits it --
+which is intermittent: it later blocked the same import in the same session.
+ADR-020 STANDS and bm-ptl is the only reliable host; local rendering is a
+convenience, not a guarantee. bm-ptl remains authoritative for reported numbers (ADR-047).
 
   python scripts/v2_stage5_demo.py --probe          # score only, no render
   python scripts/v2_stage5_demo.py --outdir frames  # score + render
