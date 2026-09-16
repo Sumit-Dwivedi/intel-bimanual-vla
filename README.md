@@ -22,6 +22,25 @@ Status section below for exactly which skill/arm/object combinations
 currently work end-to-end, and `SUBMISSION.md` for the full, unembellished
 submission checklist and rubric self-assessment.
 
+**Platform note — read this before reporting that the demo does not run.**
+Every number in this repository was produced on the Intel target (bm-ptl,
+Windows 11), which is the authoritative host (ADR-020 for why simulation runs
+there, ADR-047 for why its floating-point results are the ones quoted).
+MuJoCo's native extension is blocked on some Windows installations by Smart
+App Control / Application Control, which surfaces as:
+
+```
+ImportError: DLL load failed while importing _specs:
+An Application Control policy has blocked this file.
+```
+
+This is a host policy, not a bug in the project, and it can appear on a
+machine where MuJoCo previously imported fine. If you hit it, run on a host
+without that policy (Linux and macOS are unaffected), or read the recorded
+results: every figure in `SUBMISSION.md` and the ADRs is reported together
+with the run that produced it, and `docs/videos/` holds the rendered
+outcomes.
+
 ## Demo Video
 
 `docs/videos/full-sequence-demo.mp4` — one continuous, fixed-camera take of the
