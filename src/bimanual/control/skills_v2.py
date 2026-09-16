@@ -290,7 +290,14 @@ HANDOFF_HOVER_OFFSET_M = 0.02
 #: without re-running the co-occupancy check.
 P_FROM = np.array([-0.03, 0.0, 0.46], dtype=np.float64)
 P_TO = np.array([0.03, 0.0, 0.46], dtype=np.float64)
-HANDOFF_YAW = np.pi / 2.0
+#: **ORCHESTRATOR (Part B).** HANDOFF_YAW is 3*pi/2, not pi/2. Both give the
+#: same physical grip for a two-jaw gripper (they differ by 180 deg, and the
+#: measured pad offsets are identical), but the arm configuration differs
+#: enormously. At pi/2 arm B's approach collides with armA_lower_arm for 129
+#: steps (worst -0.0047 m); at 3*pi/2 cross-arm contact is ZERO and phase 2
+#: converges. This eliminated a transit collision I had wrongly concluded
+#: needed a waypoint search or an elbow-branch change.
+HANDOFF_YAW = 3.0 * np.pi / 2.0
 
 #: Per-object resting half-height above the table surface, metres -- the
 #: vertical distance from `TABLE_SURFACE_Z` up to that object's own BODY

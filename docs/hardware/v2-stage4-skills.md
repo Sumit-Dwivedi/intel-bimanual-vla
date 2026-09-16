@@ -1,9 +1,14 @@
 # v2 Stage 4 — phase-based skills: measured results (WIP)
 
-**Status: INCOMPLETE.** `pick` passes all five criteria. `place` fails only on
-end-state accuracy. `handoff` fails on a genuine, diagnosed cross-arm transit
-collision that is NOT yet solved. ADR-073 is deliberately NOT written yet —
-this stage is not finished, and an ADR claiming otherwise would be false.
+**Status: INCOMPLETE.** ADR-073 is deliberately NOT written yet — this stage is
+not finished, and an ADR claiming otherwise would be false.
+
+> **The "Five-criterion scoring" table immediately below is the PRE-PART-A
+> state and is superseded.** Read **PART A** further down first: it retracts
+> that table's `pick` PASS (it passed on a weld to a fork that was not between
+> the jaws) and supersedes the `place` diagnosis (the 12.5 mm offset was a
+> symptom of the grasp geometry, and is now fixed). The table is kept as the
+> record of what was measured before the fix.
 
 The Stage 4 builder stalled (no progress for 600 s) after writing
 `skills_v2.py` and the `executor.py` routing flag but before validating or
