@@ -34,6 +34,18 @@ reading of "`__init__` constructs it as `self.weld`" -- constructing it
 eagerly in `__init__` is not possible without an `env` argument this class
 has never taken, and adding one would break every existing call site.
 
+**v2 Stage 4 (ADR-073): a routing flag, nothing else.** `ScriptedSkillExecutor(use_v2=True)`
+routes `_dispatch` to `bimanual.control.skills_v2.dispatch_v2` instead of
+this module's own per-skill calls into `skills_scripted.py`. `use_v2=False`
+(the default) reproduces this class's ENTIRE pre-Stage-4 behaviour
+byte-for-byte -- every line below this flag's own `if` branch is completely
+unchanged, including the oracle-mode `cameras=None` assertion. This is the
+ONLY change Stage 4 made to this file (task instruction); all of Stage 4's
+actual skill logic, the five-criterion success definition, and its own
+dispatch-argument extraction (`destination`, `from_arm`) live in
+`skills_v2.py`, not here, precisely so this file's diff stays a one-flag,
+one-branch change.
+
 **M10 Phase 5 (ADR-046): perception is opt-in, oracle is the default.**
 `ScriptedSkillExecutor(inference=None)` -- the default, and every existing
 call site (`tests/test_skills.py`, `scripts/run_skill.py` before this
@@ -99,7 +111,7 @@ class ScriptedSkillExecutor(SkillExecutor):
     opt-in" section.
     """
 
-    def __init__(self, inference=None) -> None:
+    def __init__(self, inference=None, use_v2: bool = False) -> None:
         # See this module's docstring (ADR-030) for why this cannot be a
         # constructed `WeldGrasp` yet: no `env` exists at this point.
         self.weld: WeldGrasp | None = None
@@ -108,6 +120,10 @@ class ScriptedSkillExecutor(SkillExecutor):
         # life of this executor instance.
         self.inference = inference
         self._position_provider = None
+        # v2 Stage 4 (ADR-073): the ONLY new state this class gained this
+        # stage. `False` (the default) means every `execute()` call below
+        # behaves EXACTLY as it did before this stage existed.
+        self.use_v2 = use_v2
 
     def reset(self, env, seed: int = 0, cameras: list[str] | None = None) -> dict:
         """Reset `env`'s physics AND this executor's `WeldGrasp` together (ADR-047).
@@ -232,7 +248,7 @@ class ScriptedSkillExecutor(SkillExecutor):
             # through the same executor).
             provider.invalidate()
         try:
-            return self._dispatch(skill_call, env, step_budget, weld, provider)
+            return self._dispatch(skill_call, env, step_budget, weld, provider, use_v2=self.use_v2)
         except UngroundedCommandError:
             # This layer never calls the Grounder, so UngroundedCommandError
             # cannot legitimately originate here today -- but it subclasses
@@ -248,7 +264,20 @@ class ScriptedSkillExecutor(SkillExecutor):
             return SkillResult(False, f"ValueError: {exc}", 0)
 
     @staticmethod
-    def _dispatch(skill_call: SkillCall, env, step_budget: int, weld: WeldGrasp, position_provider=None) -> SkillResult:
+    def _dispatch(
+        skill_call: SkillCall, env, step_budget: int, weld: WeldGrasp, position_provider=None, use_v2: bool = False,
+    ) -> SkillResult:
+        # v2 Stage 4 (ADR-073): the ONLY branch this stage added. `use_v2`
+        # is keyword-only with a default of `False`, so every EXISTING call
+        # site/test (none of which pass it) takes this `if` as false and
+        # falls through to the untouched code below, unchanged. All of v2's
+        # own per-skill argument extraction lives in `skills_v2.dispatch_v2`
+        # itself, not duplicated here.
+        if use_v2:
+            from bimanual.control import skills_v2
+
+            return skills_v2.dispatch_v2(skill_call, env, weld)
+
         # `weld` (ADR-030): threaded to every skill that grasps. `open_drawer`
         # does not take one -- the drawer is not a `WeldGrasp.GRASPABLE_OBJECTS`
         # prop (slide joint, not free joint, ADR-029) -- so it is left exactly
